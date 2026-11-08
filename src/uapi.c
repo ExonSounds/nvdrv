@@ -428,6 +428,15 @@ static struct nv_bo *nv_bo_new(struct drm_device *dev, u64 size, u32 domain, u64
 	return bo;
 }
 
+/* For KMS: is obj a VRAM object of this driver, and where is it? */
+bool nv_uapi_bo_vram(struct drm_gem_object *obj, u64 *vram)
+{
+	if (obj->funcs != &nv_bo_funcs || !to_nv_bo(obj)->vram)
+		return false;
+	*vram = to_nv_bo(obj)->node.start;
+	return true;
+}
+
 static void bo_info(struct drm_file *file, struct nv_bo *bo, u32 handle, struct drm_nouveau_gem_info *info)
 {
 	info->handle = handle;

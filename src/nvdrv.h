@@ -330,6 +330,9 @@ struct nv_evo {
 	bool pattern_dirty;
 	struct nv_dma_buf sysfb;		/* scanout test surface in sysmem */
 	bool fb_bound, win_mapped, active;
+	bool pool_ctxdma;			/* window ctxdma over the VRAM pool exists */
+	u64 scanout_cur;			/* surface window 0 shows (0 = own framebuffer) */
+	u32 fb_pitch;				/* own framebuffer pitch for the current mode */
 	u32 sor, head;				/* of the active modeset */
 };
 
@@ -581,6 +584,8 @@ long nv_uapi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 struct drm_ioctl_desc;
 extern const struct drm_ioctl_desc *const nv_uapi_ioctls_ptr;
 extern const int nv_uapi_num_ioctls;
+struct drm_gem_object;
+bool nv_uapi_bo_vram(struct drm_gem_object *obj, u64 *vram);
 
 int nv_fifo_init(struct nvdrv_dev *nv);
 int nv_ce_test(struct nvdrv_dev *nv);
@@ -613,6 +618,7 @@ int nv_disp_set_mode(struct nvdrv_dev *nv, const struct nv_mode *m);
 #define NV_FLIP_NO_FMT			BIT(3)
 #define NV_FLIP_CSC			BIT(4)	/* send CSC/ILUT/TMO disables (err 0x2 with bypass) */
 #define NV_FLIP_SYSMEM			BIT(5)	/* scan out a test surface from coherent sysmem */
+int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch);
 int nv_disp_flip(struct nvdrv_dev *nv, u32 flags);
 int nv_bar1_test(struct nvdrv_dev *nv);
 int nv_bar1_bench(struct nvdrv_dev *nv);

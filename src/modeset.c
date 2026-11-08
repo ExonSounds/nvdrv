@@ -88,6 +88,7 @@
 
 #define NVDRV_H_FB_CTXDMA			0xd000f100
 #define NVDRV_H_SYSFB_CTXDMA			0xd000f101
+#define NVDRV_H_POOL_CTXDMA			0xd000f102
 
 #define NV0073_CTRL_CMD_DP_CONFIG_STREAM	0x731362
 #define NV0073_CTRL_CMD_DP_GET_CAPS		0x731369
@@ -254,6 +255,8 @@ int nv_disp_modeset_locked(struct nvdrv_dev *nv, u32 flags)
 	h = m->vdisplay;
 	pitch = ALIGN(w * 4, 256);
 	fb_size = ALIGN((u64)pitch * h, SZ_64K);
+	e->fb_pitch = pitch;
+	e->scanout_cur = 0;	/* the modeset points window 0 at the own framebuffer */
 
 	/*
 	 * 1. one fixed framebuffer big enough for any mode we drive, mapped through BAR1
@@ -459,6 +462,59 @@ static int sysfb_prepare(struct nvdrv_dev *nv, u32 w, u32 h)
 }
 
 /* Re-send only the window state (no core interlock) and report what the hardware thinks. */
+/*
+ * Point window 0 at another surface of the current mode's size: vram != 0 is a
+ * linear XRGB surface in the VRAM pool (a GPU-rendered DRM framebuffer, shown without
+ * a copy), vram == 0 nvdrv's own framebuffer. Takes effect at the next vblank.
+ */
+int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch)
+{
+	struct nv_evo *e = &nv->evo;
+	struct nv_evo_chan *win = &e->win[0];
+	u32 ctxdma = NVDRV_H_FB_CTXDMA;
+	u64 offset = 0;
+	int ret = 0;
+
+	if (vram && (!nv->mem.ready || vram < nv->mem.base || vram >= nv->mem.base + nv->mem.size ||
+		     (vram & 255) || (pitch & 63)))
+		return -EINVAL;
+	mutex_lock(&nv->gsp_lock);
+	if (!win->handle || !e->active) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (vram == e->scanout_cur)
+		goto out;
+	if (vram) {
+		if (!e->pool_ctxdma) {
+			ret = nv_evo_ctxdma(nv, NVDRV_H_POOL_CTXDMA, nv->mem.base, nv->mem.size, win->chn, false);
+			if (ret)
+				goto out;
+			e->pool_ctxdma = true;
+		}
+		ctxdma = NVDRV_H_POOL_CTXDMA;
+		offset = vram - nv->mem.base;
+	} else {
+		pitch = e->fb_pitch;
+	}
+	ret = nv_evo_begin(nv, win, 16);
+	if (ret)
+		goto out;
+	m1(win, C67E_SET_CONTEXT_DMA_ISO(0), ctxdma);
+	m1(win, C67E_SET_OFFSET(0), offset >> 8);
+	m1(win, C67E_SET_PLANAR_STORAGE(0), pitch >> 6);
+	/* standalone window update: the modeset left it interlocked with the core channel */
+	m1(win, C67E_SET_INTERLOCK_FLAGS, 0);
+	m1(win, C67E_SET_WINDOW_INTERLOCK_FLAGS, 0);
+	m1(win, C67E_UPDATE, 1);
+	ret = nv_evo_kick(nv, win);
+	if (!ret)
+		e->scanout_cur = vram;
+out:
+	mutex_unlock(&nv->gsp_lock);
+	return ret;
+}
+
 int nv_disp_flip(struct nvdrv_dev *nv, u32 flags)
 {
 	struct nv_evo *e = &nv->evo;

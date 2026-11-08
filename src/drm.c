@@ -106,7 +106,7 @@ static bool nv_drm_mode_ok(struct nv_drm *d, const struct drm_display_mode *dm)
 
 /* ---- plane ------------------------------------------------------------- */
 
-static const u32 nv_formats[] = { DRM_FORMAT_XRGB8888 };
+static const u32 nv_formats[] = { DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888 };	/* alpha ignored */
 static const u64 nv_modifiers[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID };
 
 static int nv_plane_atomic_check(struct drm_plane *plane, struct drm_atomic_commit *state)
@@ -114,10 +114,39 @@ static int nv_plane_atomic_check(struct drm_plane *plane, struct drm_atomic_comm
 	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
 	struct drm_crtc_state *cs = NULL;
 
+	u64 vram;
+	int ret;
+
 	if (ps->crtc)
 		cs = drm_atomic_get_new_crtc_state(state, ps->crtc);
-	return drm_atomic_helper_check_plane_state(ps, cs, DRM_PLANE_NO_SCALING,
-						   DRM_PLANE_NO_SCALING, false, false);
+	ret = drm_atomic_helper_check_plane_state(ps, cs, DRM_PLANE_NO_SCALING,
+						  DRM_PLANE_NO_SCALING, false, false);
+	if (ret || !ps->fb || !nv_uapi_bo_vram(ps->fb->obj[0], &vram))
+		return ret;
+	/* GPU-rendered VRAM framebuffer: scanned out directly, so it must fit the window */
+	if (ps->fb->modifier != DRM_FORMAT_MOD_LINEAR || (ps->fb->pitches[0] & 63) ||
+	    ((vram + ps->fb->offsets[0]) & 255) || (ps->src.x1 >> 16) || (ps->src.y1 >> 16))
+		return -EINVAL;
+	return 0;
+}
+
+/* The shadow-plane vmap only for framebuffers that are copied (shmem objects). */
+static int nv_plane_begin_fb_access(struct drm_plane *plane, struct drm_plane_state *ps)
+{
+	u64 vram;
+
+	if (ps->fb && nv_uapi_bo_vram(ps->fb->obj[0], &vram))
+		return 0;
+	return drm_gem_begin_shadow_fb_access(plane, ps);
+}
+
+static void nv_plane_end_fb_access(struct drm_plane *plane, struct drm_plane_state *ps)
+{
+	u64 vram;
+
+	if (ps->fb && nv_uapi_bo_vram(ps->fb->obj[0], &vram))
+		return;
+	drm_gem_end_shadow_fb_access(plane, ps);
 }
 
 static void nv_plane_atomic_update(struct drm_plane *plane, struct drm_atomic_commit *state)
@@ -132,8 +161,20 @@ static void nv_plane_atomic_update(struct drm_plane *plane, struct drm_atomic_co
 	struct drm_rect damage;
 	int idx;
 
+	u64 vram;
+
 	if (!fb || !drm_dev_enter(&d->dev, &idx))
 		return;
+	if (nv_uapi_bo_vram(fb->obj[0], &vram)) {	/* zero copy: flip the window to it */
+		nv_disp_scanout(d->nv, vram + fb->offsets[0], fb->pitches[0]);
+		atomic64_inc(&d->updates);
+		drm_dev_exit(idx);
+		return;
+	}
+	if (d->nv->evo.scanout_cur) {	/* back from a direct framebuffer: copy all of this one */
+		nv_disp_scanout(d->nv, 0, 0);
+		ps->ignore_damage_clips = true;
+	}
 	drm_atomic_helper_damage_iter_init(&iter, old, ps);
 	drm_atomic_for_each_plane_damage(&iter, &damage) {
 		struct drm_rect dst_clip = ps->dst;
@@ -173,7 +214,8 @@ static void nv_plane_atomic_disable(struct drm_plane *plane, struct drm_atomic_c
 }
 
 static const struct drm_plane_helper_funcs nv_plane_helper_funcs = {
-	DRM_GEM_SHADOW_PLANE_HELPER_FUNCS,
+	.begin_fb_access = nv_plane_begin_fb_access,
+	.end_fb_access = nv_plane_end_fb_access,
 	.atomic_check = nv_plane_atomic_check,
 	.atomic_update = nv_plane_atomic_update,
 	.atomic_disable = nv_plane_atomic_disable,
