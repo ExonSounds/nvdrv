@@ -547,6 +547,13 @@ static const struct file_operations disp_up_fops = {
 	.write = disp_up_write,
 };
 
+static int drm_stats_show(struct seq_file *m, void *unused)
+{
+	nv_drm_stats_show(m->private, m);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(drm_stats);
+
 static int perf_show(struct seq_file *m, void *unused)
 {
 	nv_rm_perf_show(m->private, m);
@@ -637,6 +644,7 @@ static void nv_debugfs_init(struct nvdrv_dev *nv)
 	if (nv_hw_writes_allowed()) {
 		debugfs_create_file("perf", 0600, nv->dbg, nv, &perf_fops);
 		debugfs_create_file("bar1_bench", 0200, nv->dbg, nv, &bar1_bench_fops);
+		debugfs_create_file("drm_stats", 0400, nv->dbg, nv, &drm_stats_fops);
 	}
 
 	if (nv->vbios.data) {

@@ -466,6 +466,7 @@ void __iomem *nv_bar1_map(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size);
 /* drm.c */
 int nv_drm_register(struct nvdrv_dev *nv);
 void nv_drm_unregister(struct nvdrv_dev *nv);
+void nv_drm_stats_show(struct nvdrv_dev *nv, struct seq_file *m);
 
 /* modeset.c */
 int nv_disp_modeset(struct nvdrv_dev *nv, u32 flags);

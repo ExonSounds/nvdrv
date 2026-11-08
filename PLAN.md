@@ -300,7 +300,8 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
     0xffffffff = until cleared) moves it to P0/Gen3 in ~250 ms. The DRM plane update re-arms a 3 s boost
     (work item, at most 1/s) once more than 64 MB were copied within a second. Cursor blinks never trigger it, a
     static screen drops back to P8 after ~6 s, and full-screen flips hold 180.00 Hz. Debugfs `perf` shows the
-    pstate and link and accepts max/clear/<seconds>; `bar1_bench` times full-frame copies.
+    pstate and link and accepts max/clear/<seconds>; `bar1_bench` times full-frame copies. Confirmed in Hyprland at 180 Hz
+    ("smooth"): 5969 plane updates / 20.2 GB copied in a ~20 s motion test (debugfs `drm_stats`), back to P8 when idle.
   - A module reload is impossible while a compositor still holds fds of the unplugged DRM device (each open
     file pins the module); stop it first.
 - **Open:** `DP_CONFIG_STREAM` returns NV_ERR_ILLEGAL_ACTION (0x16) before the modeset; the link works with RM's

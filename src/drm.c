@@ -11,6 +11,7 @@
  */
 #include <linux/aperture.h>
 #include <linux/iosys-map.h>
+#include <linux/seq_file.h>
 #include <linux/workqueue.h>
 
 #include <drm/clients/drm_client_setup.h>
@@ -56,6 +57,7 @@ struct nv_drm {
 	unsigned long boost_next;	/* jiffies: earliest next boost request */
 	unsigned long win_start;	/* jiffies: start of the 1 s traffic window */
 	u64 win_bytes;			/* bytes copied in the window */
+	atomic64_t updates, bytes;	/* totals, debugfs drm_stats */
 };
 
 #define NV_DRM_BOOST_SECONDS	3
@@ -143,7 +145,9 @@ static void nv_plane_atomic_update(struct drm_plane *plane, struct drm_atomic_co
 		drm_rect_translate(&dst_clip, (ps->src.x1 >> 16) - ps->dst.x1, (ps->src.y1 >> 16) - ps->dst.y1);
 		drm_fb_memcpy(&dst, &d->pitch, sps->data, fb, &dst_clip);
 		d->win_bytes += (u64)drm_rect_width(&dst_clip) * drm_rect_height(&dst_clip) * 4;
+		atomic64_add((u64)drm_rect_width(&dst_clip) * drm_rect_height(&dst_clip) * 4, &d->bytes);
 	}
+	atomic64_inc(&d->updates);
 	/* sustained copy traffic: keep the GPU (and its PCIe link) out of the idle state */
 	if (time_after(jiffies, d->win_start + HZ)) {
 		d->win_start = jiffies;
@@ -416,6 +420,19 @@ int nv_drm_register(struct nvdrv_dev *nv)
 err:
 	d->scanout = NULL;
 	return ret;
+}
+
+/* debugfs drm_stats: plane updates and bytes copied into the scanout surface so far */
+void nv_drm_stats_show(struct nvdrv_dev *nv, struct seq_file *m)
+{
+	struct nv_drm *d = nv->drm;
+
+	if (!d) {
+		seq_puts(m, "no DRM device\n");
+		return;
+	}
+	seq_printf(m, "updates %lld bytes %lld mode %s@%d\n", atomic64_read(&d->updates),
+		   atomic64_read(&d->bytes), d->mode.name, drm_mode_vrefresh(&d->mode));
 }
 
 /* .remove, before the GPU is reset: stop all access to BAR1. */
