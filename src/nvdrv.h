@@ -344,6 +344,7 @@ struct nv_evo {
 struct nv_bar1 {
 	u64 tables, pd0, pts;	/* VRAM: PD0 pages consecutive, then the page tables */
 	u64 npd0;		/* PD0 pages (512 MiB of BAR1 each) */
+	bool pool_mapped;	/* VRAM pool mapped 1:1 (BAR1 offset == VRAM address) */
 	u64 old_root0;		/* GSP's original root entry 0 */
 	u64 size;		/* usable BAR1 VA */
 };
@@ -568,6 +569,7 @@ int nv_evo_wait(struct nvdrv_dev *nv, struct nv_evo_chan *c);
 int nv_bar1_init(struct nvdrv_dev *nv);
 #define NV_BAR1_UNMAP	(~0ULL)
 int nv_bar1_set(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size);
+void nv_bar1_map_pool(struct nvdrv_dev *nv);
 void __iomem *nv_bar1_map(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size);
 
 /* fifo.c */

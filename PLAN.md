@@ -412,6 +412,17 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       Not yet: moving objects back when VRAM frees up; LRU by use (eviction order is allocation order).
 - [x] **BAR1 beyond 512 MiB** (2026-11-09): one PD0 page per 512 MiB up to the whole BAR (8 GiB with Resizable BAR,
       16 PD0 pages + 4096 64 KiB-page tables, 1.1 MiB). NVK's host-visible VRAM is no longer capped at 446 MiB.
+- [x] **Resizable BAR** (2026-11-09):
+      - *Resize at probe* (as amdgpu_device_resize_fb_bar; module parameter `rebar`: -1 largest (default), 0 leave,
+        N MiB): before anything uses BAR1, the firmware framebuffer in BAR1 is removed, memory decoding is turned
+        off, `pci_resize_resource(pdev, 1, size, BIT(0))` (BAR0 excluded; BAR3 shares the window and is
+        reassigned), `pci_assign_unassigned_bus_resources`. Only with allow_hw_writes. Tested both ways on this
+        machine (firmware already sets 8 GiB): `rebar=256` -> 256 MiB (BAR moved to 0x830000000; driver uses
+        per-object BAR1 mappings), default -> 8 GiB again (moved to 0xa00000000); GSP-RM, display, uAPI, overcommit
+        all fine after each.
+      - *Use of a large BAR*: the whole VRAM pool is mapped 1:1 into BAR1 (BAR1 offset == VRAM address; 51 ms once),
+        so GEM mmap needs no BAR1 space or PTE writes and cannot fail for lack of BAR; GETPARAM VRAM_BAR_SIZE
+        reports the pool. NVK then offers DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT over all 7.4 GiB.
 - [ ] **64 KiB / 2 MiB GPU pages** (big-page tables) and **compression** (comptags, compressible kinds).
 - [ ] **Z-cull info** (`GET_ZCULL_INFO` from RM) so NVK enables Z-cull.
 - [ ] **Per-object fences / implicit sync**: BO reservation fences (dma-buf with other devices), VM_BIND unmap and

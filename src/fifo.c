@@ -1129,6 +1129,8 @@ int nv_fifo_init(struct nvdrv_dev *nv)
 		ret = nv_mem_get(nv, &n, SZ_4K, 0);
 		if (!ret)
 			nv_mem_put(nv, &n);
+		if (!ret)
+			nv_bar1_map_pool(nv);	/* large BAR: CPU sees the whole pool */
 	}
 	if (!ret && !nv->chan.handle) {
 		ret = ce_chan_init(nv, &nv->chan);

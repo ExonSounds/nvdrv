@@ -17,6 +17,7 @@
  * TLB invalidate: tu102_vmm_flush (NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE*).
  */
 #include <linux/io.h>
+#include <linux/ktime.h>
 #include <linux/iopoll.h>
 #include <linux/lockdep.h>
 
@@ -107,11 +108,33 @@ int nv_bar1_set(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size)
 	for (off = 0; off < size; off += SZ_64K) {
 		u64 v = va + off, pt = b->pts + (v >> 21) * BAR1_PT_BYTES;
 
-		/* PD0 dual entry: [0] = 64 KiB page table, [1] = 4 KiB table (none) */
-		wr64(nv, b->pd0 + (v >> 29) * SZ_4K + ((v >> 21) & 255) * 16, (pt >> 4) | PDE_VRAM);
+		/* PD0 dual entry ([0] 64 KiB table, [1] 4 KiB table: none), PD0 page v >> 29; once per 2 MiB */
+		if (!off || !(v & (SZ_2M - 1)))
+			wr64(nv, b->pd0 + (v >> 29) * SZ_4K + ((v >> 21) & 255) * 16, (pt >> 4) | PDE_VRAM);
 		wr64(nv, pt + ((v >> 16) & 31) * 8, unmap ? 0 : ((vram + off) >> 4) | PTE_VALID);
 	}
 	return bar1_invalidate(nv);
+}
+
+/*
+ * With a large (resizable) BAR: map the whole VRAM pool once at BAR1 offset = VRAM address,
+ * so every pool object is CPU-reachable without per-object BAR1 space or PTE updates. The
+ * pool starts above the scanout surface and USERD at the bottom of BAR1.
+ */
+void nv_bar1_map_pool(struct nvdrv_dev *nv)
+{
+	struct nv_bar1 *b = &nv->bar1;
+	ktime_t t0 = ktime_get();
+	int ret;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	if (b->pool_mapped || !nv->mem.ready || !b->tables || nv->mem.base + nv->mem.size > b->size ||
+	    nv->mem.base < NV_FB_MAX + SZ_64K)
+		return;
+	ret = nv_bar1_set(nv, nv->mem.base, nv->mem.base, nv->mem.size);
+	b->pool_mapped = !ret;
+	dev_info(&nv->pdev->dev, "bar1: VRAM pool 0x%llx+%llu MiB mapped 1:1 (%d, %lld ms)\n", nv->mem.base,
+		 nv->mem.size >> 20, ret, ktime_ms_delta(ktime_get(), t0));
 }
 
 /* Map and return a write-combined CPU mapping of it. */

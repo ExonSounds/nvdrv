@@ -23,6 +23,7 @@
  * Probe is read-only: no register writes, no DMA, BAR1 untouched (the boot
  * framebuffer lives there). Writes happen only through explicit triggers.
  */
+#include <linux/aperture.h>
 #include <linux/bitfield.h>
 #include <linux/debugfs.h>
 #include <linux/iopoll.h>
@@ -873,6 +874,50 @@ static void nv_init_readonly(struct nvdrv_dev *nv)
 		dev_err(dev, "pre-boot RPC queueing failed: %d\n", ret);
 }
 
+static int rebar = -1;
+module_param(rebar, int, 0444);
+MODULE_PARM_DESC(rebar, "Resize BAR1 at probe: -1 = largest supported (default), 0 = leave as is, N = N MiB");
+
+/*
+ * Resizable BAR (as amdgpu_device_resize_fb_bar): grow BAR1 so the CPU can reach all of
+ * VRAM, when the firmware left it small. At probe, before GSP-RM or anything else uses
+ * BAR1; the firmware framebuffer (simpledrm/efifb) lives in BAR1 and is removed first,
+ * its claim on the old range would block the release. BAR0 sits in a different (32-bit)
+ * bridge window and is excluded. Failures leave the BAR as it was (the PCI core restores).
+ */
+static void nv_rebar(struct pci_dev *pdev)
+{
+	struct device *dev = &pdev->dev;
+	u64 cur = pci_resource_len(pdev, 1), want;
+	int max = pci_rebar_get_max_size(pdev, 1), size, ret;
+	u16 cmd;
+
+	if (!rebar || max < 0 || !nv_hw_writes_allowed())
+		return;
+	size = rebar > 0 ? pci_rebar_bytes_to_size((u64)rebar << 20) : max;
+	if (size > max || !pci_rebar_size_supported(pdev, 1, size)) {
+		dev_warn(dev, "rebar: %d MiB not supported (largest %llu MiB)\n", rebar,
+			 (u64)pci_rebar_size_to_bytes(max) >> 20);
+		return;
+	}
+	want = pci_rebar_size_to_bytes(size);
+	if (want == cur)
+		return;
+	dev_info(dev, "rebar: BAR1 %llu MiB -> %llu MiB\n", cur >> 20, want >> 20);
+	aperture_remove_conflicting_pci_devices(pdev, DRV_NAME);	/* boot framebuffer is in BAR1 */
+	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
+	pci_write_config_word(pdev, PCI_COMMAND, cmd & ~PCI_COMMAND_MEMORY);
+	ret = pci_resize_resource(pdev, 1, size, BIT(0));
+	pci_assign_unassigned_bus_resources(pdev->bus);
+	pci_write_config_word(pdev, PCI_COMMAND, cmd);
+	if (ret)
+		dev_warn(dev, "rebar: resize failed (%d%s), BAR1 stays %llu MiB\n", ret,
+			 ret == -ENOSPC ? ": not enough PCI address space" : "", pci_resource_len(pdev, 1) >> 20);
+	else
+		dev_info(dev, "rebar: BAR1 now %llu MiB at 0x%llx\n", pci_resource_len(pdev, 1) >> 20,
+			 (u64)pci_resource_start(pdev, 1));
+}
+
 static void nv_release(struct kref *ref)
 {
 	struct nvdrv_dev *nv = container_of(ref, struct nvdrv_dev, ref);
@@ -924,6 +969,7 @@ static int nvdrv_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ret = pcim_enable_device(pdev);
 	if (ret)
 		return ret;
+	nv_rebar(pdev);	/* before anything maps or uses BAR1 */
 
 	/* BAR0 only. BAR1 holds the firmware framebuffer used by simpledrm. */
 	nv->bar0 = pcim_iomap_region(pdev, 0, DRV_NAME);

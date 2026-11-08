@@ -360,7 +360,10 @@ static vm_fault_t nv_bo_fault(struct vm_fault *vmf)
 	if (pg >= bo->base.size >> PAGE_SHIFT)
 		return VM_FAULT_SIGBUS;
 	down_read(&ua->evict_sem);	/* placement is stable while held */
-	if (bo->vram && (bo->nv->unplugged || !drm_mm_node_allocated(&bo->bar1)))
+	if (bo->vram && bo->nv->bar1.pool_mapped && !bo->nv->unplugged)
+		ret = vmf_insert_pfn(vma, vmf->address,
+				     (pci_resource_start(bo->nv->pdev, 1) + bo->node.start) / PAGE_SIZE + pg);
+	else if (bo->vram && (bo->nv->unplugged || !drm_mm_node_allocated(&bo->bar1)))
 		ret = VM_FAULT_SIGBUS;
 	else if (bo->vram)
 		ret = vmf_insert_pfn(vma, vmf->address,
@@ -385,7 +388,9 @@ static int nv_bo_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma)
 	int ret = 0;
 
 	down_read(&nv->uapi.evict_sem);
-	if (bo->vram) {
+	if (bo->vram && nv->bar1.pool_mapped) {
+		vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+	} else if (bo->vram) {
 		mutex_lock(&nv->uapi.bar1_lock);
 		if (!drm_mm_node_allocated(&bo->bar1)) {
 			ret = bar1_pool(nv);
@@ -1392,8 +1397,9 @@ static int ioctl_getparam(struct drm_device *dev, void *data, struct drm_file *f
 	case NOUVEAU_GETPARAM_EXEC_PUSH_MAX:
 		req->value = UAPI_PUSH_MAX;
 		break;
-	case NOUVEAU_GETPARAM_VRAM_BAR_SIZE:
-		req->value = nv->bar1.size > ALIGN(NV_FB_MAX + SZ_64K, SZ_2M) ?
+	case NOUVEAU_GETPARAM_VRAM_BAR_SIZE:	/* all of the pool with a large BAR */
+		req->value = nv->bar1.pool_mapped ? nv->mem.size :
+			     nv->bar1.size > ALIGN(NV_FB_MAX + SZ_64K, SZ_2M) ?
 			     nv->bar1.size - ALIGN(NV_FB_MAX + SZ_64K, SZ_2M) : 0;
 		break;
 	case NOUVEAU_GETPARAM_VRAM_USED:
