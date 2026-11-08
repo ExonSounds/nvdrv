@@ -829,8 +829,11 @@ static int nvdrv_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	nv->pdev = pdev;
 	pci_set_drvdata(pdev, nv);
 	ret = devm_mutex_init(&pdev->dev, &nv->gsp_lock);
+	if (!ret)
+		ret = devm_mutex_init(&pdev->dev, &nv->mem.lock);
 	if (ret)
 		return ret;
+	nv_uapi_init(nv);
 
 	ret = pcim_enable_device(pdev);
 	if (ret)

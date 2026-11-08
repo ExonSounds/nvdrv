@@ -15,7 +15,7 @@ if lsmod | grep -q '^nvdrv '; then
 	have=$(cat /sys/module/nvdrv/parameters/allow_hw_writes)
 	[ "$want" = "$have" ] || rmmod nvdrv
 fi
-lsmod | grep -q '^nvdrv ' || insmod "$HERE/nvdrv.ko" allow_hw_writes=$([ "${HW:-0}" = 1 ] && echo 1 || echo 0)
+lsmod | grep -q '^nvdrv ' || insmod "$HERE/nvdrv.ko" allow_hw_writes=$([ "${HW:-0}" = 1 ] && echo 1 || echo 0) ${NVDRV_PARAMS:-}
 echo nvdrv > "$SYS/driver_override"
 echo "$DEV" > /sys/bus/pci/drivers_probe
 dmesg | grep nvdrv | tail -n 3

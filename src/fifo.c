@@ -53,18 +53,32 @@ static u64 rd64(struct nvdrv_dev *nv, u64 addr)
 	return nv_vram_rd32(nv, addr) | (u64)nv_vram_rd32(nv, addr + 4) << 32;
 }
 
-/* A zeroed 4K page-table page from the VRAM carve-out. */
-static int pt_page(struct nvdrv_dev *nv, u64 *out)
+/* A zeroed 4K page-table page: carve-out for nvdrv's VM, the freeable pool for client VMs. */
+static int pt_page(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 *out)
 {
-	int ret = nv_vram_alloc(nv, SZ_4K, SZ_4K, out);
+	int ret;
 
-	if (!ret)
-		nv_vram_fill(nv, *out, SZ_4K, 0, NULL, NULL);
-	return ret;
+	if (vm->external) {
+		struct nv_pt *pt = kzalloc(sizeof(*pt), GFP_KERNEL);
+
+		ret = pt ? nv_mem_get(nv, &pt->node, SZ_4K, SZ_4K) : -ENOMEM;
+		if (ret) {
+			kfree(pt);
+			return ret;
+		}
+		list_add(&pt->head, &vm->pts);
+		*out = pt->node.start;
+	} else {
+		ret = nv_vram_alloc(nv, SZ_4K, SZ_4K, out);
+		if (ret)
+			return ret;
+	}
+	nv_vram_fill(nv, *out, SZ_4K, 0, NULL, NULL);
+	return 0;
 }
 
 /* Next-level table behind entry (addr), allocated on first use. */
-static int pd_next(struct nvdrv_dev *nv, u64 entry, u64 *next)
+static int pd_next(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 entry, u64 *next)
 {
 	u64 e = rd64(nv, entry);
 	int ret;
@@ -73,7 +87,7 @@ static int pd_next(struct nvdrv_dev *nv, u64 entry, u64 *next)
 		*next = (e & ~0xfULL) << 4;
 		return 0;
 	}
-	ret = pt_page(nv, next);
+	ret = pt_page(nv, vm, next);
 	if (!ret)
 		wr64(nv, entry, (*next >> 4) | PDE_VRAM);
 	return ret;
@@ -83,25 +97,31 @@ static int pd_next(struct nvdrv_dev *nv, u64 entry, u64 *next)
  * Map one 4 KiB page at va. 4K pages use PD0 entry [1] (the small page table, 512 x 8 B);
  * aperture: VRAM (pte_flags 0) or coherent sysmem (PTE_APER_SYS_COH | PTE_VOL).
  */
-static int vmm_map_4k(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pa, u64 pte_flags)
+/* Write the 4K PTE for va (allocating the tables on the way); pte is the full entry. */
+int nv_vmm_set_pte(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pte)
 {
 	u64 pd2, pd1, pd0, pt;
 	int ret;
 
-	ret = pd_next(nv, vm->root + ((va >> 47) & 3) * 8, &pd2);
+	ret = pd_next(nv, vm, vm->root + ((va >> 47) & 3) * 8, &pd2);
 	if (!ret)
-		ret = pd_next(nv, pd2 + ((va >> 38) & 511) * 8, &pd1);
+		ret = pd_next(nv, vm, pd2 + ((va >> 38) & 511) * 8, &pd1);
 	if (!ret)
-		ret = pd_next(nv, pd1 + ((va >> 29) & 511) * 8, &pd0);
+		ret = pd_next(nv, vm, pd1 + ((va >> 29) & 511) * 8, &pd0);
 	if (!ret)
-		ret = pd_next(nv, pd0 + ((va >> 21) & 255) * 16 + 8, &pt);
+		ret = pd_next(nv, vm, pd0 + ((va >> 21) & 255) * 16 + 8, &pt);
 	if (ret)
 		return ret;
-	wr64(nv, pt + ((va >> 12) & 511) * 8, (pa >> 4) | PTE_VALID | pte_flags);
+	wr64(nv, pt + ((va >> 12) & 511) * 8, pte);
 	return 0;
 }
 
-static int vmm_flush(struct nvdrv_dev *nv, struct nv_vmm *vm)
+int nv_vmm_map_4k(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pa, u64 pte_flags)
+{
+	return nv_vmm_set_pte(nv, vm, va, (pa >> 4) | PTE_VALID | pte_flags);
+}
+
+int nv_vmm_flush(struct nvdrv_dev *nv, struct nv_vmm *vm)
 {
 	u32 v;
 
@@ -113,7 +133,7 @@ static int vmm_flush(struct nvdrv_dev *nv, struct nv_vmm *vm)
 }
 
 /* Map a VRAM range (4K granularity) at a fresh VA aligned to align; returns the VA. */
-static int vmm_map_vram_flags(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 vram, u64 size, u64 align,
+int nv_vmm_map_vram_flags(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 vram, u64 size, u64 align,
 			      u64 pte_flags, u64 *va)
 {
 	u64 off;
@@ -121,25 +141,25 @@ static int vmm_map_vram_flags(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 vram,
 
 	*va = ALIGN(vm->next, max_t(u64, align, SZ_4K));
 	for (off = 0; off < size && !ret; off += SZ_4K)
-		ret = vmm_map_4k(nv, vm, *va + off, vram + off, pte_flags);
+		ret = nv_vmm_map_4k(nv, vm, *va + off, vram + off, pte_flags);
 	vm->next = ALIGN(*va + size, SZ_2M);
 	return ret;
 }
 
-static int vmm_map_vram(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 vram, u64 size, u64 *va)
+static int nv_vmm_map_vram(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 vram, u64 size, u64 *va)
 {
-	return vmm_map_vram_flags(nv, vm, vram, size, SZ_4K, 0, va);
+	return nv_vmm_map_vram_flags(nv, vm, vram, size, SZ_4K, 0, va);
 }
 
 /* Map a coherent sysmem buffer (contiguous bus addresses) at a fresh VA. */
-static int vmm_map_sysmem(struct nvdrv_dev *nv, struct nv_vmm *vm, const struct nv_dma_buf *b, u64 *va)
+int nv_vmm_map_sysmem(struct nvdrv_dev *nv, struct nv_vmm *vm, const struct nv_dma_buf *b, u64 *va)
 {
 	u64 off;
 	int ret = 0;
 
 	*va = vm->next;
 	for (off = 0; off < b->size && !ret; off += SZ_4K)
-		ret = vmm_map_4k(nv, vm, *va + off, b->dma + off, PTE_APER_SYS_COH | PTE_VOL);
+		ret = nv_vmm_map_4k(nv, vm, *va + off, b->dma + off, PTE_APER_SYS_COH | PTE_VOL);
 	vm->next = ALIGN(vm->next + b->size, SZ_2M);
 	return ret;
 }
@@ -149,7 +169,7 @@ static int vmm_map_sysmem(struct nvdrv_dev *nv, struct nv_vmm *vm, const struct 
  * gv100_vmm_join): PDB at 0x200 (VER2, 64 KiB big pages, VRAM), VA limit at 0x208,
  * subcontext 0 PDB at 0x2a0, subcontexts 1..63 invalid, valid mask at 0x298.
  */
-static void vmm_join(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 inst)
+void nv_vmm_join(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 inst)
 {
 	u64 base = vm->root | BIT_ULL(10) | BIT_ULL(11);
 	int i;
@@ -276,11 +296,14 @@ static int vmm_init(struct nvdrv_dev *nv, struct nv_vmm *vm)
 	u64 pd2, pd1;
 	int ret;
 
-	ret = pt_page(nv, &vm->root);
+	vm->h_client = nv->rm.h_client;
+	vm->h_device = nv->rm.h_device;
+	vm->h_subdevice = nv->rm.h_subdevice;
+	ret = pt_page(nv, vm, &vm->root);
 	if (!ret)
-		ret = pd_next(nv, vm->root + ((SPLIT_VAS_START >> 47) & 3) * 8, &pd2);
+		ret = pd_next(nv, vm, vm->root + ((SPLIT_VAS_START >> 47) & 3) * 8, &pd2);
 	if (!ret)
-		ret = pd_next(nv, pd2 + ((SPLIT_VAS_START >> 38) & 511) * 8, &pd1);
+		ret = pd_next(nv, vm, pd2 + ((SPLIT_VAS_START >> 38) & 511) * 8, &pd1);
 	if (ret)
 		return ret;
 	vm->next = NV_VA_BASE;
@@ -312,6 +335,96 @@ static int vmm_init(struct nvdrv_dev *nv, struct nv_vmm *vm)
 	dev_info(&nv->pdev->dev, "fifo: VA space 0x%08x, root PD at VRAM 0x%llx, server PDEs copied: %d\n",
 		 vm->handle, vm->root, ret);
 	return ret;
+}
+
+#define NV_VASPACE_FLAGS_EXTERNALLY_OWNED	BIT(3)
+#define NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY	0x00801813
+#define NV0080_CTRL_CMD_DMA_UNSET_PAGE_DIRECTORY	0x00801814
+
+struct nv_set_page_directory {
+	__le64 phys_address;
+	__le32 num_entries, flags, h_vaspace, chid, sub_device_id, pasid;
+};
+static_assert(sizeof(struct nv_set_page_directory) == 32);
+
+/*
+ * A client GPU address space (r535_mmu_vaspace_new with external = true): its own RM
+ * client/device/subdevice (h_client), an externally owned FERMI_VASPACE_A whose page
+ * directory nvdrv writes and hands to RM with DMA_SET_PAGE_DIRECTORY. No RM-reserved
+ * range; kernel objects (GPFIFOs, push buffers, GR context) go from kernel_va upwards.
+ */
+int nv_vmm_client_init(struct nvdrv_dev *nv, struct nv_vmm *vm, u32 h_client, u64 kernel_va)
+{
+	struct nv_vaspace_alloc a = { .flags = cpu_to_le32(NV_VASPACE_FLAGS_EXTERNALLY_OWNED) };
+	struct nv_set_page_directory pd = {};
+	int ret;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	memset(vm, 0, sizeof(*vm));
+	INIT_LIST_HEAD(&vm->pts);
+	vm->external = true;
+	vm->next = kernel_va;
+	ret = nv_rm_client_alloc(nv, h_client);
+	if (ret)
+		return ret;
+	vm->h_client = h_client;
+	vm->h_device = NVDRV_H_DEVICE;
+	vm->h_subdevice = NVDRV_H_SUBDEVICE;
+	ret = pt_page(nv, vm, &vm->root);
+	if (!ret)
+		ret = nv_rm_alloc(nv, h_client, vm->h_device, NVDRV_H_VASPACE, FERMI_VASPACE_A, &a, sizeof(a));
+	if (ret)
+		goto fail;
+	vm->handle = NVDRV_H_VASPACE;
+	pd.phys_address = cpu_to_le64(vm->root);
+	pd.num_entries = cpu_to_le32(4);		/* PD3: VA bits 48:47 */
+	pd.flags = 0;					/* APERTURE_VIDMEM */
+	pd.h_vaspace = cpu_to_le32(vm->handle);
+	ret = nv_rm_control(nv, h_client, vm->h_device, NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY, &pd, sizeof(pd));
+	if (!ret)
+		return 0;
+fail:
+	nv_vmm_client_fini(nv, vm);
+	return ret;
+}
+
+void nv_vmm_client_fini(struct nvdrv_dev *nv, struct nv_vmm *vm)
+{
+	struct nv_pt *pt, *tmp;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	if (vm->h_client && nv->gsp_running) {
+		if (vm->handle) {
+			__le32 un[2] = { cpu_to_le32(vm->handle), 0 };
+
+			nv_rm_control(nv, vm->h_client, vm->h_device, NV0080_CTRL_CMD_DMA_UNSET_PAGE_DIRECTORY,
+				      un, sizeof(un));
+		}
+		nv_rm_free(nv, vm->h_client, vm->h_client);
+	}
+	if (vm->pts.next)
+		list_for_each_entry_safe(pt, tmp, &vm->pts, head) {
+			nv_mem_put(nv, &pt->node);
+			kfree(pt);
+		}
+	memset(vm, 0, sizeof(*vm));
+	INIT_LIST_HEAD(&vm->pts);
+}
+
+int nv_chid_get(struct nvdrv_dev *nv)
+{
+	unsigned long *map = nv->fifo.chids;
+	int chid = find_next_zero_bit(map, 128, 1);
+
+	if (chid >= 128)
+		return -ENOSPC;
+	set_bit(chid, map);
+	return chid;
+}
+
+void nv_chid_put(struct nvdrv_dev *nv, u32 chid)
+{
+	clear_bit(chid, nv->fifo.chids);
 }
 
 /*
@@ -348,6 +461,10 @@ static int ce_pick(struct nvdrv_dev *nv, u32 *runlist, u32 *ce, u32 *rl_base)
 		u32 type = le32_to_cpu(data[ENGINE_INFO_TYPE_RM_ENGINE_TYPE]);
 		u32 rl = le32_to_cpu(data[ENGINE_INFO_TYPE_RUNLIST]);
 
+		if (type >= RM_ENGINE_TYPE_COPY0 && type < RM_ENGINE_TYPE_COPY0 + 10 && rl == gr_runlist &&
+		    !nv->fifo.gr_ce)
+			nv->fifo.gr_ce = type - RM_ENGINE_TYPE_COPY0 + 1;	/* +1: 0 = none */
+
 		dev_info(&nv->pdev->dev, "fifo: engine %u: RM type 0x%02x, runlist %u, name %.16s\n", i, type, rl,
 			 (const char *)(t + 12 + i * 100 + 84));
 		if (type >= RM_ENGINE_TYPE_COPY0 && type < RM_ENGINE_TYPE_COPY0 + 10 && rl != gr_runlist) {
@@ -372,7 +489,7 @@ static int ce_pick(struct nvdrv_dev *nv, u32 *runlist, u32 *ce, u32 *rl_base)
 	return ret;
 }
 
-static int dma_buf_alloc(struct nvdrv_dev *nv, struct nv_dma_buf *b, size_t size)
+int nv_dma_buf_alloc(struct nvdrv_dev *nv, struct nv_dma_buf *b, size_t size)
 {
 	b->size = size;
 	b->cpu = dma_alloc_coherent(&nv->pdev->dev, size, &b->dma, GFP_KERNEL);
@@ -382,7 +499,7 @@ static int dma_buf_alloc(struct nvdrv_dev *nv, struct nv_dma_buf *b, size_t size
 	return 0;
 }
 
-static void dma_buf_free(struct nvdrv_dev *nv, struct nv_dma_buf *b)
+void nv_dma_buf_free(struct nvdrv_dev *nv, struct nv_dma_buf *b)
 {
 	if (b->cpu)
 		dma_free_coherent(&nv->pdev->dev, b->size, b->cpu, b->dma);
@@ -410,8 +527,8 @@ static int userd_page(struct nvdrv_dev *nv)
  * host-provided instance block (VRAM), USERD slot, method buffer; sysmem GPFIFO, push
  * buffer and semaphore page mapped into nvdrv's VA space; then BIND and SCHEDULE.
  */
-static int chan_create(struct nvdrv_dev *nv, struct nv_chan *ch, u32 handle, u32 chid, u32 engine,
-		       u32 runlist, u32 rl_base)
+int nv_chan_create(struct nvdrv_dev *nv, struct nv_chan *ch, struct nv_vmm *vm, u32 handle, u32 chid,
+		   u32 engine, u32 runlist, u32 rl_base)
 {
 	struct device *dev = &nv->pdev->dev;
 	struct nv_gsp_static_info *si = &nv->gsp_info;
@@ -431,24 +548,25 @@ static int chan_create(struct nvdrv_dev *nv, struct nv_chan *ch, u32 handle, u32
 	if (ret)
 		return ret;
 	mthdbuf_size = le32_to_cpu(v32);
+	ch->vm = vm;
 	ch->chid = chid;
 	ch->engine = engine;
 	ch->runlist = runlist;
 	ch->rl_base = rl_base;
 	nv_vram_fill(nv, ch->inst, CHAN_INST_SIZE, 0, NULL, NULL);
-	vmm_join(nv, &nv->vmm, ch->inst);
+	nv_vmm_join(nv, vm, ch->inst);
 	ch->userd_cpu = f->userd_cpu + chid * USERD_SIZE;
 	memset_io(ch->userd_cpu, 0, USERD_SIZE);
-	if ((ret = dma_buf_alloc(nv, &ch->gpfifo, GPFIFO_ENTRIES * 8)) ||
-	    (ret = dma_buf_alloc(nv, &ch->pb, PUSHBUF_SIZE)) ||
-	    (ret = dma_buf_alloc(nv, &ch->mthdbuf, PAGE_ALIGN(mthdbuf_size))) ||
-	    (ret = dma_buf_alloc(nv, &ch->sem, SZ_4K)) ||
-	    (ret = dma_buf_alloc(nv, &ch->errnotif, SZ_4K)))
+	if ((ret = nv_dma_buf_alloc(nv, &ch->gpfifo, GPFIFO_ENTRIES * 8)) ||
+	    (ret = nv_dma_buf_alloc(nv, &ch->pb, PUSHBUF_SIZE)) ||
+	    (ret = nv_dma_buf_alloc(nv, &ch->mthdbuf, PAGE_ALIGN(mthdbuf_size))) ||
+	    (ret = nv_dma_buf_alloc(nv, &ch->sem, SZ_4K)) ||
+	    (ret = nv_dma_buf_alloc(nv, &ch->errnotif, SZ_4K)))
 		return ret;
-	if ((ret = vmm_map_sysmem(nv, &nv->vmm, &ch->gpfifo, &ch->gpfifo_va)) ||
-	    (ret = vmm_map_sysmem(nv, &nv->vmm, &ch->pb, &ch->pb_va)) ||
-	    (ret = vmm_map_sysmem(nv, &nv->vmm, &ch->sem, &ch->sem_va)) ||
-	    (ret = vmm_flush(nv, &nv->vmm)))
+	if ((ret = nv_vmm_map_sysmem(nv, vm, &ch->gpfifo, &ch->gpfifo_va)) ||
+	    (ret = nv_vmm_map_sysmem(nv, vm, &ch->pb, &ch->pb_va)) ||
+	    (ret = nv_vmm_map_sysmem(nv, vm, &ch->sem, &ch->sem_va)) ||
+	    (ret = nv_vmm_flush(nv, vm)))
 		return ret;
 
 	a = kzalloc(sizeof(*a), GFP_KERNEL);
@@ -458,7 +576,7 @@ static int chan_create(struct nvdrv_dev *nv, struct nv_chan *ch, u32 handle, u32
 	a->gpfifo_entries = cpu_to_le32(GPFIFO_ENTRIES);
 	a->flags = cpu_to_le32(NVOS04_FLAGS_BASE | 0 << NVOS04_RUNQUEUE_SHIFT |
 			       (chid % 8) << NVOS04_USERD_IDX_SHIFT | (chid / 8) << NVOS04_USERD_PAGE_SHIFT);
-	a->h_vaspace = cpu_to_le32(nv->vmm.handle);
+	a->h_vaspace = cpu_to_le32(vm->handle);
 	a->engine_type = cpu_to_le32(engine);
 	a->instance_mem = (struct nv_memdesc){ cpu_to_le64(ch->inst), cpu_to_le64(CHAN_INST_SIZE), cpu_to_le32(2), cpu_to_le32(1) };
 	a->userd_mem = (struct nv_memdesc){ cpu_to_le64(f->userd + chid * USERD_SIZE), cpu_to_le64(USERD_SIZE), cpu_to_le32(2), cpu_to_le32(1) };
@@ -466,16 +584,16 @@ static int chan_create(struct nvdrv_dev *nv, struct nv_chan *ch, u32 handle, u32
 	a->mthdbuf_mem = (struct nv_memdesc){ cpu_to_le64(ch->mthdbuf.dma), cpu_to_le64(mthdbuf_size), cpu_to_le32(1), 0 };
 	a->internal_flags = cpu_to_le32(KCHAN_INTERNAL_FLAGS);
 	a->error_notifier_mem = (struct nv_memdesc){ cpu_to_le64(ch->errnotif.dma), cpu_to_le64(SZ_4K), cpu_to_le32(1), 0 };
-	ret = nv_rm_alloc(nv, nv->rm.h_client, nv->rm.h_device, handle, AMPERE_CHANNEL_GPFIFO_A, a, sizeof(*a));
+	ret = nv_rm_alloc(nv, vm->h_client, vm->h_device, handle, AMPERE_CHANNEL_GPFIFO_A, a, sizeof(*a));
 	kfree(a);
 	if (ret)
 		return ret;
 	ch->handle = handle;
 
 	v32 = cpu_to_le32(engine);
-	ret = nv_rm_control(nv, nv->rm.h_client, ch->handle, NVA06F_CTRL_CMD_BIND, &v32, sizeof(v32));
+	ret = nv_rm_control(nv, vm->h_client, ch->handle, NVA06F_CTRL_CMD_BIND, &v32, sizeof(v32));
 	if (!ret)
-		ret = nv_rm_control(nv, nv->rm.h_client, ch->handle, NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, sched, 2);
+		ret = nv_rm_control(nv, vm->h_client, ch->handle, NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, sched, 2);
 	if (ret)
 		return ret;
 	/*
@@ -489,6 +607,24 @@ static int chan_create(struct nvdrv_dev *nv, struct nv_chan *ch, u32 handle, u32
 	return 0;
 }
 
+/* Free a client channel (RM preempts and unbinds it) and everything the host gave it. */
+void nv_chan_destroy(struct nvdrv_dev *nv, struct nv_chan *ch)
+{
+	lockdep_assert_held(&nv->gsp_lock);
+	if (ch->handle && nv->gsp_running)
+		nv_rm_free(nv, ch->vm->h_client, ch->handle);
+	nv_dma_buf_free(nv, &ch->gpfifo);
+	nv_dma_buf_free(nv, &ch->pb);
+	nv_dma_buf_free(nv, &ch->mthdbuf);
+	nv_dma_buf_free(nv, &ch->sem);
+	nv_dma_buf_free(nv, &ch->errnotif);
+	nv_mem_put(nv, &ch->ctx[0]);
+	nv_mem_put(nv, &ch->ctx[1]);
+	if (ch->chid)
+		nv_chid_put(nv, ch->chid);
+	memset(ch, 0, sizeof(*ch));
+}
+
 /* The copy-engine channel: a CE with physical engines on a runlist of its own. */
 static int ce_chan_init(struct nvdrv_dev *nv, struct nv_chan *ch)
 {
@@ -498,7 +634,7 @@ static int ce_chan_init(struct nvdrv_dev *nv, struct nv_chan *ch)
 
 	ret = ce_pick(nv, &runlist, &n, &rl_base);
 	if (!ret)
-		ret = chan_create(nv, ch, NVDRV_H_CHAN(0), CHID_CE, NV2080_ENGINE_TYPE_COPY0 + n, runlist, rl_base);
+		ret = nv_chan_create(nv, ch, &nv->vmm, NVDRV_H_CHAN(0), CHID_CE, NV2080_ENGINE_TYPE_COPY0 + n, runlist, rl_base);
 	if (ret)
 		return ret;
 	ch->ce = n;
@@ -509,7 +645,7 @@ static int ce_chan_init(struct nvdrv_dev *nv, struct nv_chan *ch)
 
 /* ---- push buffer and submission -------------------------------------------- */
 
-static void push(struct nv_chan *ch, u32 subc, u32 mthd, const u32 *data, u32 n)
+void nv_push(struct nv_chan *ch, u32 subc, u32 mthd, const u32 *data, u32 n)
 {
 	u32 *pb = ch->pb.cpu;
 
@@ -518,14 +654,19 @@ static void push(struct nv_chan *ch, u32 subc, u32 mthd, const u32 *data, u32 n)
 		pb[ch->pb_put++] = *data++;
 }
 
-static void push1(struct nv_chan *ch, u32 subc, u32 mthd, u32 v)
+void nv_push1(struct nv_chan *ch, u32 subc, u32 mthd, u32 v)
 {
-	push(ch, subc, mthd, &v, 1);
+	nv_push(ch, subc, mthd, &v, 1);
 }
 
 /* Submit everything pushed since the last kick as one GPFIFO entry. */
-static void kick(struct nvdrv_dev *nv, struct nv_chan *ch)
+void nv_kick(struct nvdrv_dev *nv, struct nv_chan *ch)
 {
+	u32 spins = 0;
+
+	/* room for one more GPFIFO entry */
+	while ((ch->gp_put + 1) % GPFIFO_ENTRIES == ioread32(ch->userd_cpu + USERD_GP_GET) && spins++ < 200000)
+		udelay(10);
 	u64 va = ch->pb_va + ch->pb_start * 4;
 	u32 len = ch->pb_put - ch->pb_start, *gp = ch->gpfifo.cpu;
 
@@ -533,6 +674,12 @@ static void kick(struct nvdrv_dev *nv, struct nv_chan *ch)
 	gp[ch->gp_put * 2 + 1] = (upper_32_bits(va) & 0xff) | len << 10;
 	ch->gp_put = (ch->gp_put + 1) % GPFIFO_ENTRIES;
 	ch->pb_start = ch->pb_put;
+	/*
+	 * Kernel push buffers wrap once 3/4 full: by then the GPFIFO (512 entries) has been
+	 * waited on far more often than the oldest segment could still be pending.
+	 */
+	if (ch->pb_put > PUSHBUF_SIZE / 4 * 3 / 4)
+		ch->pb_put = ch->pb_start = 0;
 	wmb();
 	iowrite32(ch->gp_put, ch->userd_cpu + USERD_GP_PUT);
 	wmb();
@@ -553,10 +700,10 @@ static void ce_copy(struct nv_chan *ch, u64 dst_va, u64 src_va, u32 bytes, u32 s
 	u32 in_out[4] = { upper_32_bits(src_va), lower_32_bits(src_va), upper_32_bits(dst_va), lower_32_bits(dst_va) };
 	u32 sem[3] = { upper_32_bits(ch->sem_va), lower_32_bits(ch->sem_va), seq };
 
-	push(ch, SUBC_CE, C7B5_OFFSET_IN_UPPER, in_out, 4);
-	push1(ch, SUBC_CE, C7B5_LINE_LENGTH_IN, bytes);
-	push(ch, SUBC_CE, C7B5_SET_SEMAPHORE_A, sem, 3);
-	push1(ch, SUBC_CE, C7B5_LAUNCH_DMA, LAUNCH_COPY_SEM);
+	nv_push(ch, SUBC_CE, C7B5_OFFSET_IN_UPPER, in_out, 4);
+	nv_push1(ch, SUBC_CE, C7B5_LINE_LENGTH_IN, bytes);
+	nv_push(ch, SUBC_CE, C7B5_SET_SEMAPHORE_A, sem, 3);
+	nv_push1(ch, SUBC_CE, C7B5_LAUNCH_DMA, LAUNCH_COPY_SEM);
 }
 
 /* ---- graphics engine context (nouveau r535 gr.c) --------------------------- */
@@ -619,7 +766,7 @@ static int gr_ctxbuf_add(struct nvdrv_dev *nv, u16 id, u32 size, bool init, bool
 	if (init)
 		nv_vram_fill(nv, vram, size, 0, NULL, NULL);
 	if (!nonmapped) {
-		ret = vmm_map_vram_flags(nv, &nv->vmm, vram, size, align, PTE_PRIV | (ro ? PTE_RO : 0), &va);
+		ret = nv_vmm_map_vram_flags(nv, &nv->vmm, vram, size, align, PTE_PRIV | (ro ? PTE_RO : 0), &va);
 		if (ret)
 			return ret;
 	}
@@ -664,7 +811,7 @@ static int gr_ctx_promote(struct nvdrv_dev *nv, struct nv_chan *ch)
 			ret = gr_ctxbuf_add(nv, PROMOTE_ID_UNRESTRICTED_PRIV_ACCESS_MAP, size, true, true, false);
 	}
 	if (!ret)
-		ret = vmm_flush(nv, &nv->vmm);
+		ret = nv_vmm_flush(nv, &nv->vmm);
 	if (ret)
 		goto out;
 
@@ -702,6 +849,68 @@ out:
 	return ret;
 }
 
+/*
+ * GR context for a client channel (r535_gr_chan_new: promote with golden = false):
+ * fresh MAIN and PATCH buffers from the pool (RM initialises them from the golden
+ * context), the global buffers from the golden setup mapped into the client's VM,
+ * PRIV_ACCESS_MAP mapped this time and its unrestricted copy left out.
+ */
+int nv_gr_chan_ctx(struct nvdrv_dev *nv, struct nv_chan *ch)
+{
+	struct nv_fifo *f = &nv->fifo;
+	struct nv_vmm *vm = ch->vm;
+	struct nv_promote_ctx *pc;
+	int i, n = 0, ret = 0;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	if (!f->gr_ready)
+		return -ENODEV;
+	pc = kzalloc(sizeof(*pc), GFP_KERNEL);
+	if (!pc)
+		return -ENOMEM;
+	for (i = 0; i < f->ctxbuf_nr && !ret; i++) {
+		struct nv_promote_entry *e = &pc->entry[n];
+		u16 id = f->ctxbuf[i].id;
+		u64 size = f->ctxbuf[i].size, va, vram = f->ctxbuf[i].vram, align;
+		bool ro = false;
+		int j, k = id == PROMOTE_ID_MAIN ? 0 : id == 2 ? 1 : -1;
+
+		if (id == PROMOTE_ID_UNRESTRICTED_PRIV_ACCESS_MAP)
+			continue;
+		for (j = 0; j < ARRAY_SIZE(gr_ctxbufs); j++)
+			if (gr_ctxbufs[j].id == id)
+				ro = gr_ctxbufs[j].ro;
+		align = id == PROMOTE_ID_ATTRIBUTE_CB ? roundup_pow_of_two(size) :
+			size >= SZ_2M ? SZ_2M : size >= SZ_64K ? SZ_64K : SZ_4K;
+		if (k >= 0) {	/* per-channel */
+			ret = nv_mem_get(nv, &ch->ctx[k], size, align);
+			if (ret)
+				break;
+			vram = ch->ctx[k].start;
+			nv_vram_fill(nv, vram, size, 0, NULL, NULL);
+			e->initialize = 1;
+			e->gpu_phys_addr = cpu_to_le64(vram);
+			e->size = cpu_to_le64(size);
+			e->phys_attr = cpu_to_le32(4);
+		}
+		ret = nv_vmm_map_vram_flags(nv, vm, vram, size, align, NV_PTE_PRIV | (ro ? NV_PTE_RO : 0), &va);
+		e->buffer_id = cpu_to_le16(id);
+		e->gpu_virt_addr = cpu_to_le64(va);
+		n++;
+	}
+	if (!ret)
+		ret = nv_vmm_flush(nv, vm);
+	if (!ret) {
+		pc->engine_type = cpu_to_le32(NV2080_ENGINE_TYPE_GR0);
+		pc->h_chan_client = cpu_to_le32(vm->h_client);
+		pc->h_object = cpu_to_le32(ch->handle);
+		pc->entry_count = cpu_to_le32(n);
+		ret = nv_rm_control(nv, vm->h_client, vm->h_subdevice, NV2080_CTRL_CMD_GPU_PROMOTE_CTX, pc, sizeof(*pc));
+	}
+	kfree(pc);
+	return ret;
+}
+
 #define SUBC_3D			0
 #define SUBC_COMPUTE		1
 #define C7C0_SET_REPORT_SEMAPHORE_A	0x1b00
@@ -714,14 +923,14 @@ static int gr_chan_init(struct nvdrv_dev *nv, struct nv_chan *ch)
 
 	if (!f->gr_rl_base)
 		return -ENODEV;
-	ret = chan_create(nv, ch, NVDRV_H_CHAN(1), CHID_GR, NV2080_ENGINE_TYPE_GR0, f->gr_runlist, f->gr_rl_base);
+	ret = nv_chan_create(nv, ch, &nv->vmm, NVDRV_H_CHAN(1), CHID_GR, NV2080_ENGINE_TYPE_GR0, f->gr_runlist, f->gr_rl_base);
 	if (!ret)
 		ret = gr_ctx_promote(nv, ch);
 	if (ret)
 		return ret;
-	push1(ch, SUBC_3D, 0, AMPERE_B);		/* SET_OBJECT */
-	push1(ch, SUBC_COMPUTE, 0, AMPERE_COMPUTE_B);
-	kick(nv, ch);
+	nv_push1(ch, SUBC_3D, 0, AMPERE_B);		/* SET_OBJECT */
+	nv_push1(ch, SUBC_COMPUTE, 0, AMPERE_COMPUTE_B);
+	nv_kick(nv, ch);
 	f->gr_ready = true;
 	return 0;
 }
@@ -741,9 +950,9 @@ int nv_gr_test(struct nvdrv_dev *nv)
 	{
 		u32 d[4] = { upper_32_bits(ch->sem_va), lower_32_bits(ch->sem_va), seq, REPORT_SEM_RELEASE_1WORD };
 
-		push(ch, SUBC_COMPUTE, C7C0_SET_REPORT_SEMAPHORE_A, d, 4);
+		nv_push(ch, SUBC_COMPUTE, C7C0_SET_REPORT_SEMAPHORE_A, d, 4);
 	}
-	kick(nv, ch);
+	nv_kick(nv, ch);
 	ret = read_poll_timeout(READ_ONCE, sem, sem == seq, 50, 2000000, false, *(u32 *)ch->sem.cpu);
 	n = ch->errnotif.cpu;
 	dev_info(&nv->pdev->dev, "gr test: compute semaphore %u/%u (%d), GP_GET %u/%u, error notifier %u/0x%x\n",
@@ -751,6 +960,46 @@ int nv_gr_test(struct nvdrv_dev *nv)
 out:
 	mutex_unlock(&nv->gsp_lock);
 	return ret;
+}
+
+/*
+ * Zero [vram, vram + size) with the copy engine in physical mode (constant remap), and
+ * wait for it. Caller holds gsp_lock (nvdrv's CE channel).
+ */
+#define C7B5_SET_DST_PHYS_MODE	0x264
+#define C7B5_OFFSET_OUT_UPPER	0x408
+#define C7B5_SET_REMAP_CONST_A	0x700
+#define C7B5_SET_REMAP_COMPONENTS	0x708
+#define REMAP_CONST_A_4BYTE	0x30004		/* DST_X = CONST_A, 4-byte components, 1 src/dst */
+#define LAUNCH_CLEAR_PHYS_SEM	0x258e		/* LAUNCH_COPY_SEM | REMAP | DST_TYPE PHYSICAL */
+int nv_ce_clear(struct nvdrv_dev *nv, u64 vram, u64 size)
+{
+	struct nv_chan *ch = &nv->chan;
+	u32 seq = 0, sem;
+	u64 off;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	if (!ch->handle || (vram | size) & 3)
+		return -ENODEV;
+	nv_push1(ch, SUBC_CE, C7B5_SET_REMAP_CONST_A, 0);
+	nv_push1(ch, SUBC_CE, C7B5_SET_REMAP_COMPONENTS, REMAP_CONST_A_4BYTE);
+	nv_push1(ch, SUBC_CE, C7B5_SET_DST_PHYS_MODE, 0);	/* LOCAL_FB */
+	for (off = 0; off < size; off += SZ_1G) {
+		u64 dst = vram + off, n = min_t(u64, size - off, SZ_1G);
+		u32 out[2] = { upper_32_bits(dst), lower_32_bits(dst) };
+		u32 semd[3];
+
+		seq = ++ch->seq;
+		semd[0] = upper_32_bits(ch->sem_va);
+		semd[1] = lower_32_bits(ch->sem_va);
+		semd[2] = seq;
+		nv_push(ch, SUBC_CE, C7B5_OFFSET_OUT_UPPER, out, 2);
+		nv_push1(ch, SUBC_CE, C7B5_LINE_LENGTH_IN, n / 4);
+		nv_push(ch, SUBC_CE, C7B5_SET_SEMAPHORE_A, semd, 3);
+		nv_push1(ch, SUBC_CE, C7B5_LAUNCH_DMA, LAUNCH_CLEAR_PHYS_SEM);
+	}
+	nv_kick(nv, ch);
+	return read_poll_timeout(READ_ONCE, sem, (s32)(sem - seq) >= 0, 20, 2000000, false, *(u32 *)ch->sem.cpu);
 }
 
 static void __maybe_unused rl_state(struct nvdrv_dev *nv, const char *when)
@@ -781,13 +1030,22 @@ int nv_fifo_init(struct nvdrv_dev *nv)
 	if (!nv->rm.h_device)
 		return -ENODEV;
 	ret = nv_bar1_init(nv);
+	set_bit(CHID_CE, nv->fifo.chids);
+	set_bit(CHID_GR, nv->fifo.chids);
 	if (!ret && !nv->vmm.handle)
 		ret = vmm_init(nv, &nv->vmm);
+	if (!ret && !nv->mem.ready) {	/* the VRAM pool takes its range from the carve-out */
+		struct drm_mm_node n;
+
+		ret = nv_mem_get(nv, &n, SZ_4K, 0);
+		if (!ret)
+			nv_mem_put(nv, &n);
+	}
 	if (!ret && !nv->chan.handle) {
 		ret = ce_chan_init(nv, &nv->chan);
 		if (!ret) {
-			push1(&nv->chan, SUBC_CE, 0, AMPERE_DMA_COPY_B);	/* SET_OBJECT */
-			kick(nv, &nv->chan);
+			nv_push1(&nv->chan, SUBC_CE, 0, AMPERE_DMA_COPY_B);	/* SET_OBJECT */
+			nv_kick(nv, &nv->chan);
 		}
 	}
 	if (!ret && !nv->grch.handle)
@@ -813,23 +1071,23 @@ int nv_ce_test(struct nvdrv_dev *nv)
 	ret = nv_fifo_init(nv);
 	if (!nv->chan.handle || !e->fb)
 		goto out;	/* a GR setup failure alone does not stop the CE test */
-	ret = dma_buf_alloc(nv, &src, SZ_1M);
+	ret = nv_dma_buf_alloc(nv, &src, SZ_1M);
 	if (ret)
 		goto out;
 	for (s = src.cpu, i = 0; i < SZ_1M / 4; i++)
 		s[i] = 0xff000000 | (i * 2654435761u >> 8);	/* hashed colours */
 	dst = e->fb + (e->fb_size / 2 & ~(u64)(SZ_1M - 1));
-	ret = vmm_map_sysmem(nv, &nv->vmm, &src, &src_va);
+	ret = nv_vmm_map_sysmem(nv, &nv->vmm, &src, &src_va);
 	if (!ret)
-		ret = vmm_map_vram(nv, &nv->vmm, dst, SZ_1M, &dst_va);
+		ret = nv_vmm_map_vram(nv, &nv->vmm, dst, SZ_1M, &dst_va);
 	if (!ret)
-		ret = vmm_flush(nv, &nv->vmm);
+		ret = nv_vmm_flush(nv, &nv->vmm);
 	if (ret)
 		goto out_free;
 
 	seq = ++ch->seq;
 	ce_copy(ch, dst_va, src_va, SZ_1M, seq);
-	kick(nv, ch);
+	nv_kick(nv, ch);
 	ret = read_poll_timeout(READ_ONCE, sem, sem == seq, 50, 2000000, false, *(u32 *)ch->sem.cpu);
 	for (i = 0; i < 64; i++) {
 		u32 idx = (i * 4099) % (SZ_1M / 4);
@@ -841,7 +1099,7 @@ int nv_ce_test(struct nvdrv_dev *nv)
 	if (!ret && bad)
 		ret = -EIO;
 out_free:
-	dma_buf_free(nv, &src);	/* GPU done with it (or the GPU gets reset before reuse) */
+	nv_dma_buf_free(nv, &src);	/* GPU done with it (or the GPU gets reset before reuse) */
 out:
 	mutex_unlock(&nv->gsp_lock);
 	return ret;
@@ -913,11 +1171,11 @@ void nv_fifo_fini(struct nvdrv_dev *nv)
 	for (i = 0; i < ARRAY_SIZE(chans); i++) {
 		struct nv_chan *ch = chans[i];
 
-		dma_buf_free(nv, &ch->gpfifo);
-		dma_buf_free(nv, &ch->pb);
-		dma_buf_free(nv, &ch->mthdbuf);
-		dma_buf_free(nv, &ch->sem);
-		dma_buf_free(nv, &ch->errnotif);
+		nv_dma_buf_free(nv, &ch->gpfifo);
+		nv_dma_buf_free(nv, &ch->pb);
+		nv_dma_buf_free(nv, &ch->mthdbuf);
+		nv_dma_buf_free(nv, &ch->sem);
+		nv_dma_buf_free(nv, &ch->errnotif);
 		memset(ch, 0, sizeof(*ch));
 	}
 	if (nv->fifo.userd_cpu)

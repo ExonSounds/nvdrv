@@ -35,6 +35,8 @@
 #include <drm/drm_vblank.h>
 #include <drm/drm_vblank_helper.h>
 
+#include <uapi/drm/nouveau_drm.h>
+
 #include "nvdrv.h"
 
 struct nv_drm {
@@ -302,6 +304,45 @@ static const struct drm_driver nv_drm_driver = {
 	DRM_FBDEV_SHMEM_DRIVER_OPS,
 };
 
+/*
+ * nvk=1: the same KMS device plus nouveau's uAPI subset (src/uapi.c) on a render node.
+ * Mesa only binds NVK to a DRM driver named "nouveau" with version >= 1.3.1; 1.4.0
+ * keeps NVK off the transfer-queue path (copy-engine channels) for now.
+ */
+static const struct file_operations nv_nvk_fops = {
+	.owner = THIS_MODULE,
+	.open = drm_open,
+	.release = drm_release,
+	.unlocked_ioctl = nv_uapi_ioctl,
+	.compat_ioctl = drm_compat_ioctl,
+	.poll = drm_poll,
+	.read = drm_read,
+	.llseek = noop_llseek,
+	.mmap = drm_gem_mmap,
+	.fop_flags = FOP_UNSIGNED_OFFSET,
+};
+
+static struct drm_driver nv_nvk_driver = {	/* .ioctls set at registration (another unit) */
+	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC | DRIVER_RENDER |
+			   DRIVER_SYNCOBJ | DRIVER_SYNCOBJ_TIMELINE,
+	.name = "nouveau",
+	.desc = "nvdrv GSP-RM (nouveau uAPI subset)",
+	.major = 1,
+	.minor = 4,
+	.patchlevel = 0,
+	.fops = &nv_nvk_fops,
+	.open = nv_uapi_open,
+	.postclose = nv_uapi_postclose,
+	.num_ioctls = DRM_NOUVEAU_GEM_INFO + 1,	/* nv_uapi_ioctls[] is indexed by ioctl number */
+	DRM_GEM_SHMEM_DRIVER_OPS,
+	DRM_FBDEV_SHMEM_DRIVER_OPS,
+};
+
+struct nvdrv_dev *nv_drm_nv(struct drm_device *dev)
+{
+	return to_nv_drm(dev)->nv;
+}
+
 static void nv_mode_to_drm(const struct nv_mode *m, struct drm_display_mode *dm)
 {
 	memset(dm, 0, sizeof(*dm));
@@ -352,7 +393,8 @@ int nv_drm_register(struct nvdrv_dev *nv)
 	if (ret)
 		return ret;
 
-	d = devm_drm_dev_alloc(&pdev->dev, &nv_drm_driver, struct nv_drm, dev);
+	nv_nvk_driver.ioctls = nv_uapi_ioctls_ptr;
+	d = devm_drm_dev_alloc(&pdev->dev, nv_nvk ? &nv_nvk_driver : &nv_drm_driver, struct nv_drm, dev);
 	if (IS_ERR(d))
 		return PTR_ERR(d);
 	dev = &d->dev;

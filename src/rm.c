@@ -371,8 +371,6 @@ int nv_rm_free(struct nvdrv_dev *nv, u32 h_client, u32 h_object)
  * (0xc1d0xxxx); GSP-RM's internal client is 0xc2xxxxxx. Object handles are free-form.
  */
 #define NVDRV_H_CLIENT		0xc1d00001
-#define NVDRV_H_DEVICE		0xd0000080
-#define NVDRV_H_SUBDEVICE	0xd0002080
 
 /* NV0000_ALLOC_PARAMETERS, NV0080_ALLOC_PARAMETERS, NV2080_ALLOC_PARAMETERS (tools/rm_struct_probe.sh) */
 struct nv0000_alloc {
@@ -419,6 +417,35 @@ static_assert(sizeof(struct nv2080_memsys_static_config) == 40);
 static_assert(offsetof(struct nv2080_memsys_static_config, l2_cache_size) == 8);
 static_assert(offsetof(struct nv2080_memsys_static_config, ram_type) == 28);
 static_assert(offsetof(struct nv2080_memsys_static_config, lts_per_ltc) == 36);
+
+/*
+ * A further RM client with its own device and subdevice (handles NVDRV_H_DEVICE /
+ * NVDRV_H_SUBDEVICE inside it), e.g. one per DRM file for its GPU address space, the way
+ * nouveau gives each VMM its own client (r535 vmm.c). Free it with nv_rm_free(h, h).
+ */
+int nv_rm_client_alloc(struct nvdrv_dev *nv, u32 h_client)
+{
+	struct nv0000_alloc root = {
+		.h_client = cpu_to_le32(h_client),
+		.process_id = cpu_to_le32(KERNEL_PID),
+		.process_name = DRV_NAME,
+	};
+	struct nv0080_alloc device = { .h_client_share = cpu_to_le32(h_client) };
+	struct nv2080_alloc subdevice = { .sub_device_id = 0 };
+	int ret;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	ret = nv_rm_alloc(nv, h_client, 0, 0, NV01_ROOT, &root, sizeof(root));
+	if (ret)
+		return ret;
+	ret = nv_rm_alloc(nv, h_client, h_client, NVDRV_H_DEVICE, NV01_DEVICE_0, &device, sizeof(device));
+	if (!ret)
+		ret = nv_rm_alloc(nv, h_client, NVDRV_H_DEVICE, NVDRV_H_SUBDEVICE, NV20_SUBDEVICE_0,
+				  &subdevice, sizeof(subdevice));
+	if (ret)
+		nv_rm_free(nv, h_client, h_client);
+	return ret;
+}
 
 /*
  * Caller holds gsp_lock, GSP-RM running. Allocates root client -> device ->

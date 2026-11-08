@@ -87,25 +87,32 @@ int nv_bar1_init(struct nvdrv_dev *nv)
 }
 
 /*
- * Map [vram, vram + size) at BAR1 offset va (both 64 KiB aligned) and return a
- * write-combined CPU mapping of it.
+ * Point BAR1 [va, va + size) at [vram, vram + size), or unmap it (vram == NV_BAR1_UNMAP).
+ * All 64 KiB aligned. Caller holds gsp_lock (PRAMIN).
  */
-void __iomem *nv_bar1_map(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size)
+int nv_bar1_set(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size)
 {
 	struct nv_bar1 *b = &nv->bar1;
+	bool unmap = vram == NV_BAR1_UNMAP;
 	u64 off;
 
 	lockdep_assert_held(&nv->gsp_lock);
-	if (!b->tables || (va | vram | size) & (SZ_64K - 1) || va + size > b->size)
-		return NULL;
+	if (!b->tables || (va | size | (unmap ? 0 : vram)) & (SZ_64K - 1) || va + size > b->size)
+		return -EINVAL;
 	for (off = 0; off < size; off += SZ_64K) {
 		u64 v = va + off, pt = b->pts + (v >> 21) * BAR1_PT_BYTES;
 
 		/* PD0 dual entry: [0] = 64 KiB page table, [1] = 4 KiB table (none) */
 		wr64(nv, b->pd0 + (v >> 21) * 16, (pt >> 4) | PDE_VRAM);
-		wr64(nv, pt + ((v >> 16) & 31) * 8, ((vram + off) >> 4) | PTE_VALID);
+		wr64(nv, pt + ((v >> 16) & 31) * 8, unmap ? 0 : ((vram + off) >> 4) | PTE_VALID);
 	}
-	if (bar1_invalidate(nv))
+	return bar1_invalidate(nv);
+}
+
+/* Map and return a write-combined CPU mapping of it. */
+void __iomem *nv_bar1_map(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size)
+{
+	if (nv_bar1_set(nv, va, vram, size))
 		return NULL;
 	return ioremap_wc(pci_resource_start(nv->pdev, 1) + va, size);
 }

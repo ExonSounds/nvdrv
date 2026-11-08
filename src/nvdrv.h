@@ -2,6 +2,7 @@
 #ifndef NVDRV_H
 #define NVDRV_H
 
+#include <drm/drm_mm.h>
 #include <linux/debugfs.h>
 #include <linux/io.h>
 #include <linux/mutex.h>
@@ -344,12 +345,30 @@ struct nv_drm;
 /* GPU address space and channel (src/fifo.c). */
 struct nv_vmm {
 	u32 handle;		/* FERMI_VASPACE_A */
+	u32 h_client, h_device, h_subdevice;	/* RM objects it lives under */
 	u64 root;		/* root page directory (VRAM) */
-	u64 next;		/* next free VA (bump) */
+	u64 next;		/* next free VA for kernel objects (bump) */
+	bool external;		/* client VM: externally owned, page tables from the pool */
+	struct list_head pts;	/* struct nv_pt, external only */
+};
+
+/* A freeable VRAM allocation from the pool (src/mem.c). */
+struct nv_pt {
+	struct list_head head;
+	struct drm_mm_node node;
+};
+
+struct nv_mem {
+	struct mutex lock;
+	struct drm_mm mm;
+	u64 base, size, used;
+	bool ready;
 };
 
 struct nv_chan {
+	struct nv_vmm *vm;
 	u32 handle, chid, runlist, token, ce, rl_base, engine;
+	struct drm_mm_node ctx[2];		/* client GR channels: MAIN, PATCH from the pool */
 	u64 inst;				/* VRAM */
 	void __iomem *userd_cpu;		/* this channel's USERD through BAR1 */
 	struct nv_dma_buf gpfifo, pb, mthdbuf, sem, errnotif;
@@ -366,6 +385,20 @@ struct nv_fifo {
 	u32 ctxbuf_nr;
 	struct { u64 vram, va, size; u16 id; bool nonmapped; } ctxbuf[NV_GR_MAX_CTXBUFS];
 	bool gr_ready;
+	unsigned long chids[2];			/* chids in use (0 = reserved by RM) */
+	u32 gr_ce;				/* a copy engine on the GR runlist (GRCE) */
+};
+
+/* nouveau-compatible uAPI state (src/uapi.c) */
+struct nv_uapi {
+	spinlock_t lock;			/* fence lock: pending lists, active channels */
+	struct list_head active;		/* channels with unsignalled fences */
+	struct hrtimer timer;			/* polls their semaphores */
+	bool polling;				/* timer armed or running (under lock) */
+	struct mutex bar1_lock;
+	struct drm_mm bar1_mm;			/* BAR1 VA for CPU-mapped VRAM objects */
+	bool bar1_ready;
+	u32 gpcs, tpcs;
 };
 
 struct nvdrv_dev {
@@ -399,6 +432,8 @@ struct nvdrv_dev {
 	struct nv_chan chan;		/* copy engine */
 	struct nv_chan grch;		/* graphics/compute */
 	struct nv_fifo fifo;
+	struct nv_mem mem;
+	struct nv_uapi uapi;
 	bool gsp_touched;	/* Booter/FWSEC ran: GSP may DMA into our memory */
 	bool gsp_running;	/* GSP_INIT_DONE received */
 
@@ -459,6 +494,9 @@ int nv_rm_alloc(struct nvdrv_dev *nv, u32 h_client, u32 h_parent, u32 h_object, 
 		void *params, u32 params_size);
 int nv_rm_control(struct nvdrv_dev *nv, u32 h_client, u32 h_object, u32 cmd,
 		  void *params, u32 params_size);
+#define NVDRV_H_DEVICE		0xd0000080	/* in every nvdrv RM client */
+#define NVDRV_H_SUBDEVICE	0xd0002080
+int nv_rm_client_alloc(struct nvdrv_dev *nv, u32 h_client);
 int nv_rm_free(struct nvdrv_dev *nv, u32 h_client, u32 h_object);
 int nv_rm_init_objects(struct nvdrv_dev *nv);
 void nv_rm_fini_objects(struct nvdrv_dev *nv);
@@ -492,9 +530,58 @@ int nv_evo_wait(struct nvdrv_dev *nv, struct nv_evo_chan *c);
 
 /* bar1.c */
 int nv_bar1_init(struct nvdrv_dev *nv);
+#define NV_BAR1_UNMAP	(~0ULL)
+int nv_bar1_set(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size);
 void __iomem *nv_bar1_map(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size);
 
 /* fifo.c */
+/* src/mem.c: VRAM pool for GEM objects, client page tables, channel contexts */
+int nv_mem_get(struct nvdrv_dev *nv, struct drm_mm_node *n, u64 size, u64 align);
+void nv_mem_put(struct nvdrv_dev *nv, struct drm_mm_node *n);
+void nv_mem_fini(struct nvdrv_dev *nv);
+
+/* src/fifo.c helpers shared with src/uapi.c (caller holds gsp_lock) */
+#define NV_PTE_APER_SYS_COH	(2ULL << 1)
+#define NV_PTE_VOL		BIT_ULL(3)
+#define NV_PTE_PRIV		BIT_ULL(5)
+#define NV_PTE_RO		BIT_ULL(6)
+#define NV_PTE_KIND_SHIFT	56
+int nv_vmm_map_4k(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pa, u64 pte_flags);
+int nv_vmm_set_pte(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pte);
+int nv_vmm_flush(struct nvdrv_dev *nv, struct nv_vmm *vm);
+void nv_vmm_join(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 inst);
+int nv_vmm_map_vram_flags(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 vram, u64 size, u64 align,
+			  u64 pte_flags, u64 *va);
+int nv_vmm_map_sysmem(struct nvdrv_dev *nv, struct nv_vmm *vm, const struct nv_dma_buf *b, u64 *va);
+int nv_vmm_client_init(struct nvdrv_dev *nv, struct nv_vmm *vm, u32 h_client, u64 kernel_va);
+void nv_vmm_client_fini(struct nvdrv_dev *nv, struct nv_vmm *vm);
+int nv_dma_buf_alloc(struct nvdrv_dev *nv, struct nv_dma_buf *b, size_t size);
+void nv_dma_buf_free(struct nvdrv_dev *nv, struct nv_dma_buf *b);
+int nv_chan_create(struct nvdrv_dev *nv, struct nv_chan *ch, struct nv_vmm *vm, u32 handle, u32 chid,
+		   u32 engine, u32 runlist, u32 rl_base);
+void nv_chan_destroy(struct nvdrv_dev *nv, struct nv_chan *ch);
+int nv_gr_chan_ctx(struct nvdrv_dev *nv, struct nv_chan *ch);
+int nv_ce_clear(struct nvdrv_dev *nv, u64 vram, u64 size);
+int nv_chid_get(struct nvdrv_dev *nv);
+void nv_chid_put(struct nvdrv_dev *nv, u32 chid);
+void nv_push(struct nv_chan *ch, u32 subc, u32 mthd, const u32 *data, u32 n);
+void nv_push1(struct nv_chan *ch, u32 subc, u32 mthd, u32 v);
+void nv_kick(struct nvdrv_dev *nv, struct nv_chan *ch);
+/* src/uapi.c */
+struct drm_file;
+struct drm_device;
+struct file;
+extern bool nv_nvk;
+struct nvdrv_dev *nv_drm_nv(struct drm_device *dev);
+void nv_uapi_init(struct nvdrv_dev *nv);
+void nv_uapi_fini(struct nvdrv_dev *nv);
+int nv_uapi_open(struct drm_device *dev, struct drm_file *file);
+void nv_uapi_postclose(struct drm_device *dev, struct drm_file *file);
+long nv_uapi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
+struct drm_ioctl_desc;
+extern const struct drm_ioctl_desc *const nv_uapi_ioctls_ptr;
+extern const int nv_uapi_num_ioctls;
+
 int nv_fifo_init(struct nvdrv_dev *nv);
 int nv_ce_test(struct nvdrv_dev *nv);
 int nv_gr_test(struct nvdrv_dev *nv);
