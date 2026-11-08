@@ -503,6 +503,9 @@ int nv_rm_get_static_info(struct nvdrv_dev *nv);
 void nv_rm_static_info_show(struct nvdrv_dev *nv, struct seq_file *m);
 int nv_rm_alloc(struct nvdrv_dev *nv, u32 h_client, u32 h_parent, u32 h_object, u32 cls,
 		void *params, u32 params_size);
+#define NV_RMAPI_RPC_FLAGS_SERIALIZED	BIT(1)	/* params are FINN-serialised (src/finn.c) */
+int nv_rm_control_flags(struct nvdrv_dev *nv, u32 h_client, u32 h_object, u32 cmd,
+			void *params, u32 params_size, u32 flags);
 int nv_rm_control(struct nvdrv_dev *nv, u32 h_client, u32 h_object, u32 cmd,
 		  void *params, u32 params_size);
 #define NVDRV_H_DEVICE		0xd0000080	/* in every nvdrv RM client */
@@ -578,6 +581,15 @@ void nv_chid_put(struct nvdrv_dev *nv, u32 chid);
 void nv_push(struct nv_chan *ch, u32 subc, u32 mthd, const u32 *data, u32 n);
 void nv_push1(struct nv_chan *ch, u32 subc, u32 mthd, u32 v);
 void nv_kick(struct nvdrv_dev *nv, struct nv_chan *ch);
+/* src/finn.c: board I2C through GSP-RM (NV402C_CTRL_CMD_I2C_TRANSACTION, FINN-encoded) */
+enum nv_i2c_type {			/* NV402C_CTRL_I2C_TRANSACTION_TYPE */
+	NV_I2C_QUICK = 0,
+	NV_I2C_SMBUS_BYTE = 4,
+	NV_I2C_SMBUS_WORD = 5,
+};
+int nv_i2c_xfer(struct nvdrv_dev *nv, u32 h_i2c, u8 port, u16 addr8, enum nv_i2c_type type, bool write,
+		u8 reg, bool ping, u16 *val);
+
 /* src/sensors.c */
 int nv_sensor_temp(struct nvdrv_dev *nv, long *mc);
 void nv_sensors_show(struct nvdrv_dev *nv, struct seq_file *m);

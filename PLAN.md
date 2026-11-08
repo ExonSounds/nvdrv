@@ -418,7 +418,18 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       (0x3d) line (GA104: line 13; FAN PWM is line 16); its input is bit 14 of 0x021200 + 4·line (nouveau ga102
       gpio), timed over four level changes = one rotation (nouveau therm/fan.c). Passive; GSP-RM keeps driving the
       fan. Checked under load: ~1290 RPM up to ~50 C, then rising to 1800 RPM at 58 C.
+- [x] **Second fan** (2026-11-09): hwmon `fan2_input`. DCB GPIO function 0xd2 (not in the public DCB 4.x spec)
+      is the second fan's tach on this board (line 7): found by sampling every GPIO input passively; it toggles
+      at fan rates next to line 13 and follows the same curve independently under load (1270 -> 1810 RPM vs
+      1280 -> 1800). Both fans share the PWM (line 16). Lines 0 (function 0x81) and 22 (0xd4) toggle at PWM rates.
 - [ ] **Board power** - experiments (debugfs `i2c`, read-only):
+      - **FINN-encoded `NV402C_CTRL_CMD_I2C_TRANSACTION` works** (`src/finn.c`, port of NVIDIA's MIT bit pump;
+        RMAPI_RPC_FLAGS_SERIALIZED). Pitfall: the SMBUS_QUICK record is {bWrite, warFlags}; missing warFlags gave
+        NV_ERR_LIB_RM_VERSION_MISMATCH. With SPEED_MODE_DEFAULT every call is INVALID_ARGUMENT; at 100 kHz port 1
+        carries real traffic (PING/quick/byte at the reserved 0x7f -> NV_ERR_I2C_ERROR = NACK).
+      - **The VRM's bus (DCB logical port 2) is closed to clients**: INVALID_ARGUMENT at every speed/mode before
+        any bus traffic; the VRM does not answer on port 1. Treated as a deliberate RM protection of the voltage
+        regulator bus; not worked around. So no board power through public interfaces on this card.
       - Older open SDK releases (515/525/535) stub the thermal/fan/clk/pmgr controls too: no published route.
       - RM-mediated I2C: `NV40_I2C` (0x402c) allocates; `I2C_TABLE_GET_DEV_INFO` lists one board device (type 0x47,
         not in the DCB 4.x type list but in its power-controller range: the VRM, addr 0x25, port 2) and no INA

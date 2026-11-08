@@ -319,6 +319,13 @@ int nv_rm_alloc(struct nvdrv_dev *nv, u32 h_client, u32 h_parent, u32 h_object, 
 int nv_rm_control(struct nvdrv_dev *nv, u32 h_client, u32 h_object, u32 cmd,
 		  void *params, u32 params_size)
 {
+	return nv_rm_control_flags(nv, h_client, h_object, cmd, params, params_size, 0);
+}
+
+/* flags: RMAPI_RPC_FLAGS_* (e.g. NV_RMAPI_RPC_FLAGS_SERIALIZED for FINN-encoded params). */
+int nv_rm_control_flags(struct nvdrv_dev *nv, u32 h_client, u32 h_object, u32 cmd,
+			void *params, u32 params_size, u32 flags)
+{
 	struct gsp_rm_control *m;
 	u32 size = sizeof(*m) + params_size;
 	char what[48];
@@ -333,6 +340,7 @@ int nv_rm_control(struct nvdrv_dev *nv, u32 h_client, u32 h_object, u32 cmd,
 	m->h_object = cpu_to_le32(h_object);
 	m->cmd = cpu_to_le32(cmd);
 	m->params_size = cpu_to_le32(params_size);
+	m->flags = cpu_to_le32(flags);
 	memcpy(m->params, params, params_size);
 
 	ret = nv_rpc_call(nv, NV_RPC_GSP_RM_CONTROL, m, size, m, size);

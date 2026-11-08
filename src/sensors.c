@@ -73,8 +73,16 @@ struct nv_level_info {			/* NV2080_CTRL_PERF_GET_LEVEL_INFO_V2_PARAMS */
 };
 static_assert(sizeof(struct nv_level_info) == 780);
 
-static int fan_line = -1;	/* FAN_SENSE GPIO line from the VBIOS, -1 = none */
-static int fan_rpm(struct nvdrv_dev *nv, long *rpm);
+/*
+ * Tach GPIO lines from the VBIOS, -1 = none. [0]: DCB function 0x3d FAN_SENSE (public
+ * DCB 4.x spec). [1]: function 0xd2, which the public spec does not list; on this GA104
+ * board it is the second fan's tachometer: it toggles at fan rates next to line 13 and
+ * follows the same fan curve independently (1270 -> 1810 RPM vs 1280 -> 1800 under
+ * load), both fans sharing one PWM.
+ */
+#define NV_FANS			2
+static int fan_line[NV_FANS] = { -1, -1 };
+static int fan_rpm(struct nvdrv_dev *nv, int fan, long *rpm);
 
 /* GPU temperature in millidegrees C; works whenever BAR0 is mapped (no GSP needed). */
 int nv_sensor_temp(struct nvdrv_dev *nv, long *mc)
@@ -167,9 +175,11 @@ void nv_sensors_show(struct nvdrv_dev *nv, struct seq_file *m)
 		seq_printf(m, "temperature: unavailable (raw 0x%08x)\n", nv_rd32(nv, NV_THERM_SENSOR));
 	{
 		long rpm;
+		int f;
 
-		if (!fan_rpm(nv, &rpm))
-			seq_printf(m, "fan: %ld RPM (tach on GPIO line %d)\n", rpm, fan_line);
+		for (f = 0; f < NV_FANS; f++)
+			if (!fan_rpm(nv, f, &rpm))
+				seq_printf(m, "fan %d: %ld RPM (tach on GPIO line %d)\n", f + 1, rpm, fan_line[f]);
 	}
 	if (!nv->rm.h_subdevice) {
 		seq_puts(m, "(GSP-RM not running: no utilisation or clocks)\n");
@@ -213,6 +223,7 @@ void nv_sensors_show(struct nvdrv_dev *nv, struct seq_file *m)
 /* ---- fan tachometer ---------------------------------------------------------- */
 
 #define DCB_GPIO_FAN_SENSE	0x3d
+#define DCB_GPIO_FAN2_SENSE	0xd2	/* empirical, see fan_line */
 #define NV_GPIO_LINE(n)		(0x00021200 + (n) * 4)
 #define NV_GPIO_LINE_SENSE	BIT(14)
 
@@ -227,8 +238,8 @@ static u32 vb_rd(const struct nvdrv_dev *nv, u32 off, u32 bytes)
 	return v;
 }
 
-/* DCB 4.x GPIO Assignment Table: the line with function FAN_SENSE. */
-static int fan_sense_line(struct nvdrv_dev *nv)
+/* DCB 4.x GPIO Assignment Table: the line with function `func`. */
+static int fan_sense_line(struct nvdrv_dev *nv, u8 func)
 {
 	u32 dcb = vb_rd(nv, 0x36, 2), gpio, hdr, cnt, len, i;
 
@@ -243,24 +254,25 @@ static int fan_sense_line(struct nvdrv_dev *nv)
 	for (i = 0; i < cnt; i++) {
 		u32 info = vb_rd(nv, gpio + hdr + i * len, 4);
 
-		if (((info >> 8) & 0xff) == DCB_GPIO_FAN_SENSE)
+		if (((info >> 8) & 0xff) == func)
 			return info & 0x3f;
 	}
 	return -ENOENT;
 }
 
 /* Fan speed in RPM, 0 if stopped (no rotation within 250 ms). Sleeps ~4 tach periods. */
-static int fan_rpm(struct nvdrv_dev *nv, long *rpm)
+static int fan_rpm(struct nvdrv_dev *nv, int fan, long *rpm)
 {
 	u32 prev, cur, changes = 0;
 	u64 start = 0, end, t0 = ktime_get_ns();
+	int line = fan_line[fan];
 
-	if (fan_line < 0)
+	if (line < 0)
 		return -ENODEV;
-	prev = nv_rd32(nv, NV_GPIO_LINE(fan_line)) & NV_GPIO_LINE_SENSE;
+	prev = nv_rd32(nv, NV_GPIO_LINE(line)) & NV_GPIO_LINE_SENSE;
 	do {
 		usleep_range(500, 1000);	/* up to 7500 RPM */
-		cur = nv_rd32(nv, NV_GPIO_LINE(fan_line)) & NV_GPIO_LINE_SENSE;
+		cur = nv_rd32(nv, NV_GPIO_LINE(line)) & NV_GPIO_LINE_SENSE;
 		if (cur != prev) {
 			if (!start)
 				start = ktime_get_ns();
@@ -280,7 +292,8 @@ static umode_t hwmon_visible(const void *data, enum hwmon_sensor_types type, u32
 {
 	if (type == hwmon_temp && (attr == hwmon_temp_input || attr == hwmon_temp_label))
 		return 0444;
-	if (type == hwmon_fan && (attr == hwmon_fan_input || attr == hwmon_fan_label) && fan_line >= 0)
+	if (type == hwmon_fan && (attr == hwmon_fan_input || attr == hwmon_fan_label) && channel < NV_FANS &&
+	    fan_line[channel] >= 0)
 		return 0444;
 	return 0;
 }
@@ -292,14 +305,14 @@ static int hwmon_read(struct device *dev, enum hwmon_sensor_types type, u32 attr
 	if (type == hwmon_temp && attr == hwmon_temp_input)
 		return nv_sensor_temp(nv, val);
 	if (type == hwmon_fan && attr == hwmon_fan_input)
-		return fan_rpm(nv, val);
+		return fan_rpm(nv, channel, val);
 	return -EOPNOTSUPP;
 }
 
 static int hwmon_read_string(struct device *dev, enum hwmon_sensor_types type, u32 attr, int channel,
 			     const char **str)
 {
-	*str = type == hwmon_fan ? "GPU fan" : "GPU";
+	*str = type != hwmon_fan ? "GPU" : channel ? "GPU fan 2" : "GPU fan 1";
 	return 0;
 }
 
@@ -311,7 +324,7 @@ static const struct hwmon_ops nv_hwmon_ops = {
 
 static const struct hwmon_channel_info *const nv_hwmon_info[] = {
 	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_LABEL),
-	HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT | HWMON_F_LABEL),
+	HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT | HWMON_F_LABEL, HWMON_F_INPUT | HWMON_F_LABEL),
 	NULL
 };
 
@@ -325,9 +338,10 @@ void nv_hwmon_init(struct nvdrv_dev *nv)
 {
 	struct device *hw;
 
-	fan_line = fan_sense_line(nv);
-	if (fan_line >= 0)
-		dev_info(&nv->pdev->dev, "hwmon: fan tachometer on GPIO line %d (VBIOS DCB)\n", fan_line);
+	fan_line[0] = fan_sense_line(nv, DCB_GPIO_FAN_SENSE);
+	fan_line[1] = fan_sense_line(nv, DCB_GPIO_FAN2_SENSE);
+	dev_info(&nv->pdev->dev, "hwmon: fan tachometers on GPIO lines %d, %d (VBIOS DCB)\n",
+		 fan_line[0], fan_line[1]);
 	hw = devm_hwmon_device_register_with_info(&nv->pdev->dev, "nvdrv", nv, &nv_hwmon_chip, NULL);
 	if (IS_ERR(hw))
 		dev_warn(&nv->pdev->dev, "hwmon: registration failed: %ld\n", PTR_ERR(hw));
@@ -432,6 +446,26 @@ int nv_i2c_experiment(struct nvdrv_dev *nv, const char *cmd)
 					 le16_to_cpu(t->dev[i].addr), t->dev[i].port, t->dev[i].idx);
 		}
 		kfree(t);
+	} else if (!strncmp(cmd, "ping ", 5) || !strncmp(cmd, "quick ", 6) || !strncmp(cmd, "rbyte ", 6) ||
+		   !strncmp(cmd, "rword ", 6)) {
+		/* FINN-serialised I2C_TRANSACTION: ping (PING mode), SMBus quick read, read byte / word */
+		bool quick = cmd[0] == 'q', ping = cmd[0] == 'p' || quick, word = cmd[1] == 'w';
+		int n = sscanf(cmd + (cmd[0] == 'p' ? 5 : 6), "%u %x %x", &port, &addr, &reg);
+		u16 val = 0;
+
+		ret = -EINVAL;
+		if (n >= (ping ? 2 : 3) && addr < 0x80 && reg < 0x100) {
+			ret = nv_rm_alloc(nv, nv->rm.h_client, nv->rm.h_subdevice, NVDRV_H_I2C, NV40_I2C, NULL, 0);
+			ret = nv_i2c_xfer(nv, NVDRV_H_I2C, port, addr << 1,
+					  ping ? NV_I2C_QUICK : word ? NV_I2C_SMBUS_WORD : NV_I2C_SMBUS_BYTE,
+					  false, ping ? 0 : reg, ping && !quick, &val);
+			if (ping)
+				i2c_logf("%s port %u addr 0x%02x: %d (%s)\n", quick ? "quick" : "ping", port, addr, ret,
+					 ret ? "no answer" : "ACK");
+			else
+				i2c_logf("%s port %u addr 0x%02x cmd 0x%02x: %d, value 0x%04x\n", word ? "rword" : "rbyte",
+					 port, addr, reg, ret, val);
+		}
 	} else if (sscanf(cmd, "read %u %x %x %u", &port, &addr, &reg, &len) == 4 && len && len <= 16 &&
 		   addr < 0x80 && reg < 0x100) {
 		struct nv_i2c_rw_reg *p = kzalloc(sizeof(*p), GFP_KERNEL);
