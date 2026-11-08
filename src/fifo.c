@@ -103,6 +103,15 @@ int nv_vmm_set_pte(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pte)
 	u64 pd2, pd1, pd0, pt;
 	int ret;
 
+	/*
+	 * Every directory level is a slow uncached VRAM read through PRAMIN; consecutive
+	 * pages share one page table per 2 MiB, so remember the last one (page tables live
+	 * as long as the VM, the cache never goes stale).
+	 */
+	if (vm->pt_valid && vm->pt_key == va >> 21) {
+		wr64(nv, vm->pt_addr + ((va >> 12) & 511) * 8, pte);
+		return 0;
+	}
 	ret = pd_next(nv, vm, vm->root + ((va >> 47) & 3) * 8, &pd2);
 	if (!ret)
 		ret = pd_next(nv, vm, pd2 + ((va >> 38) & 511) * 8, &pd1);
@@ -112,6 +121,9 @@ int nv_vmm_set_pte(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pte)
 		ret = pd_next(nv, vm, pd0 + ((va >> 21) & 255) * 16 + 8, &pt);
 	if (ret)
 		return ret;
+	vm->pt_key = va >> 21;
+	vm->pt_addr = pt;
+	vm->pt_valid = true;
 	wr64(nv, pt + ((va >> 12) & 511) * 8, pte);
 	return 0;
 }

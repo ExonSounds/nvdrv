@@ -71,6 +71,7 @@ struct nv_cli {
 	bool vm_ready;
 	u64 kernel_va, kernel_size;
 	struct list_head vmas;		/* struct nv_vma, sorted by addr */
+	u32 nsparse;			/* sparse regions among them */
 	struct idr chans;		/* struct nv_uchan */
 };
 
@@ -547,6 +548,8 @@ static u64 hole_pte(struct nv_cli *cli, u64 va)
 {
 	struct nv_vma *v;
 
+	if (!cli->nsparse)
+		return 0;
 	list_for_each_entry(v, &cli->vmas, link)
 		if (!v->bo && va >= v->addr && va < v->addr + v->range)
 			return NV_PTE_VOL;
@@ -602,6 +605,8 @@ static int vma_remove(struct nv_cli *cli, u64 addr, u64 range, bool sparse)
 			t->bo_offset += end - v->addr;
 			if (t->bo)
 				drm_gem_object_get(&t->bo->base);
+			else
+				cli->nsparse++;
 			list_add(&t->link, &v->link);
 			v->range = addr - v->addr;
 		} else if (v->addr < addr) {
@@ -614,6 +619,8 @@ static int vma_remove(struct nv_cli *cli, u64 addr, u64 range, bool sparse)
 			list_del(&v->link);
 			if (v->bo)
 				drm_gem_object_put(&v->bo->base);
+			else
+				cli->nsparse--;
 			kfree(v);
 		}
 	}
@@ -669,6 +676,7 @@ static int vm_bind_op(struct drm_file *file, struct nv_cli *cli, const struct dr
 		return ret;
 	}
 	list_add_tail(&v->link, &cli->vmas);
+	cli->nsparse += !v->bo;
 	return 0;
 }
 
@@ -859,6 +867,7 @@ static int ioctl_channel_free(struct drm_device *dev, void *data, struct drm_fil
 }
 
 static void push_dump(struct nv_cli *cli, u32 chid, u64 va, u32 len);
+static void uapi_boost(struct nvdrv_dev *nv);
 #define HOST_SEM_ADDR_LO	0x5c
 #define HOST_SEM_EXECUTE_RELEASE_WFI	(0x1 | 1 << 20)	/* RELEASE, RELEASE_WFI, 32-bit payload */
 
@@ -944,6 +953,7 @@ static int ioctl_exec(struct drm_device *dev, void *data, struct drm_file *file)
 	}
 	dma_fence_put(u->last);
 	u->last = dma_fence_get(fence);
+	uapi_boost(nv);
 unlock:
 	mutex_unlock(&cli->lock);
 	if (!ret)
@@ -992,6 +1002,31 @@ static void push_dump(struct nv_cli *cli, u32 chid, u64 va, u32 len)
 		return;
 	}
 	pr_info("nvdrv: chid %u push 0x%llx+%u not in any mapping\n", chid, va, len);
+}
+
+/*
+ * GSP-RM keeps the GPU in P8 / PCIe Gen1 under a compositor's load (its governor does not
+ * raise clocks for it), so rendering runs at idle clocks and stutters. Every submission
+ * re-arms a short boost to P0 / Gen3, at most one request per second; idle drops back.
+ */
+#define UAPI_BOOST_SECONDS	3
+
+static void uapi_boost_work(struct work_struct *w)
+{
+	struct nvdrv_dev *nv = container_of(w, struct nvdrv_dev, uapi.boost_work);
+
+	if (!nv->unplugged)
+		nv_rm_perf_boost(nv, UAPI_BOOST_SECONDS);
+}
+
+static void uapi_boost(struct nvdrv_dev *nv)
+{
+	struct nv_uapi *ua = &nv->uapi;
+
+	if (time_after_eq(jiffies, READ_ONCE(ua->boost_next))) {
+		WRITE_ONCE(ua->boost_next, jiffies + HZ);
+		schedule_work(&ua->boost_work);
+	}
 }
 
 /* ---- GETPARAM ---------------------------------------------------------------------- */
@@ -1329,6 +1364,7 @@ void nv_uapi_init(struct nvdrv_dev *nv)
 	spin_lock_init(&ua->lock);
 	INIT_LIST_HEAD(&ua->active);
 	mutex_init(&ua->bar1_lock);
+	INIT_WORK(&ua->boost_work, uapi_boost_work);
 	hrtimer_setup(&ua->timer, uapi_poll, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 }
 
@@ -1340,6 +1376,7 @@ void nv_uapi_fini(struct nvdrv_dev *nv)
 	unsigned long flags;
 
 	hrtimer_cancel(&ua->timer);
+	cancel_work_sync(&ua->boost_work);
 	spin_lock_irqsave(&ua->lock, flags);
 	list_for_each_entry_safe(u, tmp, &ua->active, active) {
 		struct nv_fence *f, *ftmp;

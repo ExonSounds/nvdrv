@@ -353,6 +353,8 @@ struct nv_vmm {
 	u64 root;		/* root page directory (VRAM) */
 	u64 next;		/* next free VA for kernel objects (bump) */
 	bool external;		/* client VM: externally owned, page tables from the pool */
+	u64 pt_key, pt_addr;	/* last 4K page table walked to: VA >> 21 -> VRAM (cache) */
+	bool pt_valid;
 	struct list_head pts;	/* struct nv_pt, external only */
 };
 
@@ -399,6 +401,8 @@ struct nv_uapi {
 	struct list_head active;		/* channels with unsignalled fences */
 	struct hrtimer timer;			/* polls their semaphores */
 	bool polling;				/* timer armed or running (under lock) */
+	struct work_struct boost_work;		/* GPU work submitted: keep clocks up */
+	unsigned long boost_next;		/* jiffies: earliest next boost request */
 	struct mutex bar1_lock;
 	struct drm_mm bar1_mm;			/* BAR1 VA for CPU-mapped VRAM objects */
 	bool bar1_ready;
