@@ -359,6 +359,7 @@ void nv_gsp_fini(struct nvdrv_dev *nv)
 	if (pci_reset_function_locked(nv->pdev))
 		dev_err(&nv->pdev->dev, "gsp: FLR failed; GSP may still access freed memory\n");
 	nv_evo_fini(nv);	/* push buffers: only after the FLR stopped the display engine */
+	nv_fifo_fini(nv);	/* GPFIFO/push buffers: likewise only after the FLR */
 	nv->gsp_touched = nv->gsp_running = false;
 	nv->gsp_info.valid = false;
 }

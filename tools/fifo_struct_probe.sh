@@ -1,0 +1,115 @@
+#!/bin/sh
+# Layouts and constants for GPU VA spaces, channels and the copy engine, compiled from
+# NVIDIA's SDK headers (ref/ogkm). Used to derive src/fifo.c; rerun on firmware updates.
+set -eu
+R=${1:-$(cd "$(dirname "$0")/.." && pwd)/ref/ogkm/src}
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+cat > "$T/probe.c" <<'EOF'
+#include <stdio.h>
+#include <stddef.h>
+#include "nvtypes.h"
+#include "nvmisc.h"
+#include "nvos.h"
+#include "alloc/alloc_channel.h"
+#include "class/clc56f.h"
+#include "class/clc7b5.h"
+#include "class/cl90f1.h"
+#include "class/clc0b5sw.h"
+#include "ctrl/ctrl90f1.h"
+#include "ctrl/ctrla06f.h"
+#include "ctrl/ctrlc36f.h"
+#include "ctrl/ctrl2080/ctrl2080fifo.h"
+#include "ctrl/ctrl2080/ctrl2080ce.h"
+
+#define S(t)    printf("%-58s size %5zu\n", #t, sizeof(t))
+#define F(t, f) printf("  %-56s %5zu %4zu\n", #f, offsetof(t, f), sizeof(((t *)0)->f))
+#define V(x)    printf("  %-56s 0x%08llx\n", #x, (unsigned long long)(x))
+
+int main(void)
+{
+	S(NV_VASPACE_ALLOCATION_PARAMETERS);
+	F(NV_VASPACE_ALLOCATION_PARAMETERS, index); F(NV_VASPACE_ALLOCATION_PARAMETERS, flags);
+	F(NV_VASPACE_ALLOCATION_PARAMETERS, vaSize); F(NV_VASPACE_ALLOCATION_PARAMETERS, vaStartInternal);
+	F(NV_VASPACE_ALLOCATION_PARAMETERS, vaLimitInternal); F(NV_VASPACE_ALLOCATION_PARAMETERS, bigPageSize);
+	F(NV_VASPACE_ALLOCATION_PARAMETERS, vaBase);
+
+	S(NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS);
+#define P(f) F(NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS, f)
+	P(hSubDevice); P(subDeviceId); P(pageSize); P(virtAddrLo); P(virtAddrHi); P(numLevelsToCopy); P(levels);
+	P(levels[0].physAddress); P(levels[0].size); P(levels[0].aperture); P(levels[0].pageShift); P(levels[1]);
+
+	S(NV_CHANNEL_ALLOC_PARAMS);
+#define C(f) F(NV_CHANNEL_ALLOC_PARAMS, f)
+	C(hObjectError); C(hObjectBuffer); C(gpFifoOffset); C(gpFifoEntries); C(flags); C(hContextShare);
+	C(hVASpace); C(hUserdMemory); C(userdOffset); C(engineType); C(cid); C(subDeviceId); C(hObjectEccError);
+	C(instanceMem); C(userdMem); C(ramfcMem); C(mthdbufMem); C(hPhysChannelGroup); C(internalFlags);
+	C(errorNotifierMem); C(eccErrorNotifierMem); C(ProcessID); C(SubProcessID); C(encryptIv); C(decryptIv);
+	C(hmacNonce);
+	S(NV_MEMORY_DESC_PARAMS);
+	F(NV_MEMORY_DESC_PARAMS, base); F(NV_MEMORY_DESC_PARAMS, size);
+	F(NV_MEMORY_DESC_PARAMS, addressSpace); F(NV_MEMORY_DESC_PARAMS, cacheAttrib);
+
+	/* the flags nouveau's r535_chan_alloc composes, minus the per-channel USERD index */
+	V(DRF_DEF(OS04, _FLAGS, _CHANNEL_TYPE, _PHYSICAL) | DRF_DEF(OS04, _FLAGS, _VPR, _FALSE) |
+	  DRF_DEF(OS04, _FLAGS, _CHANNEL_SKIP_MAP_REFCOUNTING, _FALSE) |
+	  DRF_DEF(OS04, _FLAGS, _PRIVILEGED_CHANNEL, _TRUE) |
+	  DRF_DEF(OS04, _FLAGS, _DELAY_CHANNEL_SCHEDULING, _FALSE) |
+	  DRF_DEF(OS04, _FLAGS, _CHANNEL_DENY_PHYSICAL_MODE_CE, _FALSE) |
+	  DRF_DEF(OS04, _FLAGS, _CHANNEL_USERD_INDEX_FIXED, _FALSE) |
+	  DRF_DEF(OS04, _FLAGS, _CHANNEL_USERD_INDEX_PAGE_FIXED, _TRUE) |
+	  DRF_DEF(OS04, _FLAGS, _CHANNEL_DENY_AUTH_LEVEL_PRIV, _FALSE) |
+	  DRF_DEF(OS04, _FLAGS, _CHANNEL_SKIP_SCRUBBER, _FALSE) |
+	  DRF_DEF(OS04, _FLAGS, _CHANNEL_CLIENT_MAP_FIFO, _FALSE) |
+	  DRF_DEF(OS04, _FLAGS, _SET_EVICT_LAST_CE_PREFETCH_CHANNEL, _FALSE) |
+	  DRF_DEF(OS04, _FLAGS, _CHANNEL_VGPU_PLUGIN_CONTEXT, _FALSE) |
+	  DRF_DEF(OS04, _FLAGS, _CHANNEL_PBDMA_ACQUIRE_TIMEOUT, _FALSE) |
+	  DRF_DEF(OS04, _FLAGS, _GROUP_CHANNEL_THREAD, _DEFAULT) |
+	  DRF_DEF(OS04, _FLAGS, _MAP_CHANNEL, _FALSE) |
+	  DRF_DEF(OS04, _FLAGS, _SKIP_CTXBUFFER_ALLOC, _FALSE));
+	V(DRF_SHIFT(NVOS04_FLAGS_GROUP_CHANNEL_RUNQUEUE));
+	V(DRF_SHIFT(NVOS04_FLAGS_CHANNEL_USERD_INDEX_VALUE)); V(DRF_MASK(NVOS04_FLAGS_CHANNEL_USERD_INDEX_VALUE));
+	V(DRF_SHIFT(NVOS04_FLAGS_CHANNEL_USERD_INDEX_PAGE_VALUE)); V(DRF_MASK(NVOS04_FLAGS_CHANNEL_USERD_INDEX_PAGE_VALUE));
+	/* internal flags: PRIVILEGE (1:0) ADMIN = 1, error notifiers NONE (engine_info.h, g_kernel_channel_nvoc.h) */
+	S(NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS);
+	F(NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS, baseIndex);
+	F(NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS, numEntries);
+	F(NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS, bMore);
+	F(NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS, entries);
+	S(NV2080_CTRL_FIFO_DEVICE_ENTRY);
+	F(NV2080_CTRL_FIFO_DEVICE_ENTRY, engineData); F(NV2080_CTRL_FIFO_DEVICE_ENTRY, pbdmaIds);
+	F(NV2080_CTRL_FIFO_DEVICE_ENTRY, pbdmaFaultIds); F(NV2080_CTRL_FIFO_DEVICE_ENTRY, numPbdmas);
+	F(NV2080_CTRL_FIFO_DEVICE_ENTRY, engineName);
+	V(NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE);
+	/* ENGINE_INFO_TYPE (engine_info.h): ENG_DESC 0, RM_ENGINE_TYPE 2, RUNLIST 3, RUNLIST_PRI_BASE 11 */
+
+	S(NVA06F_CTRL_BIND_PARAMS); V(NVA06F_CTRL_CMD_BIND);
+	S(NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS); V(NVA06F_CTRL_CMD_GPFIFO_SCHEDULE);
+	S(NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS); V(NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN);
+	S(NVC0B5_ALLOCATION_PARAMETERS); F(NVC0B5_ALLOCATION_PARAMETERS, version); F(NVC0B5_ALLOCATION_PARAMETERS, engineType);
+	S(NV2080_CTRL_CE_GET_FAULT_METHOD_BUFFER_SIZE_PARAMS); V(NV2080_CTRL_CMD_CE_GET_FAULT_METHOD_BUFFER_SIZE);
+	V(AMPERE_CHANNEL_GPFIFO_A); V(AMPERE_DMA_COPY_B); V(FERMI_VASPACE_A);
+
+	/* USERD and GPFIFO entry layout */
+	F(Nvc56fControl, GPGet); F(Nvc56fControl, GPPut); F(Nvc56fControl, Get); F(Nvc56fControl, Put);
+	V(DRF_SHIFT(NVC56F_GP_ENTRY0_GET)); V(DRF_SHIFT(NVC56F_GP_ENTRY1_GET_HI)); V(DRF_SHIFT(NVC56F_GP_ENTRY1_LENGTH));
+	V(DRF_MASK(NVC56F_GP_ENTRY1_LENGTH));
+	/* host semaphore methods */
+	V(NVC56F_SEM_ADDR_LO); V(NVC56F_SEM_ADDR_HI); V(NVC56F_SEM_PAYLOAD_LO); V(NVC56F_SEM_PAYLOAD_HI); V(NVC56F_SEM_EXECUTE);
+	V(DRF_DEF(C56F, _SEM_EXECUTE, _OPERATION, _RELEASE) | DRF_DEF(C56F, _SEM_EXECUTE, _RELEASE_WFI, _EN) |
+	  DRF_DEF(C56F, _SEM_EXECUTE, _PAYLOAD_SIZE, _32BIT));
+	V(NVC56F_SET_OBJECT);
+	/* copy engine */
+	V(NVC7B5_OFFSET_IN_UPPER); V(NVC7B5_OFFSET_IN_LOWER); V(NVC7B5_OFFSET_OUT_UPPER); V(NVC7B5_OFFSET_OUT_LOWER);
+	V(NVC7B5_PITCH_IN); V(NVC7B5_PITCH_OUT); V(NVC7B5_LINE_LENGTH_IN); V(NVC7B5_LINE_COUNT); V(NVC7B5_LAUNCH_DMA);
+	V(NVC7B5_SET_SEMAPHORE_A); V(NVC7B5_SET_SEMAPHORE_B); V(NVC7B5_SET_SEMAPHORE_PAYLOAD);
+	V(DRF_DEF(C7B5, _LAUNCH_DMA, _DATA_TRANSFER_TYPE, _NON_PIPELINED) | DRF_DEF(C7B5, _LAUNCH_DMA, _FLUSH_ENABLE, _TRUE) |
+	  DRF_DEF(C7B5, _LAUNCH_DMA, _SRC_MEMORY_LAYOUT, _PITCH) | DRF_DEF(C7B5, _LAUNCH_DMA, _DST_MEMORY_LAYOUT, _PITCH) |
+	  DRF_DEF(C7B5, _LAUNCH_DMA, _MULTI_LINE_ENABLE, _FALSE) | DRF_DEF(C7B5, _LAUNCH_DMA, _REMAP_ENABLE, _FALSE) |
+	  DRF_DEF(C7B5, _LAUNCH_DMA, _SRC_TYPE, _VIRTUAL) | DRF_DEF(C7B5, _LAUNCH_DMA, _DST_TYPE, _VIRTUAL) |
+	  DRF_DEF(C7B5, _LAUNCH_DMA, _SEMAPHORE_TYPE, _RELEASE_ONE_WORD_SEMAPHORE));
+	V(DRF_DEF(C7B5, _LAUNCH_DMA, _MULTI_LINE_ENABLE, _TRUE));
+	return 0;
+}
+EOF
+gcc -std=gnu11 -I"$R/common/sdk/nvidia/inc" -o "$T/probe" "$T/probe.c"
+"$T/probe"

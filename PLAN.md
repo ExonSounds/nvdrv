@@ -50,8 +50,8 @@ Most of the work is the boot chain and the RPC layer.
 | 5 | **Secure boot chain** ✅ | Run FWSEC-FRTS (carves WPR2) ✅, load firmware files (`booter_load`, `bootloader`, `gsp` ELF) ✅, build the radix-3 page table for the GSP image ✅ (`tests/phase5_fw.sh`), WPR meta ✅, run Booter-Load on SEC2 → GSP-RM starts. **✅ GSP_INIT_DONE on hardware (2026-11-08), `tests/phase6_boot.sh`** |
 | 6 | **GSP RPC layer** | Shared-memory message/status queues ✅, send/receive + checksums ✅, CPU sequencer incl. CORE_RESUME ✅, pre-boot RPCs ✅ (`tests/phase6_rpc.sh`), doorbell + synchronous calls + event draining ✅, **GET_GSP_STATIC_INFO ✅ (`tests/phase6_static.sh`)**; clean `booter_unload` shutdown, interrupts. |
 | 7 | **RM object model** | GSP_RM_ALLOC / GSP_RM_CONTROL / FREE ✅; root client → device → subdevice ✅; routed control on our subdevice and internal control on GSP's internal subdevice ✅; error paths verified ✅ (`tests/phase7_rm.sh`). |
-| 8 | **Memory management** | VRAM allocator, GPU virtual address spaces and page tables, sysmem mappings. |
-| 9 | **Channels + Copy Engine** | GPFIFO channel, USERD/doorbell, push buffer, run a CE memcpy between VRAM and sysmem and fence on a semaphore. **First "real work" milestone.** |
+| 8 | **Memory management** | VRAM carve-out allocator ✅, GPU VA space with host-written GP100 page tables + RM's server-reserved PDEs ✅, VRAM/sysmem mappings ✅. Next: free/unmap, 64K pages. |
+| 9 | **Channels + Copy Engine** | GPFIFO channel (host-provided inst/USERD/method buffer, BIND, SCHEDULE), doorbell, push buffer ✅; **CE memcpy sysmem → VRAM with semaphore release: first real GPU work (2026-11-08)** ✅ (debugfs `ce_test`). |
 | 10 | **userspace API** | DRM render node and a small uAPI (BO alloc/map, channel create, submit, wait). |
 | 11 | **Compute** | Allocate compute class, launch a hand-assembled or NAK-compiled kernel. |
 | 12 | **Display** (pulled forward) | DP sink discovery + EDID ✅, SOR assignment + DP link training via RM ✅, display instmem/ctxdma/push buffers done by nvdrv in CPU-RM's place ✅, core + window channels ✅, **modeset with a test pattern scanned out from VRAM, confirmed on the monitor (2026-11-08)** ✅, BAR1 CPU mapping ✅, robust bring-up (sink settle, link verify, detach + retrain) ✅, **DRM/KMS device with fbdev: the Linux text console runs on nvdrv, confirmed on the monitor** ✅ (`DRM=1 tests/phase12_display.sh`), **Hyprland 0.57.1 renders on nvdrv** (Mesa llvmpipe through GBM/EGL, confirmed on the monitor, 2026-11-08) ✅, **all EDID modes incl. DisplayID, mode changes through DRM, 2560x1440@180 Hz measured on the head (180 scanline wraps/s)** ✅. Next: faster frame copies, link-loss recovery, gamma LUT, cursor plane. |
@@ -304,13 +304,38 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
     ("smooth"): 5969 plane updates / 20.2 GB copied in a ~20 s motion test (debugfs `drm_stats`), back to P8 when idle.
   - A module reload is impossible while a compositor still holds fds of the unplugged DRM device (each open
     file pins the module); stop it first.
+- **First GPU work: copy engine (2026-11-08).** Following nouveau's r535 GSP code (`src/fifo.c`):
+  - **VA space:** FERMI_VASPACE_A (index GPU_NEW). The host writes the page tables (GP100 format, 4K pages through PD0's
+    small-table slot) and passes RM the PD3/PD2/PD1 pages covering the server-reserved 512 MiB at 4 GiB with
+    `VASPACE_COPY_SERVER_RESERVED_PDES`.
+  - **Instance block:** joined by the host (gp100/gv100_vmm_join: PDB | VER2 | 64K at 0x200, limit 2^49-1 at 0x208,
+    subcontext 0 PDB at 0x2a0, valid mask at 0x298).
+  - **Channel:** AMPERE_CHANNEL_GPFIFO_A with instanceMem/ramfcMem (VRAM), userdMem (VRAM, 0x200 per chid, USERD index
+    fields), mthdbufMem (sysmem, size from CE_GET_FAULT_METHOD_BUFFER_SIZE) and flags 0x00200020 (+ runqueue, USERD
+    index/page). Then NVA06F BIND (engine type) and GPFIFO_SCHEDULE(enable), and AMPERE_DMA_COPY_B {version 1,
+    engineType} on the channel.
+  - **Submission:** GPFIFO entry `{va & ~3, va>>32 | dwords<<10}`, GP_PUT at USERD+0x8c (through BAR1), doorbell
+    `(runlist doorbell id << 16) | chid` to BAR0 0xbb0090 (function base 0xb80000 + NV_FUNC_DOORBELL 0x30090). On GA104
+    the doorbell id (runlist + 0x008 >> 16) equals the runlist number. `GPFIFO_GET_WORK_SUBMIT_TOKEN` returns
+    INVALID_STATE for this privileged channel, so the token is computed as nouveau does.
+  - **Pitfalls found:** (1) internalFlags notifier types: UNKNOWN = 0 is a CPU-RM placeholder; NONE = 1, MEMORY = 3.
+    nvdrv uses a memory **error notifier**, and RM writes the robust-channel code there (info32) when it recovers a
+    channel; it sends no RC event. (2) **CE4 has no PCEs** on this board (`CE_GET_CE_PCE_MASK` = 0; CE2 = 0x10,
+    CE3 = 0x20). Using it gives ROBUST_CHANNEL_CE4_ERROR (71) with CE LAUNCHERR INVALID_CONFIG (0x0d): RM then
+    submits an empty runlist and disables the channel (chram 0x108/0x000). nvdrv now picks a non-GR CE with PCEs.
+  - Debug aids: debugfs `chan_status` (USERD/GPFIFO/push buffer), `chan_kick` (doorbell variants), and reading PBDMA
+    (0x40000 + id·0x800, id from runlist +0x010), runlist (+0x080..0x098, +0x200 engine status) and channel RAM
+    (runlist +0x004 base) registers against the GA100 manuals in open-gpu-doc.
 - **Open:** `DP_CONFIG_STREAM` returns NV_ERR_ILLEGAL_ACTION (0x16) before the modeset; the link works with RM's
   defaults. The core channel also latches EXCEPT 0x10000080 arg 0x41 during the modeset update, but the update takes
   effect. The EDID read during one early probe gave 1920x1080; later reads give 2560x1440 (sink waking up?).
 
 ## Next steps
 
-0. **Desktop polish:** gamma LUT property
+0. **GPU acceleration for Hyprland (in progress):** the GR channel (AMPERE_B / compute) with RM's context buffers
+   (r535 gr.c: golden context, PROMOTE_CTX), then the nouveau uAPI subset Mesa NVK needs (GEM, VM_BIND, EXEC,
+   syncobj, render node) so Zink-on-NVK can drive Hyprland. Meanwhile the CE can take over the scanout copies.
+1. **Desktop polish:** gamma LUT property
    (output LUT), cursor plane, fbdev restore after the last DRM master closes.
 1. **Display robustness:** a link/hotplug poller (no interrupts yet) that redoes `disp_up` when the sink drops the
    link and tells DRM about mode changes; mode changes through DRM atomic (needs a real modeset path per commit);

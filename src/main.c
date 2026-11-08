@@ -608,6 +608,42 @@ static const struct file_operations bar1_bench_fops = {
 	.write = bar1_bench_write,
 };
 
+static int chan_status_show(struct seq_file *m, void *unused)
+{
+	nv_fifo_show(m->private, m);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(chan_status);
+
+static ssize_t chan_kick_write(struct file *f, const char __user *buf, size_t count, loff_t *ppos)
+{
+	u32 mode;
+	int ret = kstrtou32_from_user(buf, count, 0, &mode);
+
+	if (!ret)
+		ret = nv_chan_kick(f->private_data, mode);
+	return ret ? ret : count;
+}
+
+static const struct file_operations chan_kick_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = chan_kick_write,
+};
+
+static ssize_t ce_test_write(struct file *f, const char __user *buf, size_t count, loff_t *ppos)
+{
+	int ret = nv_ce_test(f->private_data);
+
+	return ret ? ret : count;
+}
+
+static const struct file_operations ce_test_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = ce_test_write,
+};
+
 static void nv_debugfs_init(struct nvdrv_dev *nv)
 {
 	nv->dbg = debugfs_create_dir(pci_name(nv->pdev), nvdrv_dbg_root);
@@ -645,6 +681,9 @@ static void nv_debugfs_init(struct nvdrv_dev *nv)
 		debugfs_create_file("perf", 0600, nv->dbg, nv, &perf_fops);
 		debugfs_create_file("bar1_bench", 0200, nv->dbg, nv, &bar1_bench_fops);
 		debugfs_create_file("drm_stats", 0400, nv->dbg, nv, &drm_stats_fops);
+		debugfs_create_file("ce_test", 0200, nv->dbg, nv, &ce_test_fops);
+		debugfs_create_file("chan_status", 0400, nv->dbg, nv, &chan_status_fops);
+		debugfs_create_file("chan_kick", 0200, nv->dbg, nv, &chan_kick_fops);
 	}
 
 	if (nv->vbios.data) {

@@ -341,6 +341,22 @@ struct nv_bar1 {
 
 struct nv_drm;
 
+/* GPU address space and channel (src/fifo.c). */
+struct nv_vmm {
+	u32 handle;		/* FERMI_VASPACE_A */
+	u64 root;		/* root page directory (VRAM) */
+	u64 next;		/* next free VA (bump) */
+};
+
+struct nv_chan {
+	u32 handle, chid, runlist, token, ce, rl_base;
+	u64 inst, userd;			/* VRAM */
+	void __iomem *userd_cpu;		/* this channel's USERD through BAR1 */
+	struct nv_dma_buf gpfifo, pb, mthdbuf, sem, errnotif;
+	u64 gpfifo_va, pb_va, sem_va;
+	u32 gp_put, pb_put, pb_start, seq;
+};
+
 struct nvdrv_dev {
 	struct pci_dev *pdev;
 	void __iomem *bar0;
@@ -368,6 +384,8 @@ struct nvdrv_dev {
 	struct nv_evo evo;
 	struct nv_bar1 bar1;
 	struct nv_drm *drm;	/* DRM device once registered (src/drm.c) */
+	struct nv_vmm vmm;
+	struct nv_chan chan;
 	bool gsp_touched;	/* Booter/FWSEC ran: GSP may DMA into our memory */
 	bool gsp_running;	/* GSP_INIT_DONE received */
 
@@ -462,6 +480,13 @@ int nv_evo_wait(struct nvdrv_dev *nv, struct nv_evo_chan *c);
 /* bar1.c */
 int nv_bar1_init(struct nvdrv_dev *nv);
 void __iomem *nv_bar1_map(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size);
+
+/* fifo.c */
+int nv_fifo_init(struct nvdrv_dev *nv);
+int nv_ce_test(struct nvdrv_dev *nv);
+void nv_fifo_show(struct nvdrv_dev *nv, struct seq_file *m);
+int nv_chan_kick(struct nvdrv_dev *nv, u32 mode);
+void nv_fifo_fini(struct nvdrv_dev *nv);
 
 /* drm.c */
 int nv_drm_register(struct nvdrv_dev *nv);
