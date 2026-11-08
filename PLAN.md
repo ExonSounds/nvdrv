@@ -10,6 +10,9 @@ Kernel: Arch 7.2.x, out-of-tree C module (Kbuild), GPL-2.0.
   RISC-V), and, **since 2026-11-08, nouveau** (the user lifted the original no-nouveau rule to speed
   things up). nouveau code may be used and built on; keep its copyright/license headers (MIT) on
   anything taken from it, and note the origin in the file.
+- **No proprietary code** may be created for or added to the project unless its actual source code is
+  provided with it (user rule, 2026-11-08; also in README). NVIDIA's signed firmware loaded at runtime is
+  not part of the repository.
 - **One firmware version, pinned: `570.144`** (`/lib/firmware/nvidia/ga104/gsp/*-570.144.bin.zst`,
   from linux-firmware). The GSP RPC ABI changes with every release, so every
   struct we define must match that tag of `open-gpu-kernel-modules`.

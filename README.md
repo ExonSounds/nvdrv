@@ -59,6 +59,18 @@ Register offsets, class definitions and RPC layouts come from NVIDIA's
 which are not part of this repository. The `tools/*_probe.sh` scripts derive struct
 layouts by compiling NVIDIA's own headers from a local checkout in `ref/ogkm`.
 
+## Rules for this project
+
+- **No proprietary code may be created for or added to this project unless its actual
+  source code is provided along with it.** No binary-only modules, no obfuscated or
+  generated code without the source it was generated from, and nothing whose source
+  cannot be published here under a compatible license.
+- Code taken from other projects (nouveau, NVIDIA's open-gpu-kernel-modules headers)
+  keeps its original license header and says where it came from.
+- The GSP-RM, booter and bootloader firmware the driver loads at runtime is NVIDIA's
+  signed binary firmware from linux-firmware. It is not part of this repository and is
+  never committed here.
+
 ## License
 
 GPL-2.0-only, see [COPYING](COPYING).
