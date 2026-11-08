@@ -376,22 +376,55 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
 
 ## Next steps
 
-0. **GPU acceleration for Hyprland:** nouveau uAPI subset for NVK ✅ (`nvk=1`), Zink GL ✅, zero-copy
-   scanout ✅ (kmsgl 58 fps @60 Hz, confirmed on screen), **Hyprland smooth on the GPU ✅**. Next: nonstall interrupts
-   instead of the 100 µs fence poll, a CE transfer queue (report 1.4.1), per-object fences for VM_BIND
-   unmap (it waits for the client to idle), block-linear scanout modifiers, BAR1 beyond 512 MiB.
-1. **Desktop polish:** gamma LUT property
-   (output LUT), cursor plane, fbdev restore after the last DRM master closes.
-1. **Display robustness:** a link/hotplug poller (no interrupts yet) that redoes `disp_up` when the sink drops the
-   link and tells DRM about mode changes; mode changes through DRM atomic (needs a real modeset path per commit);
-   identity input LUT; DP_CONFIG_STREAM; core exception. Interrupts (display + GSP message) would replace polling.
-1. **Phase 8 groundwork:** a VA space (`FERMI_VASPACE_A`, 0x90f1) under our device and memory allocations
-   (`NV01_MEMORY_LOCAL_USER` / sysmem). Check the GA10x class list via `NV2080_CTRL_CMD_GPU_GET_ENGINES_V2` /
-   classlist first (note: GET_ENGINES / GET_ENGINE_CLASSLIST *are* FINN-serialized; use the V2 variants or check).
-   Messages > 64 KiB need the large-RPC continuation path (`_issueRpcAndWaitLarge`), which is not implemented yet.
-2. **Clean unload** instead of FLR: UNLOADING_GUEST_DRIVER RPC, wait for halt, Booter-Unload on SEC2 (WPR2 torn down).
-3. **Interrupts** (GSP → CPU message notification) instead of polling; health check of GSP while running.
-4. LibOS log decoding needs `.fwlogging_*` format strings, which the linux-firmware ELF does not ship. Until then, keep raw logs in debugfs.
+Done so far: GSP-RM boot, RM objects, DisplayPort display + KMS/fbdev, GPU VA spaces, channels, copy engine, GR
+contexts, nouveau uAPI subset for Mesa NVK (`nvk=1`), Zink GL, zero-copy scanout; Hyprland runs smoothly on the GPU.
+
+**In progress:** sensors (hwmon) and power management (items marked ▶).
+
+To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
+
+### Rendering and memory
+- [ ] **Interrupts**: nonstall (fence) interrupts instead of the 100 µs fence poll; GSP message notification
+      instead of polling the queue; GSP health check while running.
+- [ ] **Transfer queue**: CE channels (async copy engines) in CHANNEL_ALLOC, report uAPI 1.4.1.
+- [ ] **VRAM eviction / overcommit** to system memory; today the pool is fixed and allocations fail when full.
+- [ ] **BAR1 beyond 512 MiB** (Resizable BAR exposes all 8 GiB): more PD0 pages, larger host-visible VRAM heap.
+- [ ] **64 KiB / 2 MiB GPU pages** (big-page tables) and **compression** (comptags, compressible kinds).
+- [ ] **Z-cull info** (`GET_ZCULL_INFO` from RM) so NVK enables Z-cull.
+- [ ] **Per-object fences / implicit sync**: BO reservation fences (dma-buf with other devices), VM_BIND unmap and
+      CPU_PREP without waiting for the whole client; asynchronous VM_BIND; full sparse-binding semantics.
+- [ ] **Preemption buffers** (GFXP pool/control block, spill, beta CB; CILP) so long compute work can be preempted.
+- [ ] **GPU recovery**: channel/engine reset after faults, device-lost reporting, GPU reset without reload.
+
+### Display
+- [ ] **Multiple monitors**: the other heads/SORs, HDMI (TMDS/FRL), hotplug detection (HPD), EDID reprobe.
+- [ ] **Robust mode changes** with the AOC monitor (identity switching), DP_CONFIG_STREAM, core exceptions.
+- [ ] **Hardware cursor plane** and **overlay planes** (direct scanout of fullscreen apps).
+- [ ] **Adaptive sync (VRR / FreeSync)**.
+- [ ] **Async (tearing) page flips**; **real vblank interrupts and timestamps** instead of the software timer.
+- [ ] **Colour**: gamma LUT / CTM, 10-bit formats, HDR metadata; DSC.
+- [ ] **Block-linear scanout modifiers** (NVK renders scanout buffers linear today).
+- [ ] **Audio** over DisplayPort / HDMI.
+- [ ] fbdev restore after the last DRM master closes; mode changes through a real per-commit modeset path.
+
+### Power, thermals, stability
+- [ ] ▶ **Sensors**: GPU temperature, fan speed, power draw, clocks, utilisation through hwmon (`sensors`) and debugfs.
+- [ ] ▶ **Power management**: let RM's performance governor pick P-states (replace the boost workaround),
+      runtime power-down when idle, **system suspend/resume** (GSP-RM save/restore).
+- [ ] **Clean unload** instead of FLR: UNLOADING_GUEST_DRIVER RPC, wait for halt, Booter-Unload on SEC2.
+- [ ] Fan control / power limits (read-only first; writing them is an explicit user decision).
+
+### Hardware blocks not used yet
+- [ ] **NVDEC** (H.264/HEVC/VP9/AV1 decode) and **NVENC** channels for Vulkan Video / VA-API paths.
+- [ ] OFA (optical flow).
+
+### Platform
+- [ ] Firmware versions other than 570.144 (the RPC ABI changes per release).
+- [ ] Coexistence with nouveau (the uAPI device is named "nouveau" with `nvk=1`).
+- [ ] The Hyprland session needs `VK_DRIVER_FILES` pointing at NVK while the proprietary `nvidia-utils` ICD is
+      installed (it deadlocks Xwayland otherwise).
+- [ ] LibOS log decoding (`.fwlogging_*` format strings are not shipped in linux-firmware); raw logs in debugfs.
+- [ ] Large-RPC continuation path (`_issueRpcAndWaitLarge`) for messages > 64 KiB.
 
 ## Hardware workflow
 
