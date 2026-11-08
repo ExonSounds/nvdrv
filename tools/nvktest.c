@@ -221,6 +221,57 @@ int main(int argc, char **argv)
 	CHECK(drmCommandWrite(fd, DRM_NOUVEAU_CHANNEL_FREE, &cf2, sizeof(cf2)));
 
 	/*
+	 * nvktest pages: 64 KiB pages and their transitions. A 256 KiB VRAM object (big pages)
+	 * gets GPU writes in several chunks; then one 4 KiB page in the middle of a big chunk is
+	 * unmapped (that chunk becomes small pages) and refilled with a GART page; GPU writes
+	 * must land in VRAM next to the hole and in the GART page inside it.
+	 */
+	if (argc > 1 && !strcmp(argv[1], "pages")) {
+		uint32_t hbig, hsys;
+		void *mbig, *msys;
+		const uint64_t base = 0x50000000;
+		static const uint32_t offs[] = { 0x0, 0x10100, 0x30ff0, 0x11000, 0x12000 };
+		int bad = 0;
+
+		CHECK(bo_new(0x40000, NOUVEAU_GEM_DOMAIN_VRAM, &hbig, &mbig));
+		CHECK(bo_new(0x10000, NOUVEAU_GEM_DOMAIN_GART, &hsys, &msys));
+		CHECK(bind(hbig, base, 0x40000, DRM_NOUVEAU_VM_BIND_OP_MAP));
+		for (int round = 0; round < 2; round++) {
+			if (round == 1) {	/* punch a 4 KiB hole into big chunk 1 and fill it from GART */
+				CHECK(bind(0, base + 0x11000, 0x1000, DRM_NOUVEAU_VM_BIND_OP_UNMAP));
+				struct drm_nouveau_vm_bind_op o = { .op = DRM_NOUVEAU_VM_BIND_OP_MAP, .handle = hsys,
+								    .addr = base + 0x11000, .bo_offset = 0, .range = 0x1000 };
+				struct drm_nouveau_vm_bind b = { .op_count = 1, .op_ptr = (uintptr_t)&o };
+				CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_VM_BIND, &b, sizeof(b)));
+			}
+			p = pb;
+			mthd(1, 0x0000, 1, 0xc7c0);
+			for (i = 0; i < 5; i++)
+				mthd(1, 0x1b00, 4, (uint32_t)((base + offs[i]) >> 32), (uint32_t)(base + offs[i]),
+				     0x70000000u + round * 0x100 + i, 1u << 28);
+			ep.va = 0x10000000;
+			ep.va_len = (uint32_t)((char *)p - (char *)pb);
+			ex.channel = ca.channel;
+			ex.wait_count = 0;
+			ex.sig_ptr = (uintptr_t)&sig2;
+			CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_EXEC, &ex, sizeof(ex)));
+			r = drmSyncobjWait(fd, &so2, 1, INT64_MAX, 0, NULL);
+			for (i = 0; i < 5; i++) {
+				uint32_t want = 0x70000000u + round * 0x100 + i, got;
+
+				if (round == 1 && offs[i] == 0x11000)	/* the hole: now the GART page */
+					got = ((volatile uint32_t *)msys)[0];
+				else
+					got = ((volatile uint32_t *)mbig)[offs[i] / 4];
+				bad += got != want;
+				printf("  round %d write +0x%05x: 0x%08x%s\n", round, offs[i], got, got != want ? " (WRONG)" : "");
+			}
+		}
+		printf("pages: wait %d, %d wrong -> %s\n", r, bad, !r && !bad ? "PASS" : "FAIL");
+		return 0;
+	}
+
+	/*
 	 * nvktest overcommit [GiB]: allocate more VRAM than the pool has; nvdrv evicts older
 	 * objects to system memory. Every object must keep its contents (CPU check) and stay
 	 * usable by the GPU (compute writes into the oldest, evicted one).

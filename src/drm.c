@@ -349,7 +349,8 @@ static const struct drm_driver nv_drm_driver = {
 /*
  * nvk=1: the same KMS device plus nouveau's uAPI subset (src/uapi.c) on a render node.
  * Mesa only binds NVK to a DRM driver named "nouveau" with version >= 1.3.1; from 1.4.1
- * on NVK exposes a transfer queue on copy-engine channels.
+ * on NVK exposes a transfer queue on copy-engine channels, from 1.4.2 (big/small PTE
+ * transitions race-free, src/uapi.c write_chunk) it compresses images on Ampere.
  */
 static const struct file_operations nv_nvk_fops = {
 	.owner = THIS_MODULE,
@@ -371,7 +372,7 @@ static struct drm_driver nv_nvk_driver = {	/* .ioctls set at registration (anoth
 	.desc = "nvdrv GSP-RM (nouveau uAPI subset)",
 	.major = 1,
 	.minor = 4,
-	.patchlevel = 1,	/* >= 1.4.1: NVK uses copy-engine channels (transfer queue) */
+	.patchlevel = 2,	/* 1.4.1: transfer queue, page sizes; 1.4.2: LPTE/SPTE safe -> compression */
 	.fops = &nv_nvk_fops,
 	.open = nv_uapi_open,
 	.postclose = nv_uapi_postclose,

@@ -360,6 +360,8 @@ struct nv_vmm {
 	bool external;		/* client VM: externally owned, page tables from the pool */
 	u64 pt_key, pt_addr;	/* last 4K page table walked to: VA >> 21 -> VRAM (cache) */
 	bool pt_valid;
+	u64 lpt_key, lpt_addr;	/* same for the 64 KiB-page table */
+	bool lpt_valid;
 	struct list_head pts;	/* struct nv_pt, external only */
 };
 
@@ -424,6 +426,8 @@ struct nv_uapi {
 	struct list_head vram_bos;		/* evictable VRAM objects, oldest first */
 	struct list_head chans;			/* every client channel (idle wait), under lock */
 	atomic64_t evicted_bytes, evictions;
+	atomic64_t big_ptes, small_ptes;		/* client PTEs written: 64 KiB / 4 KiB */
+	atomic64_t compressed_maps;		/* VM_BIND maps with a compressible kind */
 	struct work_struct boost_work;		/* GPU work submitted: keep clocks up */
 	unsigned long boost_next;		/* jiffies: earliest next boost request */
 	struct mutex bar1_lock;
@@ -586,6 +590,7 @@ void nv_mem_fini(struct nvdrv_dev *nv);
 #define NV_PTE_KIND_SHIFT	56
 int nv_vmm_map_4k(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pa, u64 pte_flags);
 int nv_vmm_set_pte(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pte);
+int nv_vmm_set_lpte(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pte);
 int nv_vmm_flush(struct nvdrv_dev *nv, struct nv_vmm *vm);
 void nv_vmm_join(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 inst);
 int nv_vmm_map_vram_flags(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 vram, u64 size, u64 align,

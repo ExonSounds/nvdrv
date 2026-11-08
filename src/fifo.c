@@ -139,6 +139,36 @@ int nv_vmm_set_pte(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pte)
 	return 0;
 }
 
+/*
+ * Write the 64 KiB-page PTE (LPTE) for va: the big page table hangs off PD0 dual entry [0]
+ * (32 entries per 2 MiB; nvdrv gives it a 4 KiB page). LPTE 0 = "use the small page table",
+ * a valid LPTE overrides the 16 small PTEs below it (gp100 dual page tables).
+ */
+int nv_vmm_set_lpte(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pte)
+{
+	u64 pd2, pd1, pd0, lpt;
+	int ret;
+
+	if (vm->lpt_valid && vm->lpt_key == va >> 21) {
+		wr64(nv, vm->lpt_addr + ((va >> 16) & 31) * 8, pte);
+		return 0;
+	}
+	ret = pd_next(nv, vm, vm->root + ((va >> 47) & 3) * 8, &pd2);
+	if (!ret)
+		ret = pd_next(nv, vm, pd2 + ((va >> 38) & 511) * 8, &pd1);
+	if (!ret)
+		ret = pd_next(nv, vm, pd1 + ((va >> 29) & 511) * 8, &pd0);
+	if (!ret)
+		ret = pd_next(nv, vm, pd0 + ((va >> 21) & 255) * 16, &lpt);	/* dual entry [0] */
+	if (ret)
+		return ret;
+	vm->lpt_key = va >> 21;
+	vm->lpt_addr = lpt;
+	vm->lpt_valid = true;
+	wr64(nv, lpt + ((va >> 16) & 31) * 8, pte);
+	return 0;
+}
+
 int nv_vmm_map_4k(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pa, u64 pte_flags)
 {
 	return nv_vmm_set_pte(nv, vm, va, (pa >> 4) | PTE_VALID | pte_flags);

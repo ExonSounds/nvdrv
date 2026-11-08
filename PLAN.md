@@ -423,7 +423,21 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       - *Use of a large BAR*: the whole VRAM pool is mapped 1:1 into BAR1 (BAR1 offset == VRAM address; 51 ms once),
         so GEM mmap needs no BAR1 space or PTE writes and cannot fail for lack of BAR; GETPARAM VRAM_BAR_SIZE
         reports the pool. NVK then offers DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT over all 7.4 GiB.
-- [ ] **64 KiB / 2 MiB GPU pages** (big-page tables) and **compression** (comptags, compressible kinds).
+- [x] **64 KiB GPU pages + compression** (2026-11-09, uAPI 1.4.2):
+      - Client VMs use GP100 dual page tables: per 64 KiB chunk either *big* (one LPTE in the PD0 [0] table, 32 per
+        2 MiB; any VRAM mapping with 64 KiB-aligned VA and physical address) or *small* (LPTE 0 = "use the small
+        table", 16 SPTEs). Transitions write the SPTEs before an LPTE is invalidated, so the MMU never sees an
+        invalid LPTE over stale SPTEs (what 1.4.2 tells NVK: LPTE/SPTE races fixed). `nvktest pages` punches a
+        4 KiB hole into a big chunk and refills it from GART: all GPU writes land right. 1 GiB maps: 16384 PTEs
+        instead of 262144 (overcommit test 3.1 s -> 1.65 s).
+      - Kinds: Turing/Ampere table (nouveau tu102_mmu_kind); invalid kinds (0x07, 0x0f) rejected; compressible
+        kinds (0x08..0x0e) kept on big pages, downgraded to their uncompressed kind on small pages / system memory.
+        On GA100+ compression needs only the kind (GSP-RM keeps the backing store for all VRAM). Compressed objects
+        are never evicted (a physical copy would move raw compressed bytes).
+      - NVK compresses dedicated unshared optimal-tiling images (64 KiB / 2 MiB aligned); everything else it binds
+        at 4 KiB alignment (its nouveau backend's choice), so most mappings stay small. `tools/gltest.c` (Zink
+        off-screen FBO, gradient + depth test, full readback): exact with a compressed, big-page color target.
+- [ ] **2 MiB GPU pages** (PD0 entry as PTE): needs splitting a 2 MiB PTE back into tables on partial unmap.
 - [ ] **Z-cull info** (`GET_ZCULL_INFO` from RM) so NVK enables Z-cull.
 - [ ] **Per-object fences / implicit sync**: BO reservation fences (dma-buf with other devices), VM_BIND unmap and
       CPU_PREP without waiting for the whole client; asynchronous VM_BIND; full sparse-binding semantics.

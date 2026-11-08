@@ -797,30 +797,107 @@ static u64 hole_pte(struct nv_cli *cli, u64 va)
 	return 0;
 }
 
-static int write_ptes(struct nv_cli *cli, struct nv_vma *v, u64 addr, u64 range)
+/*
+ * PTE kinds, Turing/Ampere (nouveau tu102_mmu_kind): kind -> uncompressed equivalent;
+ * 0x07 (and 0x0f, which maps to it) is invalid, 0x08..0x0e are the compressible kinds.
+ * On GA100+ compression needs nothing but a compressible kind on a 64 KiB / 2 MiB page:
+ * GSP-RM keeps the compression backing store for all of VRAM (nouveau gp100_vmm_valid).
+ */
+static const u8 kind_uncompressed[16] = {
+	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x06, 0x06, 0x02, 0x01, 0x03, 0x04, 0x05, 0x07,
+};
+#define KIND_INVALID	0x07
+
+static bool kind_valid(u8 kind)
+{
+	return kind < ARRAY_SIZE(kind_uncompressed) && kind_uncompressed[kind] != KIND_INVALID;
+}
+
+static bool kind_compressed(u8 kind)
+{
+	return kind_valid(kind) && kind_uncompressed[kind] != kind;
+}
+
+static bool vma_covers(const struct nv_vma *v, u64 va, u64 len)
+{
+	return v && va >= v->addr && va + len <= v->addr + v->range;
+}
+
+/* The object mapping covering va, if any (sparse regions are handled by hole_pte). */
+static struct nv_vma *bo_vma_at(struct nv_cli *cli, u64 va)
+{
+	struct nv_vma *v;
+
+	list_for_each_entry(v, &cli->vmas, link)
+		if (v->bo && vma_covers(v, va, 1))
+			return v;
+	return NULL;
+}
+
+/* 4 KiB PTE for va under mapping v (NULL: unmapped). Small pages cannot be compressed. */
+static u64 spte_for(struct nv_cli *cli, const struct nv_vma *v, u64 va)
+{
+	u64 boff, pte;
+
+	if (!v)
+		return hole_pte(cli, va);
+	if (!v->bo)
+		return NV_PTE_VOL;	/* sparse */
+	boff = v->bo_offset + (va - v->addr);
+	if (v->bo->vram)
+		pte = (v->bo->node.start + boff) >> 4;
+	else
+		pte = (v->bo->dma[boff >> PAGE_SHIFT] + (boff & ~PAGE_MASK)) >> 4 | NV_PTE_APER_SYS_COH | NV_PTE_VOL;
+	return pte | BIT_ULL(0) | (u64)kind_uncompressed[v->kind] << NV_PTE_KIND_SHIFT;
+}
+
+/*
+ * One 64 KiB chunk. Big when a single VRAM mapping covers it with a 64 KiB-aligned physical
+ * address: one LPTE (keeps a compressible kind). Otherwise small: the 16 SPTEs first, then
+ * LPTE 0 (= use the small table), so the MMU never sees an invalid LPTE over stale SPTEs.
+ * hint: the mapping being written (NULL when unmapping); whole: chunk lies inside the
+ * range of the operation, so no other mapping can cover parts of it.
+ */
+static int write_chunk(struct nv_cli *cli, struct nv_vma *hint, u64 va64, bool whole)
 {
 	struct nvdrv_dev *nv = cli->nv;
-	u64 off;
+	struct nv_vma *v = hint;
+	u64 i;
 	int ret = 0;
 
-	for (off = 0; off < range && !ret; off += SZ_4K) {
-		u64 va = addr + off, pte;
+	if (!whole && !vma_covers(v, va64, SZ_64K))
+		v = bo_vma_at(cli, va64);
+	if (v && v->bo && v->bo->vram && vma_covers(v, va64, SZ_64K)) {
+		u64 pa = v->bo->node.start + v->bo_offset + (va64 - v->addr);
 
-		if (!v) {
-			pte = hole_pte(cli, va);
-		} else if (!v->bo) {
-			pte = NV_PTE_VOL;
-		} else {
-			u64 boff = v->bo_offset + (va - v->addr);
-
-			if (v->bo->vram)
-				pte = (v->bo->node.start + boff) >> 4;
-			else
-				pte = (v->bo->dma[boff >> PAGE_SHIFT] + (boff & ~PAGE_MASK)) >> 4 |
-				      NV_PTE_APER_SYS_COH | NV_PTE_VOL;
-			pte |= BIT_ULL(0) | (u64)v->kind << NV_PTE_KIND_SHIFT;
+		if (!(pa & (SZ_64K - 1))) {
+			atomic64_inc(&nv->uapi.big_ptes);
+			return nv_vmm_set_lpte(nv, &cli->vm, va64,
+					       (pa >> 4) | BIT_ULL(0) | (u64)v->kind << NV_PTE_KIND_SHIFT);
 		}
-		ret = nv_vmm_set_pte(nv, &cli->vm, va, pte);
+	}
+	atomic64_add(16, &nv->uapi.small_ptes);
+	for (i = 0; i < SZ_64K && !ret; i += SZ_4K) {
+		u64 va = va64 + i;
+		const struct nv_vma *p = hint;
+
+		if (!whole && !vma_covers(p, va, SZ_4K))
+			p = bo_vma_at(cli, va);
+		ret = nv_vmm_set_pte(nv, &cli->vm, va, spte_for(cli, p, va));
+	}
+	return ret ?: nv_vmm_set_lpte(nv, &cli->vm, va64, 0);
+}
+
+/* Bring [addr, addr + range) in line with the client's mappings; v: the mapping just made. */
+static int write_ptes(struct nv_cli *cli, struct nv_vma *v, u64 addr, u64 range)
+{
+	u64 end = addr + range, c;
+	int ret = 0;
+
+	for (c = ALIGN_DOWN(addr, SZ_64K); c < end && !ret; c += SZ_64K) {
+		bool whole = c >= addr && c + SZ_64K <= end;
+
+		ret = write_chunk(cli, v, c, whole);
 	}
 	return ret;
 }
@@ -905,6 +982,10 @@ static int vm_bind_op(struct drm_file *file, struct nv_cli *cli, const struct dr
 	v->addr = op->addr;
 	v->range = op->range;
 	v->kind = op->flags & 0xff;
+	if (!kind_valid(v->kind)) {
+		kfree(v);
+		return -EINVAL;
+	}
 	if (!sparse) {
 		struct drm_gem_object *obj = drm_gem_object_lookup(file, op->handle);
 
@@ -916,6 +997,14 @@ static int vm_bind_op(struct drm_file *file, struct nv_cli *cli, const struct dr
 		}
 		v->bo = to_nv_bo(obj);
 		v->bo_offset = op->bo_offset;
+		/*
+		 * Compressed data cannot be evicted with a physical copy (it would move the raw
+		 * compressed bytes into memory that is then read uncompressed): pin it.
+		 */
+		if (kind_compressed(v->kind) && v->bo->vram) {
+			v->bo->no_evict = true;
+			atomic64_inc(&cli->nv->uapi.compressed_maps);
+		}
 	}
 	ret = write_ptes(cli, v, v->addr, v->range);
 	if (ret) {
@@ -1681,6 +1770,8 @@ void nv_uapi_mem_show(struct nvdrv_dev *nv, struct seq_file *m)
 	seq_printf(m, "GEM objects in VRAM: %llu (%llu MiB, %llu MiB not evictable)\n", n, bytes >> 20, pinned >> 20);
 	seq_printf(m, "evictions: %lld (%lld MiB moved to system memory)\n", atomic64_read(&ua->evictions),
 		   atomic64_read(&ua->evicted_bytes) >> 20);
+	seq_printf(m, "client PTEs written: %lld big (64 KiB), %lld small (4 KiB); compressed mappings %lld\n",
+		   atomic64_read(&ua->big_ptes), atomic64_read(&ua->small_ptes), atomic64_read(&ua->compressed_maps));
 }
 
 void nv_uapi_init(struct nvdrv_dev *nv)
