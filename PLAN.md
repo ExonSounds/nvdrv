@@ -332,6 +332,25 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
   context; AMPERE_COMPUTE_B (0xc7c0) next to it. nvdrv uses its single GR channel (chid 2, runlist 0) as the golden
   channel (nouveau uses a throwaway one). debugfs `gr_test`: the compute class releases a semaphore
   (SET_REPORT_SEMAPHORE_A..D at 0x1b00) — passes.
+- **nouveau uAPI for Mesa NVK (2026-11-08, `src/uapi.c`, module parameter `nvk=1`).** The DRM driver is named
+  "nouveau" 1.4.0 (NVK checks the name, needs >= 1.3.1; 1.4.1 would enable its transfer queue) with a render node,
+  syncobjs and: GETPARAM (GRAPH_UNITS from GR_GET_GPC_MASK/TPC_MASK: 5 GPCs, 19 TPCs), NVIF device/info/sclass/
+  engine objects (custom ioctl path: variable size), GEM_NEW/INFO/CPU_PREP, VM_INIT/VM_BIND, CHANNEL_ALLOC/FREE,
+  EXEC. Per DRM file: own RM client + *externally owned* FERMI_VASPACE_A (flag bit 3) with the host's page
+  directory given by `NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY` (nouveau r535 vmm.c external path; no RM-reserved
+  range; NVK puts the kernel range at [2^39, 2^40)). VRAM objects: drm_mm pool, zeroed by the CE in physical mode
+  (remap const), mmap through BAR1 (mapped on first mmap). GART: shmem pages, SYS_COH|VOL PTEs. EXEC: GPFIFO
+  entries `{va, va>>32 | BIT(9) subroutine | dwords<<10 | no_prefetch<<31}` + host SEM_RELEASE (0x5c..0x6c,
+  RELEASE_WFI); fences signalled by a 100 µs hrtimer reading the semaphore; error notifier -> fence error.
+  - **Pitfall: client channels must be unprivileged** (NVOS04 bit 5 clear, internal PRIVILEGE_USER). With ADMIN,
+    RM gives the context the *unrestricted* priv access map, which (like nouveau) is not promoted for client
+    channels: NVK's first priv-register write via FECS (macro writing 0x419ba4) faulted at VA 0 + 0x419ba4/32
+    (RC 44 GR_FAULT_DURING_CTXSW, MMU fault 0x20000). Found by dumping NVK's push (`dump_push=1`) and decoding it.
+  - GR context promoted on a channel's first object (as r535_gr_chan_new); RC_TRIGGERED decoded in gsp.c.
+  - Results: vulkaninfo (NVK GA104, Vulkan 1.4), vkmark headless ~17k fps, Zink GLES 3.2 via GBM, kmsgl.
+- **Zero-copy scanout:** DRM framebuffers on nvdrv VRAM objects flip window 0 to them (ctxdma over the pool,
+  SET_OFFSET >> 8, PLANAR_STORAGE pitch >> 6). Pitfall: the modeset leaves the window INTERLOCK_WITH_CORE, so a
+  window-only UPDATE stalls until a core update; flips clear the interlock flags.
   - Debug aids: debugfs `chan_status` (USERD/GPFIFO/push buffer), `chan_kick` (doorbell variants), and reading PBDMA
     (0x40000 + id·0x800, id from runlist +0x010), runlist (+0x080..0x098, +0x200 engine status) and channel RAM
     (runlist +0x004 base) registers against the GA100 manuals in open-gpu-doc.
@@ -341,8 +360,10 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
 
 ## Next steps
 
-0. **GPU acceleration for Hyprland (in progress):** GR channel + context ✅. Next: the nouveau uAPI subset Mesa NVK needs (GEM, VM_BIND, EXEC,
-   syncobj, render node) so Zink-on-NVK can drive Hyprland. Meanwhile the CE can take over the scanout copies.
+0. **GPU acceleration for Hyprland:** nouveau uAPI subset for NVK ✅ (`nvk=1`), Zink GL ✅, zero-copy
+   scanout ✅ (kmsgl 58 fps @60 Hz, confirmed on screen). Next: Hyprland on it; then nonstall interrupts
+   instead of the 100 µs fence poll, a CE transfer queue (report 1.4.1), per-object fences for VM_BIND
+   unmap (it waits for the client to idle), block-linear scanout modifiers, BAR1 beyond 512 MiB.
 1. **Desktop polish:** gamma LUT property
    (output LUT), cursor plane, fbdev restore after the last DRM master closes.
 1. **Display robustness:** a link/hotplug poller (no interrupts yet) that redoes `disp_up` when the sink drops the

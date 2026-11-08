@@ -31,10 +31,16 @@ What works today (see [PLAN.md](PLAN.md) for the phase table, findings and next 
 - a DRM/KMS device with fbdev emulation: the Linux text console runs on nvdrv, and
   Hyprland runs on it with Mesa's software renderer (llvmpipe); all EDID modes,
   up to 2560x1440@180 on the test monitor
+- GPU memory management (VRAM pool, GPU page tables), GPFIFO channels, the copy
+  engine, and the graphics/compute engine with RM-managed contexts
+- **GPU acceleration (experimental, `nvk=1`)**: the subset of nouveau's uAPI that
+  Mesa's NVK Vulkan driver uses, so the stock `vulkan-nouveau` package runs on nvdrv
+  (Vulkan 1.4, `vulkaninfo`, `vkmark`) and OpenGL goes through Zink on top of it;
+  GPU-rendered DRM framebuffers are scanned out without copying
 
-Not there yet: mode changes and hotplug through DRM, memory management, GPU
-channels/copy engine, compute, interrupts, and a clean firmware unload (unbind
-currently resets the GPU).
+Not there yet: interrupts (fences are polled), a transfer queue and sparse-binding
+details in the uAPI, block-linear scanout, mode changes and hotplug through DRM, and
+a clean firmware unload (unbind currently resets the GPU).
 
 ## Building and running
 
@@ -44,6 +50,12 @@ sudo HW=1 ./scripts/bind.sh             # load with allow_hw_writes=1, bind via 
 sudo KEEP=1 DRM=1 ./tests/phase12_display.sh  # boot GSP-RM, light the DP display, console on tty3
 sudo ./scripts/unbind.sh                # unbind (resets the GPU) and unload
 ```
+
+GPU acceleration: load with `NVDRV_PARAMS=nvk=1` (passed through `scripts/bind.sh`) and
+install Mesa's `vulkan-nouveau`. The DRM driver then calls itself `nouveau` (Mesa binds
+NVK only to that name), so the in-tree nouveau module must not be loaded at the same
+time. `tools/nvktest.c` exercises the uAPI directly, `tools/kmsgl.c` shows GPU-rendered
+frames through KMS.
 
 The module never binds automatically: it has no device table and binds only through
 `driver_override`. Without `allow_hw_writes=1` it is read-only. Debug state and
