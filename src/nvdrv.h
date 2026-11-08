@@ -349,12 +349,23 @@ struct nv_vmm {
 };
 
 struct nv_chan {
-	u32 handle, chid, runlist, token, ce, rl_base;
-	u64 inst, userd;			/* VRAM */
+	u32 handle, chid, runlist, token, ce, rl_base, engine;
+	u64 inst;				/* VRAM */
 	void __iomem *userd_cpu;		/* this channel's USERD through BAR1 */
 	struct nv_dma_buf gpfifo, pb, mthdbuf, sem, errnotif;
 	u64 gpfifo_va, pb_va, sem_va;
 	u32 gp_put, pb_put, pb_start, seq;
+};
+
+#define NV_GR_MAX_CTXBUFS	16
+struct nv_fifo {
+	u64 userd;				/* shared USERD page (VRAM, 0x200 per chid) */
+	void __iomem *userd_cpu;		/* ... through BAR1 */
+	u32 gr_runlist, gr_rl_base;
+	/* GR context buffers (promoted to RM once, for the GR channel) */
+	u32 ctxbuf_nr;
+	struct { u64 vram, va, size; u16 id; bool nonmapped; } ctxbuf[NV_GR_MAX_CTXBUFS];
+	bool gr_ready;
 };
 
 struct nvdrv_dev {
@@ -385,7 +396,9 @@ struct nvdrv_dev {
 	struct nv_bar1 bar1;
 	struct nv_drm *drm;	/* DRM device once registered (src/drm.c) */
 	struct nv_vmm vmm;
-	struct nv_chan chan;
+	struct nv_chan chan;		/* copy engine */
+	struct nv_chan grch;		/* graphics/compute */
+	struct nv_fifo fifo;
 	bool gsp_touched;	/* Booter/FWSEC ran: GSP may DMA into our memory */
 	bool gsp_running;	/* GSP_INIT_DONE received */
 
@@ -484,6 +497,7 @@ void __iomem *nv_bar1_map(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size);
 /* fifo.c */
 int nv_fifo_init(struct nvdrv_dev *nv);
 int nv_ce_test(struct nvdrv_dev *nv);
+int nv_gr_test(struct nvdrv_dev *nv);
 void nv_fifo_show(struct nvdrv_dev *nv, struct seq_file *m);
 int nv_chan_kick(struct nvdrv_dev *nv, u32 mode);
 void nv_fifo_fini(struct nvdrv_dev *nv);

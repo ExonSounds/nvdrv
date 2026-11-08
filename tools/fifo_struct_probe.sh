@@ -20,6 +20,10 @@ cat > "$T/probe.c" <<'EOF'
 #include "ctrl/ctrlc36f.h"
 #include "ctrl/ctrl2080/ctrl2080fifo.h"
 #include "ctrl/ctrl2080/ctrl2080ce.h"
+#include "ctrl/ctrl2080/ctrl2080gpu.h"
+#include "ctrl/ctrl2080/ctrl2080internal.h"
+#include "class/clc797.h"
+#include "class/clc7c0.h"
 
 #define S(t)    printf("%-58s size %5zu\n", #t, sizeof(t))
 #define F(t, f) printf("  %-56s %5zu %4zu\n", #f, offsetof(t, f), sizeof(((t *)0)->f))
@@ -108,6 +112,17 @@ int main(void)
 	  DRF_DEF(C7B5, _LAUNCH_DMA, _SRC_TYPE, _VIRTUAL) | DRF_DEF(C7B5, _LAUNCH_DMA, _DST_TYPE, _VIRTUAL) |
 	  DRF_DEF(C7B5, _LAUNCH_DMA, _SEMAPHORE_TYPE, _RELEASE_ONE_WORD_SEMAPHORE));
 	V(DRF_DEF(C7B5, _LAUNCH_DMA, _MULTI_LINE_ENABLE, _TRUE));
+	/* GR context (nouveau r535 gr.c) */
+	S(NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS);
+#define G(f) F(NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS, f)
+	G(engineType); G(hClient); G(ChID); G(hChanClient); G(hObject); G(hVirtMemory); G(virtAddress);
+	G(size); G(entryCount); G(promoteEntry);
+	S(NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY);
+#define E(f) F(NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY, f)
+	E(gpuPhysAddr); E(gpuVirtAddr); E(size); E(physAttr); E(bufferId); E(bInitialize); E(bNonmapped);
+	S(NV2080_CTRL_INTERNAL_STATIC_GR_GET_CONTEXT_BUFFERS_INFO_PARAMS);
+	V(NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO); V(NV2080_CTRL_CMD_GPU_PROMOTE_CTX);
+	V(AMPERE_B); V(AMPERE_COMPUTE_B);
 	return 0;
 }
 EOF

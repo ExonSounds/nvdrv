@@ -644,6 +644,19 @@ static const struct file_operations ce_test_fops = {
 	.write = ce_test_write,
 };
 
+static ssize_t gr_test_write(struct file *f, const char __user *buf, size_t count, loff_t *ppos)
+{
+	int ret = nv_gr_test(f->private_data);
+
+	return ret ? ret : count;
+}
+
+static const struct file_operations gr_test_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = gr_test_write,
+};
+
 static void nv_debugfs_init(struct nvdrv_dev *nv)
 {
 	nv->dbg = debugfs_create_dir(pci_name(nv->pdev), nvdrv_dbg_root);
@@ -682,6 +695,7 @@ static void nv_debugfs_init(struct nvdrv_dev *nv)
 		debugfs_create_file("bar1_bench", 0200, nv->dbg, nv, &bar1_bench_fops);
 		debugfs_create_file("drm_stats", 0400, nv->dbg, nv, &drm_stats_fops);
 		debugfs_create_file("ce_test", 0200, nv->dbg, nv, &ce_test_fops);
+		debugfs_create_file("gr_test", 0200, nv->dbg, nv, &gr_test_fops);
 		debugfs_create_file("chan_status", 0400, nv->dbg, nv, &chan_status_fops);
 		debugfs_create_file("chan_kick", 0200, nv->dbg, nv, &chan_kick_fops);
 	}

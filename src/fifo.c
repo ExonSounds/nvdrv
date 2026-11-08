@@ -22,7 +22,7 @@
 
 #include "nvdrv.h"
 
-static void rl_state(struct nvdrv_dev *nv, const char *when);
+static void __maybe_unused rl_state(struct nvdrv_dev *nv, const char *when);
 
 /* ---- GMMU page tables (GP100+ format, see bar1.c) ------------------------- */
 
@@ -30,6 +30,8 @@ static void rl_state(struct nvdrv_dev *nv, const char *when);
 #define PTE_VALID		BIT_ULL(0)
 #define PTE_APER_SYS_COH	(2ULL << 1)
 #define PTE_VOL			BIT_ULL(3)
+#define PTE_PRIV		BIT_ULL(5)
+#define PTE_RO			BIT_ULL(6)
 
 #define MMU_INVALIDATE_PDB_LO	0x00b830a0
 #define MMU_INVALIDATE_PDB_HI	0x00b830a4
@@ -110,17 +112,23 @@ static int vmm_flush(struct nvdrv_dev *nv, struct nv_vmm *vm)
 	return readl_poll_timeout(nv->bar0 + MMU_INVALIDATE, v, !(v & BIT(31)), 10, 2000000);
 }
 
-/* Map a VRAM range (4K granularity) at a fresh VA; returns the VA. */
-static int vmm_map_vram(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 vram, u64 size, u64 *va)
+/* Map a VRAM range (4K granularity) at a fresh VA aligned to align; returns the VA. */
+static int vmm_map_vram_flags(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 vram, u64 size, u64 align,
+			      u64 pte_flags, u64 *va)
 {
 	u64 off;
 	int ret = 0;
 
-	*va = vm->next;
+	*va = ALIGN(vm->next, max_t(u64, align, SZ_4K));
 	for (off = 0; off < size && !ret; off += SZ_4K)
-		ret = vmm_map_4k(nv, vm, *va + off, vram + off, 0);
-	vm->next = ALIGN(vm->next + size, SZ_2M);
+		ret = vmm_map_4k(nv, vm, *va + off, vram + off, pte_flags);
+	vm->next = ALIGN(*va + size, SZ_2M);
 	return ret;
+}
+
+static int vmm_map_vram(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 vram, u64 size, u64 *va)
+{
+	return vmm_map_vram_flags(nv, vm, vram, size, SZ_4K, 0, va);
 }
 
 /* Map a coherent sysmem buffer (contiguous bus addresses) at a fresh VA. */
@@ -174,6 +182,15 @@ static void vmm_join(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 inst)
 #define NVDRV_H_VASPACE		0xd0009001
 #define NVDRV_H_CHAN(i)		(0xd000c000 + (i))
 #define NVDRV_H_CE(i)		(0xd000c100 + (i))
+#define NVDRV_H_GR3D		0xd000c200
+#define NVDRV_H_GRCOMPUTE	0xd000c201
+#define AMPERE_B		0xc797
+#define AMPERE_COMPUTE_B	0xc7c0
+#define NV2080_ENGINE_TYPE_GR0	0x01
+#define NV2080_CTRL_CMD_GPU_PROMOTE_CTX	0x2080012b
+#define NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO	0x20800a32
+#define CHID_CE			1
+#define CHID_GR			2
 
 #define ENGINE_INFO_TYPE_RM_ENGINE_TYPE	2
 #define ENGINE_INFO_TYPE_RUNLIST	3
@@ -320,8 +337,11 @@ static int ce_pick(struct nvdrv_dev *nv, u32 *runlist, u32 *ce, u32 *rl_base)
 	for (i = 0; i < n && i < 32; i++) {
 		const __le32 *data = (const __le32 *)(t + 12 + i * 100);
 
-		if (le32_to_cpu(data[ENGINE_INFO_TYPE_RM_ENGINE_TYPE]) == RM_ENGINE_TYPE_GR0)
+		if (le32_to_cpu(data[ENGINE_INFO_TYPE_RM_ENGINE_TYPE]) == RM_ENGINE_TYPE_GR0) {
 			gr_runlist = le32_to_cpu(data[ENGINE_INFO_TYPE_RUNLIST]);
+			nv->fifo.gr_runlist = gr_runlist;
+			nv->fifo.gr_rl_base = le32_to_cpu(data[ENGINE_INFO_TYPE_RUNLIST_PRI_BASE]);
+		}
 	}
 	for (i = 0; i < n && i < 32; i++) {
 		const __le32 *data = (const __le32 *)(t + 12 + i * 100);
@@ -369,46 +389,56 @@ static void dma_buf_free(struct nvdrv_dev *nv, struct nv_dma_buf *b)
 	b->cpu = NULL;
 }
 
+/* The USERD page all nvdrv channels share (0x200 per chid), mapped through BAR1. */
+static int userd_page(struct nvdrv_dev *nv)
+{
+	struct nv_fifo *f = &nv->fifo;
+	int ret;
+
+	if (f->userd_cpu)
+		return 0;
+	ret = nv_vram_alloc(nv, SZ_64K, SZ_64K, &f->userd);
+	if (ret)
+		return ret;
+	nv_vram_fill(nv, f->userd, SZ_64K, 0, NULL, NULL);
+	f->userd_cpu = nv_bar1_map(nv, NV_FB_MAX, f->userd, SZ_64K);	/* BAR1 VA right after scanout */
+	return f->userd_cpu ? 0 : -EIO;
+}
+
 /*
- * A privileged GPFIFO channel on the CE0 runlist with the copy engine bound to
- * subchannel 4 (r535_chan_alloc + r535_chan_ramfc_write + r535_ce_alloc).
+ * A privileged GPFIFO channel for one engine (r535_chan_alloc + r535_chan_ramfc_write):
+ * host-provided instance block (VRAM), USERD slot, method buffer; sysmem GPFIFO, push
+ * buffer and semaphore page mapped into nvdrv's VA space; then BIND and SCHEDULE.
  */
-static int chan_init(struct nvdrv_dev *nv, struct nv_chan *ch)
+static int chan_create(struct nvdrv_dev *nv, struct nv_chan *ch, u32 handle, u32 chid, u32 engine,
+		       u32 runlist, u32 rl_base)
 {
 	struct device *dev = &nv->pdev->dev;
 	struct nv_gsp_static_info *si = &nv->gsp_info;
+	struct nv_fifo *f = &nv->fifo;
 	struct nv_channel_alloc *a;
-	struct { __le32 version, engine_type; } ce;
-	__le32 v32;
-	u32 chid = NV_RSVD_CHIDS, mthdbuf_size;
-	u64 userd_bar1 = NV_FB_MAX;	/* BAR1 VA right after the scanout surface */
+	__le32 v32 = 0;
+	u32 mthdbuf_size;
+	u8 sched[2] = { 1, 0 };	/* NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS: bEnable, bSkipSubmit */
 	int ret;
 
-	ret = ce_pick(nv, &ch->runlist, &ch->ce, &ch->rl_base);
-	if (ret)
-		return ret;
-	ce.version = cpu_to_le32(1);
-	ce.engine_type = cpu_to_le32(NV2080_ENGINE_TYPE_COPY0 + ch->ce);
-	v32 = 0;
 	ret = nv_rm_control(nv, si->h_internal_client, si->h_internal_subdevice,
 			    NV2080_CTRL_CMD_CE_GET_FAULT_METHOD_BUFFER_SIZE, &v32, sizeof(v32));
+	if (!ret)
+		ret = userd_page(nv);
+	if (!ret)
+		ret = nv_vram_alloc(nv, CHAN_INST_SIZE, SZ_4K, &ch->inst);
 	if (ret)
 		return ret;
 	mthdbuf_size = le32_to_cpu(v32);
-
-	/* VRAM: instance block, USERD page; sysmem: GPFIFO, push buffer, method buffer, semaphores */
-	ret = nv_vram_alloc(nv, CHAN_INST_SIZE, SZ_4K, &ch->inst);
-	if (!ret)
-		ret = nv_vram_alloc(nv, SZ_64K, SZ_64K, &ch->userd);
-	if (ret)
-		return ret;
+	ch->chid = chid;
+	ch->engine = engine;
+	ch->runlist = runlist;
+	ch->rl_base = rl_base;
 	nv_vram_fill(nv, ch->inst, CHAN_INST_SIZE, 0, NULL, NULL);
-	nv_vram_fill(nv, ch->userd, SZ_64K, 0, NULL, NULL);
 	vmm_join(nv, &nv->vmm, ch->inst);
-	ch->userd_cpu = nv_bar1_map(nv, userd_bar1, ch->userd, SZ_64K);
-	if (!ch->userd_cpu)
-		return -EIO;
-	ch->userd_cpu += chid * USERD_SIZE;
+	ch->userd_cpu = f->userd_cpu + chid * USERD_SIZE;
+	memset_io(ch->userd_cpu, 0, USERD_SIZE);
 	if ((ret = dma_buf_alloc(nv, &ch->gpfifo, GPFIFO_ENTRIES * 8)) ||
 	    (ret = dma_buf_alloc(nv, &ch->pb, PUSHBUF_SIZE)) ||
 	    (ret = dma_buf_alloc(nv, &ch->mthdbuf, PAGE_ALIGN(mthdbuf_size))) ||
@@ -429,46 +459,52 @@ static int chan_init(struct nvdrv_dev *nv, struct nv_chan *ch)
 	a->flags = cpu_to_le32(NVOS04_FLAGS_BASE | 0 << NVOS04_RUNQUEUE_SHIFT |
 			       (chid % 8) << NVOS04_USERD_IDX_SHIFT | (chid / 8) << NVOS04_USERD_PAGE_SHIFT);
 	a->h_vaspace = cpu_to_le32(nv->vmm.handle);
-	a->engine_type = cpu_to_le32(NV2080_ENGINE_TYPE_COPY0 + ch->ce);
+	a->engine_type = cpu_to_le32(engine);
 	a->instance_mem = (struct nv_memdesc){ cpu_to_le64(ch->inst), cpu_to_le64(CHAN_INST_SIZE), cpu_to_le32(2), cpu_to_le32(1) };
-	a->userd_mem = (struct nv_memdesc){ cpu_to_le64(ch->userd + chid * USERD_SIZE), cpu_to_le64(USERD_SIZE), cpu_to_le32(2), cpu_to_le32(1) };
+	a->userd_mem = (struct nv_memdesc){ cpu_to_le64(f->userd + chid * USERD_SIZE), cpu_to_le64(USERD_SIZE), cpu_to_le32(2), cpu_to_le32(1) };
 	a->ramfc_mem = (struct nv_memdesc){ cpu_to_le64(ch->inst), cpu_to_le64(0x200), cpu_to_le32(2), cpu_to_le32(1) };
 	a->mthdbuf_mem = (struct nv_memdesc){ cpu_to_le64(ch->mthdbuf.dma), cpu_to_le64(mthdbuf_size), cpu_to_le32(1), 0 };
 	a->internal_flags = cpu_to_le32(KCHAN_INTERNAL_FLAGS);
 	a->error_notifier_mem = (struct nv_memdesc){ cpu_to_le64(ch->errnotif.dma), cpu_to_le64(SZ_4K), cpu_to_le32(1), 0 };
-	ret = nv_rm_alloc(nv, nv->rm.h_client, nv->rm.h_device, NVDRV_H_CHAN(0), AMPERE_CHANNEL_GPFIFO_A, a, sizeof(*a));
+	ret = nv_rm_alloc(nv, nv->rm.h_client, nv->rm.h_device, handle, AMPERE_CHANNEL_GPFIFO_A, a, sizeof(*a));
 	kfree(a);
 	if (ret)
 		return ret;
-	ch->handle = NVDRV_H_CHAN(0);
-	ch->chid = chid;
+	ch->handle = handle;
 
-	v32 = cpu_to_le32(NV2080_ENGINE_TYPE_COPY0 + ch->ce);
+	v32 = cpu_to_le32(engine);
 	ret = nv_rm_control(nv, nv->rm.h_client, ch->handle, NVA06F_CTRL_CMD_BIND, &v32, sizeof(v32));
-	if (ret)
-		return ret;
-	{
-		u8 sched[2] = { 1, 0 };	/* NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS: bEnable, bSkipSubmit */
-
+	if (!ret)
 		ret = nv_rm_control(nv, nv->rm.h_client, ch->handle, NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, sched, 2);
-	}
 	if (ret)
 		return ret;
 	/*
 	 * Doorbell token: the runlist's hardware doorbell ID (RUNLIST_DOORBELL_CONFIG at
-	 * runlist base + 0x008, bits 31:16; nouveau ga100_runl_new / ga100_chan_doorbell_handle),
-	 * which is not necessarily the runlist number.
+	 * runlist base + 0x008, bits 31:16; nouveau ga100_runl_new / ga100_chan_doorbell_handle).
+	 * GPFIFO_GET_WORK_SUBMIT_TOKEN returns INVALID_STATE for these privileged channels.
 	 */
-	ch->token = (nv_rd32(nv, ch->rl_base + 0x008) >> 16) << 16 | ch->chid;
-	dev_info(dev, "fifo: runlist %u at 0x%x: chcfg 0x%08x dbcfg 0x%08x pbcfg 0x%08x/0x%08x -> token 0x%x\n",
-		 ch->runlist, ch->rl_base, nv_rd32(nv, ch->rl_base + 0x004), nv_rd32(nv, ch->rl_base + 0x008),
-		 nv_rd32(nv, ch->rl_base + 0x010), nv_rd32(nv, ch->rl_base + 0x014), ch->token);
-	ret = nv_rm_alloc(nv, nv->rm.h_client, ch->handle, NVDRV_H_CE(0), AMPERE_DMA_COPY_B, &ce, sizeof(ce));
+	ch->token = (nv_rd32(nv, rl_base + 0x008) >> 16) << 16 | chid;
+	dev_info(dev, "fifo: channel %u (engine 0x%x, runlist %u) up: inst 0x%llx, GPFIFO va 0x%llx, token 0x%x\n",
+		 chid, engine, runlist, ch->inst, ch->gpfifo_va, ch->token);
+	return 0;
+}
+
+/* The copy-engine channel: a CE with physical engines on a runlist of its own. */
+static int ce_chan_init(struct nvdrv_dev *nv, struct nv_chan *ch)
+{
+	struct { __le32 version, engine_type; } ce;
+	u32 runlist, rl_base, n;
+	int ret;
+
+	ret = ce_pick(nv, &runlist, &n, &rl_base);
+	if (!ret)
+		ret = chan_create(nv, ch, NVDRV_H_CHAN(0), CHID_CE, NV2080_ENGINE_TYPE_COPY0 + n, runlist, rl_base);
 	if (ret)
 		return ret;
-	dev_info(dev, "fifo: channel %u (runlist %u) up: inst 0x%llx, USERD 0x%llx, GPFIFO va 0x%llx, token 0x%x, CE bound\n",
-		 ch->chid, ch->runlist, ch->inst, ch->userd + chid * USERD_SIZE, ch->gpfifo_va, ch->token);
-	return 0;
+	ch->ce = n;
+	ce.version = cpu_to_le32(1);
+	ce.engine_type = cpu_to_le32(NV2080_ENGINE_TYPE_COPY0 + n);
+	return nv_rm_alloc(nv, nv->rm.h_client, ch->handle, NVDRV_H_CE(0), AMPERE_DMA_COPY_B, &ce, sizeof(ce));
 }
 
 /* ---- push buffer and submission -------------------------------------------- */
@@ -523,7 +559,201 @@ static void ce_copy(struct nv_chan *ch, u64 dst_va, u64 src_va, u32 bytes, u32 s
 	push1(ch, SUBC_CE, C7B5_LAUNCH_DMA, LAUNCH_COPY_SEM);
 }
 
-static void rl_state(struct nvdrv_dev *nv, const char *when)
+/* ---- graphics engine context (nouveau r535 gr.c) --------------------------- */
+
+#define CTXPROP_COUNT		0x1a	/* NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_COUNT */
+#define PROMOTE_ID_MAIN		0
+#define PROMOTE_ID_ATTRIBUTE_CB	5
+#define PROMOTE_ID_PRIV_ACCESS_MAP	10
+#define PROMOTE_ID_UNRESTRICTED_PRIV_ACCESS_MAP	11
+
+struct nv_promote_entry {
+	__le64 gpu_phys_addr, gpu_virt_addr, size;
+	__le32 phys_attr;
+	__le16 buffer_id;
+	u8 initialize, nonmapped;
+};
+
+struct nv_promote_ctx {
+	__le32 engine_type, h_client, chid, h_chan_client, h_object, h_virt_memory;
+	__le64 virt_address, size;
+	__le32 entry_count, pad;
+	struct nv_promote_entry entry[16];
+};
+static_assert(sizeof(struct nv_promote_ctx) == 560);
+
+/*
+ * RM's GR context-buffer table (engine context property id -> promote buffer id), with
+ * nouveau's flags: global (shared by all channels), init (RM initialises it through its
+ * physical address), ro (mapped read-only).
+ */
+static const struct { u8 prop, id; bool global, init, ro; } gr_ctxbufs[] = {
+	{ 0x00, PROMOTE_ID_MAIN,	false, true,  false },	/* GRAPHICS */
+	{ 0x10, 2,			false, true,  false },	/* GRAPHICS_PATCH */
+	{ 0x11, 3,			true,  false, false },	/* GRAPHICS_BUNDLE_CB */
+	{ 0x0d, 4,			true,  false, false },	/* GRAPHICS_PAGEPOOL */
+	{ 0x13, PROMOTE_ID_ATTRIBUTE_CB, true, false, false },	/* GRAPHICS_ATTRIBUTE_CB */
+	{ 0x14, 6,			true,  false, false },	/* GRAPHICS_RTV_CB_GLOBAL */
+	{ 0x17, 9,			true,  true,  false },	/* GRAPHICS_FECS_EVENT */
+	{ 0x18, PROMOTE_ID_PRIV_ACCESS_MAP, true, true, true },	/* GRAPHICS_PRIV_ACCESS_MAP */
+};
+
+/* Allocate and map one context buffer; nouveau's size, page and alignment rules. */
+static int gr_ctxbuf_add(struct nvdrv_dev *nv, u16 id, u32 size, bool init, bool ro, bool nonmapped)
+{
+	struct nv_fifo *f = &nv->fifo;
+	u32 page, align;
+	u64 vram, va = 0;
+	int ret;
+
+	if (f->ctxbuf_nr == NV_GR_MAX_CTXBUFS)
+		return -ENOSPC;
+	if (id == PROMOTE_ID_MAIN)
+		size = ALIGN(size, SZ_4K) + 64 * SZ_4K;	/* per-subcontext headers */
+	page = size >= SZ_2M ? SZ_2M : size >= SZ_64K ? SZ_64K : SZ_4K;
+	align = id == PROMOTE_ID_ATTRIBUTE_CB ? roundup_pow_of_two(size) : page;
+	size = ALIGN(size, SZ_4K);
+	ret = nv_vram_alloc(nv, size, page, &vram);
+	if (ret)
+		return ret;
+	if (init)
+		nv_vram_fill(nv, vram, size, 0, NULL, NULL);
+	if (!nonmapped) {
+		ret = vmm_map_vram_flags(nv, &nv->vmm, vram, size, align, PTE_PRIV | (ro ? PTE_RO : 0), &va);
+		if (ret)
+			return ret;
+	}
+	f->ctxbuf[f->ctxbuf_nr].vram = vram;
+	f->ctxbuf[f->ctxbuf_nr].va = va;
+	f->ctxbuf[f->ctxbuf_nr].size = size;
+	f->ctxbuf[f->ctxbuf_nr].id = id;
+	f->ctxbuf[f->ctxbuf_nr].nonmapped = nonmapped;
+	f->ctxbuf_nr++;
+	dev_info(&nv->pdev->dev, "gr: ctxbuf %2u: %8u KiB at VRAM 0x%llx, va 0x%llx%s%s\n", id, size >> 10, vram, va,
+		 init ? ", init" : "", nonmapped ? ", unmapped" : ro ? ", ro" : "");
+	return 0;
+}
+
+/*
+ * Give RM the GR context of the GR channel (r535_gr_oneinit + r535_gr_promote_ctx with
+ * golden = true): every buffer is allocated here, initialisable ones are passed with their
+ * physical address. Allocating the 3D class on the channel then makes RM build the golden
+ * context. nvdrv has one GR channel, so the golden channel is also the working channel.
+ */
+static int gr_ctx_promote(struct nvdrv_dev *nv, struct nv_chan *ch)
+{
+	struct nv_gsp_static_info *si = &nv->gsp_info;
+	struct nv_fifo *f = &nv->fifo;
+	struct nv_promote_ctx *pc;
+	__le32 *info;
+	int i, j, ret;
+
+	info = kzalloc(8 * CTXPROP_COUNT * 8, GFP_KERNEL);	/* [GR_MAX_ENGINES][COUNT] { size, align } */
+	pc = kzalloc(sizeof(*pc), GFP_KERNEL);
+	ret = info && pc ? 0 : -ENOMEM;
+	if (!ret)
+		ret = nv_rm_control(nv, si->h_internal_client, si->h_internal_subdevice,
+				    NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO,
+				    info, 8 * CTXPROP_COUNT * 8);
+	for (i = 0; !ret && i < ARRAY_SIZE(gr_ctxbufs); i++) {
+		u32 size = le32_to_cpu(info[gr_ctxbufs[i].prop * 2]);
+		bool pam = gr_ctxbufs[i].id == PROMOTE_ID_PRIV_ACCESS_MAP;
+
+		ret = gr_ctxbuf_add(nv, gr_ctxbufs[i].id, size, gr_ctxbufs[i].init, gr_ctxbufs[i].ro, pam);
+		if (!ret && pam)	/* plus a mapped, unrestricted copy */
+			ret = gr_ctxbuf_add(nv, PROMOTE_ID_UNRESTRICTED_PRIV_ACCESS_MAP, size, true, true, false);
+	}
+	if (!ret)
+		ret = vmm_flush(nv, &nv->vmm);
+	if (ret)
+		goto out;
+
+	pc->engine_type = cpu_to_le32(NV2080_ENGINE_TYPE_GR0);
+	pc->h_chan_client = cpu_to_le32(nv->rm.h_client);
+	pc->h_object = cpu_to_le32(ch->handle);
+	for (i = 0; i < f->ctxbuf_nr; i++) {
+		struct nv_promote_entry *e = &pc->entry[i];
+		bool init = f->ctxbuf[i].id == PROMOTE_ID_UNRESTRICTED_PRIV_ACCESS_MAP;
+
+		for (j = 0; j < ARRAY_SIZE(gr_ctxbufs); j++)
+			if (gr_ctxbufs[j].id == f->ctxbuf[i].id)
+				init = gr_ctxbufs[j].init;
+		e->buffer_id = cpu_to_le16(f->ctxbuf[i].id);
+		e->initialize = init;
+		e->nonmapped = f->ctxbuf[i].nonmapped;
+		e->gpu_virt_addr = cpu_to_le64(f->ctxbuf[i].va);
+		if (init) {
+			e->gpu_phys_addr = cpu_to_le64(f->ctxbuf[i].vram);
+			e->size = cpu_to_le64(f->ctxbuf[i].size);
+			e->phys_attr = cpu_to_le32(4);
+		}
+	}
+	pc->entry_count = cpu_to_le32(f->ctxbuf_nr);
+	ret = nv_rm_control(nv, nv->rm.h_client, nv->rm.h_subdevice, NV2080_CTRL_CMD_GPU_PROMOTE_CTX, pc, sizeof(*pc));
+	if (!ret)	/* golden context init happens in RM on the first GR object */
+		ret = nv_rm_alloc(nv, nv->rm.h_client, ch->handle, NVDRV_H_GR3D, AMPERE_B, NULL, 0);
+	if (!ret)
+		ret = nv_rm_alloc(nv, nv->rm.h_client, ch->handle, NVDRV_H_GRCOMPUTE, AMPERE_COMPUTE_B, NULL, 0);
+	dev_info(&nv->pdev->dev, "gr: %u context buffers promoted, AMPERE_B + AMPERE_COMPUTE_B on channel %u: %d\n",
+		 f->ctxbuf_nr, ch->chid, ret);
+out:
+	kfree(pc);
+	kfree(info);
+	return ret;
+}
+
+#define SUBC_3D			0
+#define SUBC_COMPUTE		1
+#define C7C0_SET_REPORT_SEMAPHORE_A	0x1b00
+#define REPORT_SEM_RELEASE_1WORD	(1u << 28)	/* OPERATION RELEASE, STRUCTURE_SIZE ONE_WORD */
+
+static int gr_chan_init(struct nvdrv_dev *nv, struct nv_chan *ch)
+{
+	struct nv_fifo *f = &nv->fifo;
+	int ret;
+
+	if (!f->gr_rl_base)
+		return -ENODEV;
+	ret = chan_create(nv, ch, NVDRV_H_CHAN(1), CHID_GR, NV2080_ENGINE_TYPE_GR0, f->gr_runlist, f->gr_rl_base);
+	if (!ret)
+		ret = gr_ctx_promote(nv, ch);
+	if (ret)
+		return ret;
+	push1(ch, SUBC_3D, 0, AMPERE_B);		/* SET_OBJECT */
+	push1(ch, SUBC_COMPUTE, 0, AMPERE_COMPUTE_B);
+	kick(nv, ch);
+	f->gr_ready = true;
+	return 0;
+}
+
+/* The compute engine writes a semaphore: proof that GR runs our channel's context. */
+int nv_gr_test(struct nvdrv_dev *nv)
+{
+	struct nv_chan *ch = &nv->grch;
+	u32 sem, seq, *n;
+	int ret;
+
+	mutex_lock(&nv->gsp_lock);
+	ret = nv_fifo_init(nv);
+	if (ret)
+		goto out;
+	seq = ++ch->seq;
+	{
+		u32 d[4] = { upper_32_bits(ch->sem_va), lower_32_bits(ch->sem_va), seq, REPORT_SEM_RELEASE_1WORD };
+
+		push(ch, SUBC_COMPUTE, C7C0_SET_REPORT_SEMAPHORE_A, d, 4);
+	}
+	kick(nv, ch);
+	ret = read_poll_timeout(READ_ONCE, sem, sem == seq, 50, 2000000, false, *(u32 *)ch->sem.cpu);
+	n = ch->errnotif.cpu;
+	dev_info(&nv->pdev->dev, "gr test: compute semaphore %u/%u (%d), GP_GET %u/%u, error notifier %u/0x%x\n",
+		 sem, seq, ret, ioread32(ch->userd_cpu + USERD_GP_GET), ch->gp_put, n[2], n[3] >> 16);
+out:
+	mutex_unlock(&nv->gsp_lock);
+	return ret;
+}
+
+static void __maybe_unused rl_state(struct nvdrv_dev *nv, const char *when)
 {
 	struct nv_chan *ch = &nv->chan;
 	u32 chram = (nv_rd32(nv, ch->rl_base + 0x004) & 0xfffffff0) + ch->chid * 4;
@@ -546,19 +776,22 @@ int nv_fifo_init(struct nvdrv_dev *nv)
 	int ret;
 
 	lockdep_assert_held(&nv->gsp_lock);
-	if (nv->chan.handle)
+	if (nv->fifo.gr_ready)
 		return 0;
 	if (!nv->rm.h_device)
 		return -ENODEV;
 	ret = nv_bar1_init(nv);
 	if (!ret && !nv->vmm.handle)
 		ret = vmm_init(nv, &nv->vmm);
-	if (!ret)
-		ret = chan_init(nv, &nv->chan);
-	if (!ret) {
-		push1(&nv->chan, SUBC_CE, 0, AMPERE_DMA_COPY_B);	/* SET_OBJECT */
-		kick(nv, &nv->chan);
+	if (!ret && !nv->chan.handle) {
+		ret = ce_chan_init(nv, &nv->chan);
+		if (!ret) {
+			push1(&nv->chan, SUBC_CE, 0, AMPERE_DMA_COPY_B);	/* SET_OBJECT */
+			kick(nv, &nv->chan);
+		}
 	}
+	if (!ret && !nv->grch.handle)
+		ret = gr_chan_init(nv, &nv->grch);
 	return ret;
 }
 
@@ -578,8 +811,8 @@ int nv_ce_test(struct nvdrv_dev *nv)
 
 	mutex_lock(&nv->gsp_lock);
 	ret = nv_fifo_init(nv);
-	if (ret || !e->fb)
-		goto out;
+	if (!nv->chan.handle || !e->fb)
+		goto out;	/* a GR setup failure alone does not stop the CE test */
 	ret = dma_buf_alloc(nv, &src, SZ_1M);
 	if (ret)
 		goto out;
@@ -674,15 +907,21 @@ void nv_fifo_show(struct nvdrv_dev *nv, struct seq_file *m)
 /* After the GPU reset in .remove: host memory only (RM objects died with the client). */
 void nv_fifo_fini(struct nvdrv_dev *nv)
 {
-	struct nv_chan *ch = &nv->chan;
+	struct nv_chan *chans[] = { &nv->chan, &nv->grch };
+	int i;
 
-	if (ch->userd_cpu)
-		iounmap(ch->userd_cpu - ch->chid * USERD_SIZE);
-	dma_buf_free(nv, &ch->gpfifo);
-	dma_buf_free(nv, &ch->pb);
-	dma_buf_free(nv, &ch->mthdbuf);
-	dma_buf_free(nv, &ch->sem);
-	dma_buf_free(nv, &ch->errnotif);
-	memset(ch, 0, sizeof(*ch));
+	for (i = 0; i < ARRAY_SIZE(chans); i++) {
+		struct nv_chan *ch = chans[i];
+
+		dma_buf_free(nv, &ch->gpfifo);
+		dma_buf_free(nv, &ch->pb);
+		dma_buf_free(nv, &ch->mthdbuf);
+		dma_buf_free(nv, &ch->sem);
+		dma_buf_free(nv, &ch->errnotif);
+		memset(ch, 0, sizeof(*ch));
+	}
+	if (nv->fifo.userd_cpu)
+		iounmap(nv->fifo.userd_cpu);
+	memset(&nv->fifo, 0, sizeof(nv->fifo));
 	memset(&nv->vmm, 0, sizeof(nv->vmm));
 }

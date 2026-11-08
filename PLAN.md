@@ -323,6 +323,15 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
     channel; it sends no RC event. (2) **CE4 has no PCEs** on this board (`CE_GET_CE_PCE_MASK` = 0; CE2 = 0x10,
     CE3 = 0x20). Using it gives ROBUST_CHANNEL_CE4_ERROR (71) with CE LAUNCHERR INVALID_CONFIG (0x0d): RM then
     submits an empty runlist and disables the channel (chram 0x108/0x000). nvdrv now picks a non-GR CE with PCEs.
+- **GR engine context (2026-11-08)** (`gr_ctx_promote`, nouveau r535 gr.c): `INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO`
+  (0x20800a32, internal subdevice, [8][26] {size, align}) gives the sizes; GA104: MAIN 1132 KiB (incl. 64 subcontext
+  headers), PATCH 20 KiB, BUNDLE_CB 12 KiB, PAGEPOOL 128 KiB, ATTRIBUTE_CB 8.3 MiB (VA aligned to its pow2 size),
+  RTV_CB_GLOBAL 512 KiB, FECS_EVENT 64 KiB, PRIV_ACCESS_MAP 512 KiB (unmapped) + an UNRESTRICTED copy (mapped ro).
+  Mapped with PTE PRIV (bit 5) / RO (bit 6); initialisable buffers carry their physical address (physAttr 4).
+  `GPU_PROMOTE_CTX` (0x2080012b) on nvdrv's subdevice, then AMPERE_B (0xc797) on the channel makes RM build the golden
+  context; AMPERE_COMPUTE_B (0xc7c0) next to it. nvdrv uses its single GR channel (chid 2, runlist 0) as the golden
+  channel (nouveau uses a throwaway one). debugfs `gr_test`: the compute class releases a semaphore
+  (SET_REPORT_SEMAPHORE_A..D at 0x1b00) — passes.
   - Debug aids: debugfs `chan_status` (USERD/GPFIFO/push buffer), `chan_kick` (doorbell variants), and reading PBDMA
     (0x40000 + id·0x800, id from runlist +0x010), runlist (+0x080..0x098, +0x200 engine status) and channel RAM
     (runlist +0x004 base) registers against the GA100 manuals in open-gpu-doc.
@@ -332,8 +341,7 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
 
 ## Next steps
 
-0. **GPU acceleration for Hyprland (in progress):** the GR channel (AMPERE_B / compute) with RM's context buffers
-   (r535 gr.c: golden context, PROMOTE_CTX), then the nouveau uAPI subset Mesa NVK needs (GEM, VM_BIND, EXEC,
+0. **GPU acceleration for Hyprland (in progress):** GR channel + context ✅. Next: the nouveau uAPI subset Mesa NVK needs (GEM, VM_BIND, EXEC,
    syncobj, render node) so Zink-on-NVK can drive Hyprland. Meanwhile the CE can take over the scanout copies.
 1. **Desktop polish:** gamma LUT property
    (output LUT), cursor plane, fbdev restore after the last DRM master closes.
