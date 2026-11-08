@@ -28,7 +28,8 @@ What works today (see [PLAN.md](PLAN.md) for the phase table, findings and next 
 - RM objects (client / device / subdevice), RM controls, error paths
 - display: DisplayPort sink discovery, EDID, link training, modeset scanning out
   from VRAM, BAR1 CPU mapping
-- a DRM/KMS device with fbdev emulation: the Linux text console runs on nvdrv
+- a DRM/KMS device with fbdev emulation: the Linux text console runs on nvdrv, and
+  Hyprland runs on it with Mesa's software renderer (llvmpipe), 2560x1440@60
 
 Not there yet: mode changes and hotplug through DRM, memory management, GPU
 channels/copy engine, compute, interrupts, and a clean firmware unload (unbind

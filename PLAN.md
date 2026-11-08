@@ -54,7 +54,7 @@ Most of the work is the boot chain and the RPC layer.
 | 9 | **Channels + Copy Engine** | GPFIFO channel, USERD/doorbell, push buffer, run a CE memcpy between VRAM and sysmem and fence on a semaphore. **First "real work" milestone.** |
 | 10 | **userspace API** | DRM render node and a small uAPI (BO alloc/map, channel create, submit, wait). |
 | 11 | **Compute** | Allocate compute class, launch a hand-assembled or NAK-compiled kernel. |
-| 12 | **Display** (pulled forward) | DP sink discovery + EDID ✅, SOR assignment + DP link training via RM ✅, display instmem/ctxdma/push buffers done by nvdrv in CPU-RM's place ✅, core + window channels ✅, **modeset with a test pattern scanned out from VRAM, confirmed on the monitor (2026-11-08)** ✅, BAR1 CPU mapping ✅, robust bring-up (sink settle, link verify, detach + retrain) ✅, **DRM/KMS device with fbdev: the Linux text console runs on nvdrv, confirmed on the monitor** ✅ (`DRM=1 tests/phase12_display.sh`). Next: mode changes and hotplug in DRM, input LUT, cursor. |
+| 12 | **Display** (pulled forward) | DP sink discovery + EDID ✅, SOR assignment + DP link training via RM ✅, display instmem/ctxdma/push buffers done by nvdrv in CPU-RM's place ✅, core + window channels ✅, **modeset with a test pattern scanned out from VRAM, confirmed on the monitor (2026-11-08)** ✅, BAR1 CPU mapping ✅, robust bring-up (sink settle, link verify, detach + retrain) ✅, **DRM/KMS device with fbdev: the Linux text console runs on nvdrv, confirmed on the monitor** ✅ (`DRM=1 tests/phase12_display.sh`), **Hyprland 0.57.1 renders on nvdrv** (Mesa llvmpipe through GBM/EGL, confirmed on the monitor, 2026-11-08) ✅. Next: refresh rates above 60 Hz, link-loss recovery, gamma LUT, cursor plane, mode changes. |
 
 Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`phase3.sh` FLRs the GPU).
 
@@ -267,13 +267,30 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
     (`detect`), fbdev does not recommit.
   - Unbind with fbcon bound: `drm_dev_unplug` + `drm_atomic_helper_shutdown` before the FLR. The console falls back to
     the dummy device with no warnings, and later BAR1 access is impossible.
+- **Hyprland on nvdrv (2026-11-08).** Userspace stack on a KMS-only device: GBM uses Mesa's `dri_gbm` (no
+  `nvdrv_gbm.so`), and EGL/GLES 3.2 run on **llvmpipe**. That works with the default glvnd setup even though NVIDIA's
+  EGL vendor (`10_nvidia.json`, from the nvidia-utils fallback) is installed. Checked with `tools/egltest.c`, which
+  renders into a SCANOUT|RENDERING BO and exports it as a dma-buf. The test's own pitfall: eglChooseConfig ignores
+  EGL_NATIVE_VISUAL_ID, so the XR24 config has to be picked by hand. Hyprland must be started in a **fresh session**
+  (a VT login): a running instance cannot move its primary renderer to a hotplugged GPU (aquamarine's mgpu
+  renderer fails on `eglQueryDevicesEXT`). Hyprland then modesets DP-1 at 2560x1440@60 with three XR24 LINEAR
+  buffers and page flips on the vblank timer. Missing gamma/HDR properties are logged and ignored. The user's
+  monitor rule asks for @180 (AOC Q27G42XE), which nvdrv does not offer yet.
+  - **Pitfall:** after a DRM master (modetest) exits, the CRTC stays disabled and fbdev does not restore it on
+    its own; a VT switch does (`chvt`).
+  - GSP-RM's OS_ERROR_LOG explains the core exception: `CMDre ... 00002004 00000041 00000004` = method 0x2004
+    HEAD_SET_CONTROL_OUTPUT_RESOURCE, data 0x41 (0x49 with -vsync), error 4. The modeset still applies; the field
+    combination needs checking against what RM expects for DP (nvkms programs the same bits, so maybe it is
+    ordering or a missing companion method).
 - **Open:** `DP_CONFIG_STREAM` returns NV_ERR_ILLEGAL_ACTION (0x16) before the modeset; the link works with RM's
   defaults. The core channel also latches EXCEPT 0x10000080 arg 0x41 during the modeset update, but the update takes
   effect. The EDID read during one early probe gave 1920x1080; later reads give 2560x1440 (sink waking up?).
 
 ## Next steps
 
-0. **Display robustness:** a link/hotplug poller (no interrupts yet) that redoes `disp_up` when the sink drops the
+0. **Desktop polish:** higher refresh (read DPCD 0x2200 extended caps: HBR3 likely; 180 Hz at 1440p needs it or
+   DSC), gamma LUT property (output LUT), cursor plane, fbdev restore after the last DRM master closes.
+1. **Display robustness:** a link/hotplug poller (no interrupts yet) that redoes `disp_up` when the sink drops the
    link and tells DRM about mode changes; mode changes through DRM atomic (needs a real modeset path per commit);
    identity input LUT; DP_CONFIG_STREAM; core exception. Interrupts (display + GSP message) would replace polling.
 1. **Phase 8 groundwork:** a VA space (`FERMI_VASPACE_A`, 0x90f1) under our device and memory allocations
