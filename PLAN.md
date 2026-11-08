@@ -291,9 +291,16 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
   link check, detach + retrain + modeset on loss). The 60 → 180 switch worked in place, and the link stayed locked.
   - The core exception is fixed: HEAD_SET_CONTROL_OUTPUT_RESOURCE.EXT_PACKET_WIN must be `_NONE` = 0x3F. 0 selects
     window 0 as the infoframe source, which GSP-RM rejected as an invalid argument (OS_ERROR_LOG `CMDre ... 00002004`).
-  - **Full-screen copies cap flips at ~155/s:** each plane update memcpy's the damage into VRAM through BAR1
-    (~2.3 GB/s for whole 14.7 MB frames). Partial damage is unaffected. Faster: the copy engine (Phase 9), or
-    scanning out directly from VRAM-backed GEM buffers instead of shadow copies.
+  - **Full-screen frame rate: the PCIe link, not the copy.** After a few seconds of idle, GSP-RM's governor parks
+    the GPU in **P8 with the PCIe link at 2.5 GT/s** (Gen1), because CPU traffic through BAR1 does not count as
+    load: BAR1 writes then reach 2.9 GB/s (~155 full frames/s through DRM). In **P0 the link runs Gen3 x16**
+    (8 GT/s, the root port's maximum) and BAR1 takes **11.2 GB/s** (~760 full 2560x1440 frames/s).
+    `NV2080_CTRL_CMD_INTERNAL_PERF_BOOST_SET_2X` on nvdrv's own subdevice (what CPU-RM sends for
+    NV2080_CTRL_CMD_PERF_BOOST; params {NvBool flags, u32 duration}, BOOST_TO_MAX = 2, duration in s or
+    0xffffffff = until cleared) moves it to P0/Gen3 in ~250 ms. The DRM plane update re-arms a 3 s boost
+    (work item, at most 1/s) once more than 64 MB were copied within a second. Cursor blinks never trigger it, a
+    static screen drops back to P8 after ~6 s, and full-screen flips hold 180.00 Hz. Debugfs `perf` shows the
+    pstate and link and accepts max/clear/<seconds>; `bar1_bench` times full-frame copies.
   - A module reload is impossible while a compositor still holds fds of the unplugged DRM device (each open
     file pins the module); stop it first.
 - **Open:** `DP_CONFIG_STREAM` returns NV_ERR_ILLEGAL_ACTION (0x16) before the modeset; the link works with RM's
@@ -302,7 +309,7 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
 
 ## Next steps
 
-0. **Desktop polish:** VRAM-backed scanout buffers or CE copies (full-screen frame rate), gamma LUT property
+0. **Desktop polish:** gamma LUT property
    (output LUT), cursor plane, fbdev restore after the last DRM master closes.
 1. **Display robustness:** a link/hotplug poller (no interrupts yet) that redoes `disp_up` when the sink drops the
    link and tells DRM about mode changes; mode changes through DRM atomic (needs a real modeset path per commit);

@@ -11,6 +11,7 @@
  */
 #include <linux/aperture.h>
 #include <linux/iosys-map.h>
+#include <linux/workqueue.h>
 
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic.h>
@@ -46,7 +47,26 @@ struct nv_drm {
 	unsigned int pitch;
 	struct drm_display_mode mode;	/* the one mode the head runs */
 	const struct drm_edid *edid;
+	/*
+	 * GSP-RM does not see CPU-drawn frames as load and parks the GPU in P8 / PCIe Gen1
+	 * (~2.9 GB/s through BAR1, < 180 full frames/s). Frames being drawn re-arm a short
+	 * boost to P0 / Gen3 (~11 GB/s); a static screen lets the GPU idle again.
+	 */
+	struct work_struct boost_work;
+	unsigned long boost_next;	/* jiffies: earliest next boost request */
+	unsigned long win_start;	/* jiffies: start of the 1 s traffic window */
+	u64 win_bytes;			/* bytes copied in the window */
 };
+
+#define NV_DRM_BOOST_SECONDS	3
+#define NV_DRM_BOOST_BYTES	(64ULL << 20)	/* per second; a blinking cursor stays far below */
+
+static void nv_drm_boost_work(struct work_struct *w)
+{
+	struct nv_drm *d = container_of(w, struct nv_drm, boost_work);
+
+	nv_rm_perf_boost(d->nv, NV_DRM_BOOST_SECONDS);
+}
 
 static struct nv_drm *to_nv_drm(struct drm_device *dev)
 {
@@ -122,6 +142,15 @@ static void nv_plane_atomic_update(struct drm_plane *plane, struct drm_atomic_co
 		dst = IOSYS_MAP_INIT_OFFSET(&vaddr, drm_fb_clip_offset(d->pitch, fb->format, &dst_clip));
 		drm_rect_translate(&dst_clip, (ps->src.x1 >> 16) - ps->dst.x1, (ps->src.y1 >> 16) - ps->dst.y1);
 		drm_fb_memcpy(&dst, &d->pitch, sps->data, fb, &dst_clip);
+		d->win_bytes += (u64)drm_rect_width(&dst_clip) * drm_rect_height(&dst_clip) * 4;
+	}
+	/* sustained copy traffic: keep the GPU (and its PCIe link) out of the idle state */
+	if (time_after(jiffies, d->win_start + HZ)) {
+		d->win_start = jiffies;
+		d->win_bytes = 0;
+	} else if (d->win_bytes > NV_DRM_BOOST_BYTES && time_after_eq(jiffies, d->boost_next)) {
+		d->boost_next = jiffies + HZ;
+		schedule_work(&d->boost_work);
 	}
 	drm_dev_exit(idx);
 }
@@ -324,6 +353,9 @@ int nv_drm_register(struct nvdrv_dev *nv)
 		return PTR_ERR(d);
 	dev = &d->dev;
 	d->nv = nv;
+	INIT_WORK(&d->boost_work, nv_drm_boost_work);
+	d->boost_next = jiffies;
+	d->win_start = jiffies;
 	d->pitch = ALIGN(dpy->mode.hdisplay * 4, 256);
 	nv_mode_to_drm(&dpy->mode, &d->mode);
 	d->edid = drm_edid_alloc(dpy->edid, dpy->edid_size);
@@ -395,6 +427,7 @@ void nv_drm_unregister(struct nvdrv_dev *nv)
 		return;
 	drm_dev_unplug(&d->dev);
 	drm_atomic_helper_shutdown(&d->dev);
+	cancel_work_sync(&d->boost_work);
 	d->scanout = NULL;
 	drm_edid_free(d->edid);
 	d->edid = NULL;

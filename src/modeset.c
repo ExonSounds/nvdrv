@@ -14,6 +14,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/iopoll.h>
 #include <linux/seq_file.h>
+#include <linux/vmalloc.h>
 
 #include "nvdrv.h"
 
@@ -274,7 +275,7 @@ int nv_disp_modeset_locked(struct nvdrv_dev *nv, u32 flags)
 		if (!e->fb_cpu)
 			return -EIO;
 	}
-	if (e->fb_w != w || e->fb_h != h) {
+	if (e->fb_w != w || e->fb_h != h || e->pattern_dirty) {
 		u64 px, n = (u64)(pitch / 4) * h;
 
 		pat = (struct pattern){ w, h, pitch / 4 };
@@ -284,6 +285,7 @@ int nv_disp_modeset_locked(struct nvdrv_dev *nv, u32 flags)
 		(void)ioread32(e->fb_cpu);
 		e->fb_w = w;
 		e->fb_h = h;
+		e->pattern_dirty = false;
 		dev_info(dev, "modeset: framebuffer %ux%u pitch %u at VRAM 0x%llx (BAR1)\n", w, h, pitch, e->fb);
 	}
 	ret = nv_evo_window_init(nv, 0);
@@ -590,4 +592,32 @@ int nv_disp_detach_locked(struct nvdrv_dev *nv)
 		 nv_rd32(nv, 0x611028 + win->chn * 12));
 	e->active = false;
 	return ret;
+}
+
+/* Time full-frame copies into the scanout surface through BAR1 (what each DRM plane update does). */
+int nv_bar1_bench(struct nvdrv_dev *nv)
+{
+	struct nv_evo *e = &nv->evo;
+	size_t frame = (size_t)ALIGN(e->fb_w * 4, 256) * e->fb_h;
+	void *src;
+	u64 t0, ns;
+	int i, n = 30;
+
+	if (!e->fb_cpu || !frame)
+		return -ENODEV;
+	src = vmalloc(frame);
+	if (!src)
+		return -ENOMEM;
+	memset(src, 0x40, frame);
+	t0 = ktime_get_ns();
+	for (i = 0; i < n; i++)
+		memcpy_toio(e->fb_cpu, src, frame);
+	wmb();
+	(void)ioread32(e->fb_cpu);
+	ns = ktime_get_ns() - t0;
+	vfree(src);
+	dev_info(&nv->pdev->dev, "bar1 bench: %d x %zu KiB in %llu ms = %llu MB/s, %llu frames/s\n", n, frame >> 10,
+		 ns / 1000000, (u64)n * frame * 1000 / ns, (u64)n * 1000000000ULL / ns);
+	e->pattern_dirty = true;	/* redraw the test pattern on the next modeset */
+	return 0;
 }

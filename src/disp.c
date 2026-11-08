@@ -525,6 +525,12 @@ int nv_disp_bringup(struct nvdrv_dev *nv)
 		ret = -ENOLINK;
 	}
 	mutex_unlock(&nv->gsp_lock);
+	/*
+	 * Scanout + CPU-drawn frames are invisible to GSP-RM's load governor, which would
+	 * otherwise park the GPU in P8 with the PCIe link at 2.5 GT/s (~2.3 GB/s through BAR1).
+	 */
+	if (!ret)
+		nv_rm_perf_boost(nv, 10);	/* DRM activity re-arms it */
 	return ret;
 }
 

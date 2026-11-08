@@ -326,6 +326,7 @@ struct nv_evo {
 	u64 fb, fb_size;			/* scanout surface (VRAM), NV_FB_MAX */
 	void __iomem *fb_cpu;			/* its BAR1 mapping (write-combined) */
 	u32 fb_w, fb_h;				/* mode the test pattern was drawn for */
+	bool pattern_dirty;
 	struct nv_dma_buf sysfb;		/* scanout test surface in sysmem */
 	bool fb_bound, win_mapped, active;
 	u32 sor, head;				/* of the active modeset */
@@ -432,6 +433,9 @@ int nv_rm_init_objects(struct nvdrv_dev *nv);
 void nv_rm_fini_objects(struct nvdrv_dev *nv);
 void nv_rm_objects_show(struct nvdrv_dev *nv, struct seq_file *m);
 int nv_rm_selftest(struct nvdrv_dev *nv);
+int nv_rm_perf_boost(struct nvdrv_dev *nv, u32 seconds);
+#define NV_PERF_BOOST_FOREVER	U32_MAX
+void nv_rm_perf_show(struct nvdrv_dev *nv, struct seq_file *m);
 
 /* disp.c */
 int nv_disp_probe(struct nvdrv_dev *nv);
@@ -484,6 +488,7 @@ int nv_disp_set_mode(struct nvdrv_dev *nv, const struct nv_mode *m);
 #define NV_FLIP_SYSMEM			BIT(5)	/* scan out a test surface from coherent sysmem */
 int nv_disp_flip(struct nvdrv_dev *nv, u32 flags);
 int nv_bar1_test(struct nvdrv_dev *nv);
+int nv_bar1_bench(struct nvdrv_dev *nv);
 int nv_evo_init(struct nvdrv_dev *nv);
 int nv_evo_window_init(struct nvdrv_dev *nv, u32 win);
 void nv_evo_fini(struct nvdrv_dev *nv);

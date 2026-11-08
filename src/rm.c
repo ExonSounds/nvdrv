@@ -584,3 +584,62 @@ int nv_rm_selftest(struct nvdrv_dev *nv)
 	dev_info(dev, "rm selftest: %s\n", fails ? "FAILED" : "PASS");
 	return fails ? -EIO : 0;
 }
+
+/* ---- performance state ------------------------------------------------ */
+
+#define NV2080_CTRL_CMD_INTERNAL_PERF_BOOST_SET_2X	0x20800a9a
+#define NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE		0x20802068
+#define PERF_BOOST_CLEAR				0
+#define PERF_BOOST_TO_MAX				2
+#define PERF_BOOST_DURATION_INFINITE			0xffffffff
+
+/* NV2080_CTRL_INTERNAL_PERF_BOOST_SET_PARAMS_2X: note flags is an NvBool */
+struct nv2080_perf_boost_2x {
+	u8 flags, pad[3];
+	__le32 duration;
+};
+static_assert(sizeof(struct nv2080_perf_boost_2x) == 8);
+
+/*
+ * kperfBoostSet: what CPU-RM does for NV2080_CTRL_CMD_PERF_BOOST. GSP-RM's governor
+ * only sees engine load, not CPU traffic through BAR1, so with nothing but scanout
+ * and CPU-drawn frames it parks the GPU in P8 with the PCIe link at 2.5 GT/s.
+ */
+/* seconds: 0 clears the boost, NV_PERF_BOOST_FOREVER lasts until cleared */
+int nv_rm_perf_boost(struct nvdrv_dev *nv, u32 seconds)
+{
+	bool max = seconds != 0;
+	struct nv2080_perf_boost_2x p = {
+		.flags = max ? PERF_BOOST_TO_MAX : PERF_BOOST_CLEAR,
+		.duration = cpu_to_le32(seconds == NV_PERF_BOOST_FOREVER ? PERF_BOOST_DURATION_INFINITE : seconds),
+	};
+	int ret;
+
+	mutex_lock(&nv->gsp_lock);
+	ret = nv->rm.h_subdevice ? nv_rm_control(nv, nv->rm.h_client, nv->rm.h_subdevice,
+						 NV2080_CTRL_CMD_INTERNAL_PERF_BOOST_SET_2X, &p, sizeof(p)) : -ENODEV;
+	mutex_unlock(&nv->gsp_lock);
+	dev_dbg(&nv->pdev->dev, "rm: perf boost %u s: %d\n", seconds, ret);
+	return ret;
+}
+
+void nv_rm_perf_show(struct nvdrv_dev *nv, struct seq_file *m)
+{
+	__le32 pstate = 0;
+	u16 lnksta = 0;
+	int ret = -ENODEV, i;
+
+	mutex_lock(&nv->gsp_lock);
+	if (nv->rm.h_subdevice)
+		ret = nv_rm_control(nv, nv->rm.h_client, nv->rm.h_subdevice,
+				    NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE, &pstate, sizeof(pstate));
+	mutex_unlock(&nv->gsp_lock);
+	pcie_capability_read_word(nv->pdev, PCI_EXP_LNKSTA, &lnksta);
+	i = ffs(le32_to_cpu(pstate));
+	if (ret)
+		seq_printf(m, "pstate:  unknown (%d)\n", ret);
+	else
+		seq_printf(m, "pstate:  P%d (0x%x)\n", i ? i - 1 : -1, le32_to_cpu(pstate));
+	seq_printf(m, "pcie:    gen%u x%u\n", lnksta & PCI_EXP_LNKSTA_CLS,
+		   (lnksta & PCI_EXP_LNKSTA_NLW) >> PCI_EXP_LNKSTA_NLW_SHIFT);
+}

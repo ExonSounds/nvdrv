@@ -547,6 +547,60 @@ static const struct file_operations disp_up_fops = {
 	.write = disp_up_write,
 };
 
+static int perf_show(struct seq_file *m, void *unused)
+{
+	nv_rm_perf_show(m->private, m);
+	return 0;
+}
+
+static int perf_open(struct inode *inode, struct file *f)
+{
+	return single_open(f, perf_show, inode->i_private);
+}
+
+/* write "max" to boost to the highest pstate until cleared, "clear" to drop it */
+static ssize_t perf_write(struct file *f, const char __user *buf, size_t count, loff_t *ppos)
+{
+	struct nvdrv_dev *nv = ((struct seq_file *)f->private_data)->private;
+	char cmd[16] = {};
+	u32 secs;
+	int ret;
+
+	if (copy_from_user(cmd, buf, min(count, sizeof(cmd) - 1)))
+		return -EFAULT;
+	if (!strncmp(cmd, "max", 3))
+		ret = nv_rm_perf_boost(nv, NV_PERF_BOOST_FOREVER);
+	else if (!strncmp(cmd, "clear", 5))
+		ret = nv_rm_perf_boost(nv, 0);
+	else if (!kstrtou32(strim(cmd), 0, &secs))
+		ret = nv_rm_perf_boost(nv, secs);	/* "<n>": boost for n seconds */
+	else
+		ret = -EINVAL;
+	return ret ? ret : count;
+}
+
+static const struct file_operations perf_fops = {
+	.owner = THIS_MODULE,
+	.open = perf_open,
+	.read = seq_read,
+	.write = perf_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static ssize_t bar1_bench_write(struct file *f, const char __user *buf, size_t count, loff_t *ppos)
+{
+	int ret = nv_bar1_bench(f->private_data);
+
+	return ret ? ret : count;
+}
+
+static const struct file_operations bar1_bench_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = bar1_bench_write,
+};
+
 static void nv_debugfs_init(struct nvdrv_dev *nv)
 {
 	nv->dbg = debugfs_create_dir(pci_name(nv->pdev), nvdrv_dbg_root);
@@ -580,6 +634,10 @@ static void nv_debugfs_init(struct nvdrv_dev *nv)
 		debugfs_create_file("disp_retrain", 0200, nv->dbg, nv, &disp_retrain_fops);
 	if (nv_hw_writes_allowed())
 		debugfs_create_file("disp_up", 0200, nv->dbg, nv, &disp_up_fops);
+	if (nv_hw_writes_allowed()) {
+		debugfs_create_file("perf", 0600, nv->dbg, nv, &perf_fops);
+		debugfs_create_file("bar1_bench", 0200, nv->dbg, nv, &bar1_bench_fops);
+	}
 
 	if (nv->vbios.data) {
 		nv->vbios_blob.data = nv->vbios.data;
