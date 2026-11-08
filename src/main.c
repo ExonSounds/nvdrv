@@ -815,6 +815,26 @@ static void nv_init_readonly(struct nvdrv_dev *nv)
 		dev_err(dev, "pre-boot RPC queueing failed: %d\n", ret);
 }
 
+static void nv_release(struct kref *ref)
+{
+	struct nvdrv_dev *nv = container_of(ref, struct nvdrv_dev, ref);
+
+	mutex_destroy(&nv->gsp_lock);
+	mutex_destroy(&nv->mem.lock);
+	pci_dev_put(nv->pdev);
+	kfree(nv);
+}
+
+void nv_put(struct nvdrv_dev *nv)
+{
+	kref_put(&nv->ref, nv_release);
+}
+
+static void nv_put_action(void *nv)
+{
+	nv_put(nv);
+}
+
 static int nvdrv_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct nvdrv_dev *nv;
@@ -823,17 +843,23 @@ static int nvdrv_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (pdev->vendor != PCI_VENDOR_ID_NVIDIA)
 		return -ENODEV;
 
-	nv = devm_kzalloc(&pdev->dev, sizeof(*nv), GFP_KERNEL);
+	/*
+	 * Not devm: DRM files (and the GEM objects and channels they own) can outlive the
+	 * binding, and their teardown still takes nvdrv's locks. One reference for the
+	 * binding (dropped by devres at unbind), one taken by the DRM device.
+	 */
+	nv = kzalloc(sizeof(*nv), GFP_KERNEL);
 	if (!nv)
 		return -ENOMEM;
-	nv->pdev = pdev;
-	pci_set_drvdata(pdev, nv);
-	ret = devm_mutex_init(&pdev->dev, &nv->gsp_lock);
-	if (!ret)
-		ret = devm_mutex_init(&pdev->dev, &nv->mem.lock);
+	kref_init(&nv->ref);
+	nv->pdev = pci_dev_get(pdev);	/* teardown after unbind still frees DMA memory against it */
+	mutex_init(&nv->gsp_lock);
+	mutex_init(&nv->mem.lock);
+	nv_uapi_init(nv);
+	ret = devm_add_action_or_reset(&pdev->dev, nv_put_action, nv);
 	if (ret)
 		return ret;
-	nv_uapi_init(nv);
+	pci_set_drvdata(pdev, nv);
 
 	ret = pcim_enable_device(pdev);
 	if (ret)

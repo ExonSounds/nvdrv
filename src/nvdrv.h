@@ -5,6 +5,7 @@
 #include <drm/drm_mm.h>
 #include <linux/debugfs.h>
 #include <linux/io.h>
+#include <linux/kref.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/types.h>
@@ -312,7 +313,7 @@ struct nv_evo_chan {
 	u32 handle, chn;
 	struct nv_dma_buf pb;	/* 4 KiB push buffer, coherent sysmem */
 	void __iomem *user;	/* BAR0 user area: PUT @0, GET @4 */
-	u32 put;
+	u32 put, begin_put;	/* begin_put: PUT when the current batch started */
 	bool overflow;
 };
 
@@ -405,6 +406,8 @@ struct nv_uapi {
 };
 
 struct nvdrv_dev {
+	struct kref ref;	/* PCI binding + DRM device: outlives unbind while DRM files are open */
+	bool unplugged;		/* DRM unplugged: no more hardware access from file/object teardown */
 	struct pci_dev *pdev;
 	void __iomem *bar0;
 	resource_size_t bar0_len;
@@ -595,6 +598,7 @@ int nv_chan_kick(struct nvdrv_dev *nv, u32 mode);
 void nv_fifo_fini(struct nvdrv_dev *nv);
 
 /* drm.c */
+void nv_put(struct nvdrv_dev *nv);
 int nv_drm_register(struct nvdrv_dev *nv);
 void nv_drm_unregister(struct nvdrv_dev *nv);
 void nv_drm_stats_show(struct nvdrv_dev *nv, struct seq_file *m);

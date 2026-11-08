@@ -313,6 +313,7 @@ int nv_evo_begin(struct nvdrv_dev *nv, struct nv_evo_chan *c, u32 need)
 	int ret;
 
 	c->overflow = false;
+	c->begin_put = c->put;
 	if (c->put + need < c->pb.size - 48)
 		return 0;
 	ret = readl_poll_timeout(c->user + 4, get, get == c->put, 10, 2000000);
@@ -321,15 +322,23 @@ int nv_evo_begin(struct nvdrv_dev *nv, struct nv_evo_chan *c, u32 need)
 	pb[c->put / 4] = 0x20000000;
 	wmb();
 	iowrite32(0, c->user);
-	c->put = 0;
+	c->put = c->begin_put = 0;
 	return readl_poll_timeout(c->user + 4, get, get == 0, 10, 2000000);
 }
 
 /* Publish PUT. */
 int nv_evo_kick_nowait(struct nvdrv_dev *nv, struct nv_evo_chan *c)
 {
-	if (c->overflow)
+	if (c->overflow) {
+		/*
+		 * Drop the whole batch: a partly written one must not advance PUT, or the
+		 * software PUT runs ahead of the hardware and every later wrap times out.
+		 */
+		dev_warn_ratelimited(&nv->pdev->dev, "evo: chn %u: methods overflowed the reservation, batch dropped\n",
+				     c->chn);
+		c->put = c->begin_put;
 		return -E2BIG;
+	}
 	wmb();
 	iowrite32(c->put, c->user);
 	return 0;

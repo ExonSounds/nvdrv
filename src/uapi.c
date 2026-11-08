@@ -274,7 +274,8 @@ static void nv_bo_free(struct drm_gem_object *obj)
 
 	if (drm_mm_node_allocated(&bo->bar1)) {
 		mutex_lock(&nv->gsp_lock);
-		nv_bar1_set(nv, bo->bar1.start, NV_BAR1_UNMAP, bo->bar1.size);
+		if (!nv->unplugged)	/* BAR0 is gone after unbind */
+			nv_bar1_set(nv, bo->bar1.start, NV_BAR1_UNMAP, bo->bar1.size);
 		mutex_unlock(&nv->gsp_lock);
 		mutex_lock(&nv->uapi.bar1_lock);
 		drm_mm_remove_node(&bo->bar1);
@@ -302,7 +303,7 @@ static vm_fault_t nv_bo_fault(struct vm_fault *vmf)
 	pgoff_t pg = (vmf->address - vma->vm_start) >> PAGE_SHIFT;
 
 	pg += vma->vm_pgoff - drm_vma_node_start(&bo->base.vma_node);
-	if (pg >= bo->base.size >> PAGE_SHIFT)
+	if (pg >= bo->base.size >> PAGE_SHIFT || (bo->vram && bo->nv->unplugged))
 		return VM_FAULT_SIGBUS;
 	if (bo->vram)
 		return vmf_insert_pfn(vma, vmf->address,
@@ -1242,6 +1243,8 @@ long nv_uapi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return drm_ioctl(filp, cmd, arg);
 	if (!file->driver_priv || size < sizeof(struct nvif_hdr) || size > SZ_4K)
 		return -EINVAL;
+	if (drm_dev_is_unplugged(file->minor->dev))
+		return -ENODEV;
 	buf = memdup_user((void __user *)arg, size);
 	if (IS_ERR(buf))
 		return PTR_ERR(buf);
@@ -1329,11 +1332,29 @@ void nv_uapi_init(struct nvdrv_dev *nv)
 	hrtimer_setup(&ua->timer, uapi_poll, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 }
 
+/* GPU going away (GSP teardown): stop polling and fail every pending fence. */
 void nv_uapi_fini(struct nvdrv_dev *nv)
 {
 	struct nv_uapi *ua = &nv->uapi;
+	struct nv_uchan *u, *tmp;
+	unsigned long flags;
 
 	hrtimer_cancel(&ua->timer);
+	spin_lock_irqsave(&ua->lock, flags);
+	list_for_each_entry_safe(u, tmp, &ua->active, active) {
+		struct nv_fence *f, *ftmp;
+
+		u->dead = true;
+		list_for_each_entry_safe(f, ftmp, &u->pending, link) {
+			dma_fence_set_error(&f->base, -ENODEV);
+			dma_fence_signal_locked(&f->base);
+			list_del_init(&f->link);
+			dma_fence_put(&f->base);
+		}
+		list_del_init(&u->active);
+	}
+	ua->polling = false;
+	spin_unlock_irqrestore(&ua->lock, flags);
 	if (ua->bar1_ready && drm_mm_clean(&ua->bar1_mm))
 		drm_mm_takedown(&ua->bar1_mm);
 	ua->bar1_ready = false;

@@ -497,7 +497,7 @@ int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch)
 	} else {
 		pitch = e->fb_pitch;
 	}
-	ret = nv_evo_begin(nv, win, 16);
+	ret = nv_evo_begin(nv, win, 6 * 8);	/* bytes: six single-word methods */
 	if (ret)
 		goto out;
 	m1(win, C67E_SET_CONTEXT_DMA_ISO(0), ctxdma);

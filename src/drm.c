@@ -407,6 +407,11 @@ static void nv_mode_to_drm(const struct nv_mode *m, struct drm_display_mode *dm)
  * Register the DRM device for the display nvdrv has already lit (disp_modeset).
  * Caller must not hold gsp_lock (drm_client_setup may draw through atomic commits).
  */
+static void nv_drm_put_nv(struct drm_device *dev, void *nv)
+{
+	nv_put(nv);
+}
+
 int nv_drm_register(struct nvdrv_dev *nv)
 {
 	struct pci_dev *pdev = nv->pdev;
@@ -441,6 +446,10 @@ int nv_drm_register(struct nvdrv_dev *nv)
 		return PTR_ERR(d);
 	dev = &d->dev;
 	d->nv = nv;
+	kref_get(&nv->ref);	/* dropped when the DRM device is released (last file closed) */
+	ret = drmm_add_action_or_reset(&d->dev, nv_drm_put_nv, nv);
+	if (ret)
+		return ret;
 	INIT_WORK(&d->boost_work, nv_drm_boost_work);
 	d->boost_next = jiffies;
 	d->win_start = jiffies;
@@ -526,6 +535,7 @@ void nv_drm_unregister(struct nvdrv_dev *nv)
 
 	if (!d)
 		return;
+	nv->unplugged = true;	/* file / GEM teardown from here on: software state only */
 	drm_dev_unplug(&d->dev);
 	drm_atomic_helper_shutdown(&d->dev);
 	cancel_work_sync(&d->boost_work);
