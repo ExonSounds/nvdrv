@@ -116,7 +116,7 @@ static void m1(struct nv_evo_chan *c, u32 mthd, u32 val)
 }
 
 /* isModePossibleSST, 8b/10b, no DSC/FEC/audio. */
-static int dp_watermark(const struct nv_mode *m, u32 lanes, u32 link_bw_270m, bool ef, bool increased,
+int dp_watermark(const struct nv_mode *m, u32 lanes, u32 link_bw_270m, bool ef, bool increased,
 			u32 *tu, u32 *wm, u32 *hblank_sym, u32 *vblank_sym)
 {
 	const u64 pf = 100000, depth = 24, pclk = (u64)m->clock_khz * 1000;
@@ -361,7 +361,8 @@ int nv_disp_modeset_locked(struct nvdrv_dev *nv, u32 flags)
 	e->head = head;
 	m1(core, C67D_HEAD(head, HEAD_SET_PROCAMP), 0);
 	m1(core, C67D_HEAD(head, HEAD_SET_CONTROL_OUTPUT_RESOURCE),
-	   1 | (!m->hsync_pos) << 2 | (!m->vsync_pos) << 3 | 4 << 4);	/* CRC raster, BPP_24_444 */
+	   1 | (!m->hsync_pos) << 2 | (!m->vsync_pos) << 3 | 4 << 4 |	/* CRC raster, BPP_24_444 */
+	   0x3f << 26);		/* EXT_PACKET_WIN_NONE (0 = window 0 was an invalid argument, err 4) */
 	m1(core, C67D_HEAD(head, HEAD_SET_CONTROL), 0);	/* progressive, no lock */
 	m1(core, C67D_HEAD(head, HEAD_SET_DITHER_CONTROL), 0);
 	m1(core, C67D_HEAD(head, HEAD_SET_DISPLAY_ID0), d->id);

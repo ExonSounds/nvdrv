@@ -467,6 +467,10 @@ void nv_drm_unregister(struct nvdrv_dev *nv);
 int nv_disp_modeset(struct nvdrv_dev *nv, u32 flags);
 int nv_disp_modeset_locked(struct nvdrv_dev *nv, u32 flags);
 int nv_disp_detach_locked(struct nvdrv_dev *nv);
+int dp_watermark(const struct nv_mode *m, u32 lanes, u32 link_bw_270m, bool ef, bool increased,
+		 u32 *tu, u32 *wm, u32 *hblank_sym, u32 *vblank_sym);
+bool nv_disp_mode_fits(struct nvdrv_dev *nv, const struct nv_mode *m);
+int nv_disp_set_mode(struct nvdrv_dev *nv, const struct nv_mode *m);
 #define NV_FB_MAX		(64ULL << 20)	/* fits 4096x4096 XRGB8888 */
 /*
  * Experiment flags for disp_modeset / disp_flip. 0 = the configuration known to

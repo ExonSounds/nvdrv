@@ -29,7 +29,8 @@ What works today (see [PLAN.md](PLAN.md) for the phase table, findings and next 
 - display: DisplayPort sink discovery, EDID, link training, modeset scanning out
   from VRAM, BAR1 CPU mapping
 - a DRM/KMS device with fbdev emulation: the Linux text console runs on nvdrv, and
-  Hyprland runs on it with Mesa's software renderer (llvmpipe), 2560x1440@60
+  Hyprland runs on it with Mesa's software renderer (llvmpipe); all EDID modes,
+  up to 2560x1440@180 on the test monitor
 
 Not there yet: mode changes and hotplug through DRM, memory management, GPU
 channels/copy engine, compute, interrupts, and a clean firmware unload (unbind

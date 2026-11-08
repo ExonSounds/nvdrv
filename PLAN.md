@@ -54,7 +54,7 @@ Most of the work is the boot chain and the RPC layer.
 | 9 | **Channels + Copy Engine** | GPFIFO channel, USERD/doorbell, push buffer, run a CE memcpy between VRAM and sysmem and fence on a semaphore. **First "real work" milestone.** |
 | 10 | **userspace API** | DRM render node and a small uAPI (BO alloc/map, channel create, submit, wait). |
 | 11 | **Compute** | Allocate compute class, launch a hand-assembled or NAK-compiled kernel. |
-| 12 | **Display** (pulled forward) | DP sink discovery + EDID ✅, SOR assignment + DP link training via RM ✅, display instmem/ctxdma/push buffers done by nvdrv in CPU-RM's place ✅, core + window channels ✅, **modeset with a test pattern scanned out from VRAM, confirmed on the monitor (2026-11-08)** ✅, BAR1 CPU mapping ✅, robust bring-up (sink settle, link verify, detach + retrain) ✅, **DRM/KMS device with fbdev: the Linux text console runs on nvdrv, confirmed on the monitor** ✅ (`DRM=1 tests/phase12_display.sh`), **Hyprland 0.57.1 renders on nvdrv** (Mesa llvmpipe through GBM/EGL, confirmed on the monitor, 2026-11-08) ✅. Next: refresh rates above 60 Hz, link-loss recovery, gamma LUT, cursor plane, mode changes. |
+| 12 | **Display** (pulled forward) | DP sink discovery + EDID ✅, SOR assignment + DP link training via RM ✅, display instmem/ctxdma/push buffers done by nvdrv in CPU-RM's place ✅, core + window channels ✅, **modeset with a test pattern scanned out from VRAM, confirmed on the monitor (2026-11-08)** ✅, BAR1 CPU mapping ✅, robust bring-up (sink settle, link verify, detach + retrain) ✅, **DRM/KMS device with fbdev: the Linux text console runs on nvdrv, confirmed on the monitor** ✅ (`DRM=1 tests/phase12_display.sh`), **Hyprland 0.57.1 renders on nvdrv** (Mesa llvmpipe through GBM/EGL, confirmed on the monitor, 2026-11-08) ✅, **all EDID modes incl. DisplayID, mode changes through DRM, 2560x1440@180 Hz measured on the head (180 scanline wraps/s)** ✅. Next: faster frame copies, link-loss recovery, gamma LUT, cursor plane. |
 
 Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`phase3.sh` FLRs the GPU).
 
@@ -282,14 +282,28 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
     HEAD_SET_CONTROL_OUTPUT_RESOURCE, data 0x41 (0x49 with -vsync), error 4. The modeset still applies; the field
     combination needs checking against what RM expects for DP (nvkms programs the same bits, so maybe it is
     ordering or a missing companion method).
+- **180 Hz (2026-11-08).** The AOC Q27G42XE's EDID: base DTD 2560x1440@60, CTA DTDs @144/120/100, DisplayID type I
+  @165/170/**180** (713.96 MHz, htotal 2680, vtotal 1480). The extended caps at DPCD 0x2200 (read when 0x00E bit 7
+  is set) say DP 1.4 but **HBR2 max** (0x2201 = 0x14), so 180 Hz runs on HBR2 x4: 17.135 of 17.17 Gbps; the
+  isModePossibleSST watermark/hblank checks pass (wm 22, hblank symbols 65). DRM now offers every EDID mode
+  (`drm_edid_connector_add_modes`) that `nv_disp_mode_fits` the trained link and the 64 MiB framebuffer. A mode
+  change in an atomic commit reprograms the head from `mode_set_nofb` (`nv_disp_set_mode`: in-place re-modeset,
+  link check, detach + retrain + modeset on loss). The 60 → 180 switch worked in place, and the link stayed locked.
+  - The core exception is fixed: HEAD_SET_CONTROL_OUTPUT_RESOURCE.EXT_PACKET_WIN must be `_NONE` = 0x3F. 0 selects
+    window 0 as the infoframe source, which GSP-RM rejected as an invalid argument (OS_ERROR_LOG `CMDre ... 00002004`).
+  - **Full-screen copies cap flips at ~155/s:** each plane update memcpy's the damage into VRAM through BAR1
+    (~2.3 GB/s for whole 14.7 MB frames). Partial damage is unaffected. Faster: the copy engine (Phase 9), or
+    scanning out directly from VRAM-backed GEM buffers instead of shadow copies.
+  - A module reload is impossible while a compositor still holds fds of the unplugged DRM device (each open
+    file pins the module); stop it first.
 - **Open:** `DP_CONFIG_STREAM` returns NV_ERR_ILLEGAL_ACTION (0x16) before the modeset; the link works with RM's
   defaults. The core channel also latches EXCEPT 0x10000080 arg 0x41 during the modeset update, but the update takes
   effect. The EDID read during one early probe gave 1920x1080; later reads give 2560x1440 (sink waking up?).
 
 ## Next steps
 
-0. **Desktop polish:** higher refresh (read DPCD 0x2200 extended caps: HBR3 likely; 180 Hz at 1440p needs it or
-   DSC), gamma LUT property (output LUT), cursor plane, fbdev restore after the last DRM master closes.
+0. **Desktop polish:** VRAM-backed scanout buffers or CE copies (full-screen frame rate), gamma LUT property
+   (output LUT), cursor plane, fbdev restore after the last DRM master closes.
 1. **Display robustness:** a link/hotplug poller (no interrupts yet) that redoes `disp_up` when the sink drops the
    link and tells DRM about mode changes; mode changes through DRM atomic (needs a real modeset path per commit);
    identity input LUT; DP_CONFIG_STREAM; core exception. Interrupts (display + GSP message) would replace polling.

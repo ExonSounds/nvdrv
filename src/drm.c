@@ -6,8 +6,8 @@
  * buffers, a shadow-buffered primary plane whose damaged rectangles are copied into
  * the scanout surface, software vblank timer, fbdev emulation through the client
  * library. Here the scanout surface is nvdrv's VRAM framebuffer, which the CPU reaches
- * through BAR1 (src/bar1.c). The head keeps the mode nvdrv set (EDID preferred mode);
- * other modes are rejected for now.
+ * through BAR1 (src/bar1.c). All EDID modes that fit the trained DP link are offered;
+ * a mode change in an atomic commit becomes an nvdrv modeset (mode_set_nofb).
  */
 #include <linux/aperture.h>
 #include <linux/iosys-map.h>
@@ -51,6 +51,33 @@ struct nv_drm {
 static struct nv_drm *to_nv_drm(struct drm_device *dev)
 {
 	return container_of(dev, struct nv_drm, dev);
+}
+
+static void drm_mode_to_nv(const struct drm_display_mode *dm, struct nv_mode *m)
+{
+	memset(m, 0, sizeof(*m));
+	m->valid = true;
+	m->clock_khz = dm->clock;
+	m->hdisplay = dm->hdisplay;
+	m->hsync_start = dm->hsync_start;
+	m->hsync_end = dm->hsync_end;
+	m->htotal = dm->htotal;
+	m->vdisplay = dm->vdisplay;
+	m->vsync_start = dm->vsync_start;
+	m->vsync_end = dm->vsync_end;
+	m->vtotal = dm->vtotal;
+	m->hsync_pos = !(dm->flags & DRM_MODE_FLAG_NHSYNC);
+	m->vsync_pos = !(dm->flags & DRM_MODE_FLAG_NVSYNC);
+}
+
+static bool nv_drm_mode_ok(struct nv_drm *d, const struct drm_display_mode *dm)
+{
+	struct nv_mode m;
+
+	if (dm->flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLSCAN | DRM_MODE_FLAG_3D_MASK))
+		return false;
+	drm_mode_to_nv(dm, &m);
+	return nv_disp_mode_fits(d->nv, &m);
 }
 
 /* ---- plane ------------------------------------------------------------- */
@@ -133,9 +160,30 @@ static int nv_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit 
 
 	if (!cs->enable)
 		return 0;
-	if (!drm_mode_equal(&cs->mode, &d->mode))
-		return -EINVAL;		/* only the mode the head already runs */
+	if (!nv_drm_mode_ok(d, &cs->mode))
+		return -EINVAL;
 	return drm_atomic_helper_check_crtc_primary_plane(cs);
+}
+
+/* Mode changes: reprogram the head before the planes are updated for the new size. */
+static void nv_crtc_mode_set_nofb(struct drm_crtc *crtc)
+{
+	struct nv_drm *d = to_nv_drm(crtc->dev);
+	const struct drm_display_mode *dm = &crtc->state->mode;
+	struct nv_mode m;
+	int idx;
+
+	if (drm_mode_equal(dm, &d->mode) || !drm_dev_enter(&d->dev, &idx))
+		return;
+	drm_mode_to_nv(dm, &m);
+	if (nv_disp_set_mode(d->nv, &m)) {
+		drm_err(&d->dev, "modeset to " DRM_MODE_FMT " failed\n", DRM_MODE_ARG(dm));
+	} else {
+		drm_mode_copy(&d->mode, dm);
+		d->pitch = ALIGN(dm->hdisplay * 4, 256);
+		drm_info(&d->dev, "mode " DRM_MODE_FMT ", %d Hz\n", DRM_MODE_ARG(dm), drm_mode_vrefresh(dm));
+	}
+	drm_dev_exit(idx);
 }
 
 static void nv_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
@@ -145,6 +193,7 @@ static void nv_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_commi
 
 static const struct drm_crtc_helper_funcs nv_crtc_helper_funcs = {
 	.atomic_check = nv_crtc_atomic_check,
+	.mode_set_nofb = nv_crtc_mode_set_nofb,
 	.atomic_flush = drm_crtc_vblank_atomic_flush,
 	.atomic_enable = nv_crtc_atomic_enable,
 	.atomic_disable = drm_crtc_vblank_atomic_disable,
@@ -168,8 +217,12 @@ static int nv_connector_get_modes(struct drm_connector *connector)
 {
 	struct nv_drm *d = to_nv_drm(connector->dev);
 	struct drm_display_mode *m;
+	int n;
 
 	drm_edid_connector_update(connector, d->edid);	/* EDID property + display info */
+	n = drm_edid_connector_add_modes(connector);	/* base, CTA-861 and DisplayID timings */
+	if (n)
+		return n;
 	m = drm_mode_duplicate(connector->dev, &d->mode);
 	if (!m)
 		return 0;
@@ -178,8 +231,15 @@ static int nv_connector_get_modes(struct drm_connector *connector)
 	return 1;
 }
 
+static enum drm_mode_status nv_connector_mode_valid(struct drm_connector *connector,
+						    const struct drm_display_mode *mode)
+{
+	return nv_drm_mode_ok(to_nv_drm(connector->dev), mode) ? MODE_OK : MODE_CLOCK_HIGH;
+}
+
 static const struct drm_connector_helper_funcs nv_connector_helper_funcs = {
 	.get_modes = nv_connector_get_modes,
+	.mode_valid = nv_connector_mode_valid,
 };
 
 static const struct drm_connector_funcs nv_connector_funcs = {
@@ -275,10 +335,10 @@ int nv_drm_register(struct nvdrv_dev *nv)
 	ret = drmm_mode_config_init(dev);
 	if (ret)
 		goto err;
-	dev->mode_config.min_width = d->mode.hdisplay;
-	dev->mode_config.max_width = d->mode.hdisplay;
-	dev->mode_config.min_height = d->mode.vdisplay;
-	dev->mode_config.max_height = d->mode.vdisplay;
+	dev->mode_config.min_width = 320;
+	dev->mode_config.max_width = 4096;
+	dev->mode_config.min_height = 200;
+	dev->mode_config.max_height = 4096;
 	dev->mode_config.preferred_depth = 24;
 	dev->mode_config.funcs = &nv_mode_config_funcs;
 

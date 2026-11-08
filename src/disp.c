@@ -294,6 +294,21 @@ static int dp_link_up(struct nvdrv_dev *nv, struct nv_disp_dpy *d)
 	d->max_link_bw = caps[1];
 	d->max_lanes = caps[2] & 0x1f;
 	d->enhanced_framing = !!(caps[2] & 0x80);
+	/* DP 1.4: the real capabilities (e.g. HBR3) are in the extended receiver caps at 0x2200 */
+	if (caps[0xe] & 0x80) {
+		u8 ext[16];
+
+		ret = dp_aux(nv, d->id, false, 0x2200, ext, 16);
+		if (ret)
+			dev_warn(dev, "disp: extended caps read failed: %d\n", ret);
+		if (!ret) {
+			dev_info(dev, "disp: extended caps DPCD[0x2200..] %*ph\n", 16, ext);
+			d->dpcd_rev = ext[0];
+			d->max_link_bw = max(d->max_link_bw, ext[1]);
+			d->max_lanes = ext[2] & 0x1f;
+			d->enhanced_framing = !!(ext[2] & 0x80);
+		}
+	}
 	dev_info(dev, "disp: sink DPCD %u.%u, max link 0x%02x x %u lanes%s, DPCD[0..15] %*ph\n",
 		 caps[0] >> 4, caps[0] & 0xf, d->max_link_bw, d->max_lanes,
 		 d->enhanced_framing ? ", enhanced framing" : "", 16, caps);
@@ -513,6 +528,64 @@ int nv_disp_bringup(struct nvdrv_dev *nv)
 	return ret;
 }
 
+/* Does mode m fit the trained link and nvdrv's framebuffer? */
+bool nv_disp_mode_fits(struct nvdrv_dev *nv, const struct nv_mode *m)
+{
+	struct nv_disp_dpy *d = first_dp(nv);
+	u32 tu, wm, hbs, vbs;
+
+	if (!d || !d->link_lanes || !m->clock_khz || !m->htotal || !m->vtotal)
+		return false;
+	if ((u64)ALIGN(m->hdisplay * 4, 256) * m->vdisplay > NV_FB_MAX)
+		return false;
+	return !dp_watermark(m, d->link_lanes, d->link_bw, d->enhanced_framing, true, &tu, &wm, &hbs, &vbs);
+}
+
+/*
+ * Change the mode of the running head (DRM atomic commit). Re-modeset in place; if the
+ * sink drops the link over it, detach, retrain and modeset again.
+ */
+int nv_disp_set_mode(struct nvdrv_dev *nv, const struct nv_mode *m)
+{
+	struct device *dev = &nv->pdev->dev;
+	struct nv_disp_dpy *d;
+	u8 st[4] = {};
+	int ret, attempt;
+
+	mutex_lock(&nv->gsp_lock);
+	d = first_dp(nv);
+	ret = -ENODEV;
+	if (!d || !d->link_lanes)
+		goto out;
+	if (!memcmp(&d->mode, m, sizeof(*m)) && nv->evo.active) {
+		ret = 0;
+		goto out;
+	}
+	d->mode = *m;
+	for (attempt = 1; attempt <= 3; attempt++) {
+		if (attempt > 1) {
+			nv_disp_detach_locked(nv);
+			ret = dp_retrain(nv, d);
+			if (ret)
+				continue;
+		}
+		ret = nv_disp_modeset_locked(nv, 0);
+		if (ret)
+			continue;
+		msleep(200);
+		if (dp_link_ok(nv, d, st))
+			break;
+		ret = -ENOLINK;
+	}
+	dev_info(dev, "disp: mode %ux%u %u kHz (%u Hz): %d after %d attempt(s), link %*ph\n", m->hdisplay,
+		 m->vdisplay, m->clock_khz,
+		 (u32)DIV_ROUND_CLOSEST_ULL((u64)m->clock_khz * 1000, (u64)m->htotal * m->vtotal),
+		 ret, attempt > 3 ? 3 : attempt, 4, st);
+out:
+	mutex_unlock(&nv->gsp_lock);
+	return ret;
+}
+
 /* DPCD view of the link from the sink side (debugfs dp_status). */
 void nv_disp_dp_status_show(struct nvdrv_dev *nv, struct seq_file *m)
 {
@@ -532,6 +605,10 @@ void nv_disp_dp_status_show(struct nvdrv_dev *nv, struct seq_file *m)
 
 			if (!dp_aux(nv, d->id, false, 0x000, caps, 16))
 				seq_printf(m, "  0x000 caps %*ph (max link 0x%02x x %u)\n", 16, caps, caps[1], caps[2] & 0x1f);
+			if (dp_aux(nv, d->id, false, 0x2200, caps, 16))
+				seq_puts(m, "  0x2200 extended caps: AUX read failed\n");
+			else
+				seq_printf(m, "  0x2200 extended caps %*ph (max link 0x%02x x %u)\n", 16, caps, caps[1], caps[2] & 0x1f);
 		}
 		if (!dp_aux(nv, d->id, false, 0x200, st, 6))
 			seq_printf(m, "  0x200 sink count 0x%02x, irq 0x%02x, lane0/1 0x%02x lane2/3 0x%02x, align 0x%02x, sink status 0x%02x%s\n",
