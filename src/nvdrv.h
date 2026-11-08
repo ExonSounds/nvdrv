@@ -7,6 +7,7 @@
 #include <linux/io.h>
 #include <linux/kref.h>
 #include <linux/mutex.h>
+#include <linux/rwsem.h>
 #include <linux/pci.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
@@ -341,7 +342,8 @@ struct nv_evo {
 
 /* BAR1 page tables under GSP-RM's root (src/bar1.c). */
 struct nv_bar1 {
-	u64 tables, pd0, pts;	/* VRAM */
+	u64 tables, pd0, pts;	/* VRAM: PD0 pages consecutive, then the page tables */
+	u64 npd0;		/* PD0 pages (512 MiB of BAR1 each) */
 	u64 old_root0;		/* GSP's original root entry 0 */
 	u64 size;		/* usable BAR1 VA */
 };
@@ -416,6 +418,11 @@ struct nv_uapi {
 	struct list_head active;		/* channels with unsignalled fences */
 	struct hrtimer timer;			/* polls their semaphores */
 	bool polling;				/* timer armed or running (under lock) */
+	struct rw_semaphore evict_sem;		/* read: EXEC, VM_BIND, faults; write: eviction */
+	struct mutex lru_lock;
+	struct list_head vram_bos;		/* evictable VRAM objects, oldest first */
+	struct list_head chans;			/* every client channel (idle wait), under lock */
+	atomic64_t evicted_bytes, evictions;
 	struct work_struct boost_work;		/* GPU work submitted: keep clocks up */
 	unsigned long boost_next;		/* jiffies: earliest next boost request */
 	struct mutex bar1_lock;
@@ -591,6 +598,7 @@ int nv_chan_create(struct nvdrv_dev *nv, struct nv_chan *ch, struct nv_vmm *vm, 
 void nv_chan_destroy(struct nvdrv_dev *nv, struct nv_chan *ch);
 int nv_gr_chan_ctx(struct nvdrv_dev *nv, struct nv_chan *ch);
 int nv_ce_clear(struct nvdrv_dev *nv, u64 vram, u64 size);
+int nv_ce_copy_to_sg(struct nvdrv_dev *nv, u64 vram, struct sg_table *sgt, u64 bytes);
 int nv_chid_get(struct nvdrv_dev *nv);
 void nv_chid_put(struct nvdrv_dev *nv, u32 chid);
 void nv_push(struct nv_chan *ch, u32 subc, u32 mthd, const u32 *data, u32 n);
@@ -625,6 +633,7 @@ struct file;
 extern bool nv_nvk;
 struct nvdrv_dev *nv_drm_nv(struct drm_device *dev);
 void nv_uapi_init(struct nvdrv_dev *nv);
+void nv_uapi_mem_show(struct nvdrv_dev *nv, struct seq_file *m);
 void nv_uapi_fini(struct nvdrv_dev *nv);
 int nv_uapi_open(struct drm_device *dev, struct drm_file *file);
 void nv_uapi_postclose(struct drm_device *dev, struct drm_file *file);

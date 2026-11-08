@@ -402,8 +402,16 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       AMPERE_DMA_COPY_B (engine type COPYn, no GR context). The DRM driver reports 1.4.1, so NVK exposes a
       transfer queue family (2 queues, TRANSFER | SPARSE_BINDING) and uses copy channels for uploads. nvktest:
       CE copy 4 KiB VRAM -> GART bit-exact under a syncobj; vkmark and Zink unchanged.
-- [ ] **VRAM eviction / overcommit** to system memory; today the pool is fixed and allocations fail when full.
-- [ ] **BAR1 beyond 512 MiB** (Resizable BAR exposes all 8 GiB): more PD0 pages, larger host-visible VRAM heap.
+- [x] **VRAM eviction / overcommit** (2026-11-09): a VRAM allocation that does not fit evicts the oldest evictable
+      objects (TTM-style overcommit, they stay usable from system memory): `evict_sem` (write) blocks EXEC/VM_BIND/
+      CPU faults, waits for every client channel to go idle, the CE copies VRAM -> system pages in physical mode on
+      both sides (`nv_ce_copy_to_sg`), every GPU mapping in every client VM is rewritten to the pages (objects now
+      track their mappings), CPU mappings are zapped (next fault maps the pages), the VRAM is freed. Scanout objects
+      (display reads VRAM only) and dma-buf exports/imports are never evicted. Test `nvktest overcommit 10`: 10 GiB
+      on the 7.5 GiB pool, 3 GiB evicted, all contents intact (CPU), GPU writes into an evicted object, 3.1 s.
+      Not yet: moving objects back when VRAM frees up; LRU by use (eviction order is allocation order).
+- [x] **BAR1 beyond 512 MiB** (2026-11-09): one PD0 page per 512 MiB up to the whole BAR (8 GiB with Resizable BAR,
+      16 PD0 pages + 4096 64 KiB-page tables, 1.1 MiB). NVK's host-visible VRAM is no longer capped at 446 MiB.
 - [ ] **64 KiB / 2 MiB GPU pages** (big-page tables) and **compression** (comptags, compressible kinds).
 - [ ] **Z-cull info** (`GET_ZCULL_INFO` from RM) so NVK enables Z-cull.
 - [ ] **Per-object fences / implicit sync**: BO reservation fences (dma-buf with other devices), VM_BIND unmap and

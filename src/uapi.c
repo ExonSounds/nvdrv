@@ -91,6 +91,7 @@ struct nv_uchan {
 	struct list_head active;	/* in nv->uapi.active while pending is not empty */
 	struct dma_fence *last;		/* most recent fence */
 	bool dead;
+	struct list_head all;		/* uapi.chans, under uapi.lock */
 };
 
 struct nv_fence {
@@ -103,16 +104,22 @@ struct nv_bo {
 	struct drm_gem_object base;
 	struct nvdrv_dev *nv;
 	u32 domain, tile_mode, tile_flags;
-	bool vram;
+	bool vram;			/* contents in VRAM (else system pages) */
+	bool evicted;			/* was VRAM, moved to system pages (own_pages) */
+	bool no_evict;			/* scanout / dma-buf: must stay where it is */
 	struct drm_mm_node node;	/* VRAM */
 	struct drm_mm_node bar1;	/* BAR1 VA while CPU-mappable */
-	struct page **pages;		/* GART */
-	dma_addr_t *dma;		/* GART: bus address per page */
+	struct page **pages;		/* GART / evicted */
+	dma_addr_t *dma;		/* bus address per page */
 	struct sg_table *sgt;
+	struct list_head vmas;		/* struct nv_vma.bo_link, under uapi.evict_sem */
+	struct list_head lru;		/* uapi.vram_bos while in VRAM */
 };
 
 struct nv_vma {
 	struct list_head link;
+	struct list_head bo_link;	/* in bo->vmas */
+	struct nv_cli *cli;
 	u64 addr, range, bo_offset;
 	struct nv_bo *bo;		/* NULL: sparse region */
 	u8 kind;
@@ -259,6 +266,7 @@ static void uchan_drain(struct nvdrv_dev *nv, struct nv_uchan *u)
 	}
 	if (!list_empty(&u->active))
 		list_del_init(&u->active);
+	list_del_init(&u->all);
 	spin_unlock_irqrestore(&ua->lock, flags);
 	dma_fence_put(u->last);
 	u->last = NULL;
@@ -303,6 +311,10 @@ static void nv_bo_free(struct drm_gem_object *obj)
 	struct nv_bo *bo = to_nv_bo(obj);
 	struct nvdrv_dev *nv = bo->nv;
 
+	mutex_lock(&nv->uapi.lru_lock);
+	list_del_init(&bo->lru);
+	mutex_unlock(&nv->uapi.lru_lock);
+
 	if (drm_mm_node_allocated(&bo->bar1)) {
 		mutex_lock(&nv->gsp_lock);
 		if (!nv->unplugged)	/* BAR0 is gone after unbind */
@@ -319,8 +331,16 @@ static void nv_bo_free(struct drm_gem_object *obj)
 		kfree(bo->sgt);
 	}
 	kvfree(bo->dma);
-	if (bo->pages)
+	if (bo->pages && bo->evicted) {	/* our own pages, not shmem */
+		u64 i;
+
+		for (i = 0; i < obj->size >> PAGE_SHIFT; i++)
+			if (bo->pages[i])
+				__free_page(bo->pages[i]);
+		kvfree(bo->pages);
+	} else if (bo->pages) {
 		drm_gem_put_pages(obj, bo->pages, true, false);
+	}
 	if (obj->import_attach)
 		drm_prime_gem_destroy(obj, NULL);
 	drm_gem_object_release(obj);
@@ -333,13 +353,22 @@ static vm_fault_t nv_bo_fault(struct vm_fault *vmf)
 	struct nv_bo *bo = to_nv_bo(vma->vm_private_data);
 	pgoff_t pg = (vmf->address - vma->vm_start) >> PAGE_SHIFT;
 
+	struct nv_uapi *ua = &bo->nv->uapi;
+	vm_fault_t ret;
+
 	pg += vma->vm_pgoff - drm_vma_node_start(&bo->base.vma_node);
-	if (pg >= bo->base.size >> PAGE_SHIFT || (bo->vram && bo->nv->unplugged))
+	if (pg >= bo->base.size >> PAGE_SHIFT)
 		return VM_FAULT_SIGBUS;
-	if (bo->vram)
-		return vmf_insert_pfn(vma, vmf->address,
-				      (pci_resource_start(bo->nv->pdev, 1) + bo->bar1.start) / PAGE_SIZE + pg);
-	return vmf_insert_pfn(vma, vmf->address, page_to_pfn(bo->pages[pg]));
+	down_read(&ua->evict_sem);	/* placement is stable while held */
+	if (bo->vram && (bo->nv->unplugged || !drm_mm_node_allocated(&bo->bar1)))
+		ret = VM_FAULT_SIGBUS;
+	else if (bo->vram)
+		ret = vmf_insert_pfn(vma, vmf->address,
+				     (pci_resource_start(bo->nv->pdev, 1) + bo->bar1.start) / PAGE_SIZE + pg);
+	else
+		ret = vmf_insert_pfn(vma, vmf->address, page_to_pfn(bo->pages[pg]));
+	up_read(&ua->evict_sem);
+	return ret;
 }
 
 static const struct vm_operations_struct nv_bo_vm_ops = {
@@ -355,6 +384,7 @@ static int nv_bo_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma)
 	struct nvdrv_dev *nv = bo->nv;
 	int ret = 0;
 
+	down_read(&nv->uapi.evict_sem);
 	if (bo->vram) {
 		mutex_lock(&nv->uapi.bar1_lock);
 		if (!drm_mm_node_allocated(&bo->bar1)) {
@@ -371,12 +401,14 @@ static int nv_bo_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma)
 			}
 		}
 		mutex_unlock(&nv->uapi.bar1_lock);
-		if (ret)
-			return ret;
-		vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+		if (!ret)
+			vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
 	} else {
 		vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
 	}
+	up_read(&nv->uapi.evict_sem);
+	if (ret)
+		return ret;
 	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
 	vma->vm_ops = &nv_bo_vm_ops;
 	return 0;
@@ -397,6 +429,158 @@ static const struct drm_gem_object_funcs nv_bo_funcs = {
 	.get_sg_table = nv_bo_get_sg_table,
 };
 
+/* ---- VRAM eviction ------------------------------------------------------------ */
+
+static int write_ptes(struct nv_cli *cli, struct nv_vma *v, u64 addr, u64 range);
+
+/* Wait for every client channel to finish what it was given. evict_sem held for write. */
+static int wait_gpu_idle(struct nvdrv_dev *nv)
+{
+	struct nv_uapi *ua = &nv->uapi;
+	struct dma_fence *f[UAPI_MAX_CHANS * 4];
+	struct nv_uchan *u;
+	unsigned long flags;
+	int n = 0, i, ret = 0;
+
+	spin_lock_irqsave(&ua->lock, flags);
+	list_for_each_entry(u, &ua->chans, all)
+		if (u->last && n < ARRAY_SIZE(f))
+			f[n++] = dma_fence_get(u->last);
+	spin_unlock_irqrestore(&ua->lock, flags);
+	for (i = 0; i < n; i++) {
+		long t = dma_fence_wait_timeout(f[i], false, 10 * HZ);
+
+		if (t <= 0 && !ret)
+			ret = t ?: -ETIMEDOUT;
+		dma_fence_put(f[i]);
+	}
+	return ret;
+}
+
+/*
+ * Move one VRAM object to system pages: copy with the copy engine, point every GPU
+ * mapping (all clients' VMs) at the pages, drop CPU mappings so the next fault maps the
+ * pages, free the VRAM. The object stays usable, from system memory. The GPU is idle and
+ * no submission or VM_BIND can start (evict_sem held for write).
+ */
+static int evict_one(struct nvdrv_dev *nv, struct nv_bo *bo)
+{
+	struct device *dev = &nv->pdev->dev;
+	u64 size = bo->base.size, npages = size >> PAGE_SHIFT, i;
+	struct sg_dma_page_iter it;
+	struct page **pages;
+	struct sg_table *sgt;
+	dma_addr_t *dma;
+	struct nv_vma *v;
+	int ret;
+
+	pages = kvcalloc(npages, sizeof(*pages), GFP_KERNEL);
+	dma = kvmalloc_array(npages, sizeof(*dma), GFP_KERNEL);
+	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+	ret = pages && dma && sgt ? 0 : -ENOMEM;
+	for (i = 0; !ret && i < npages; i++) {
+		pages[i] = alloc_page(GFP_HIGHUSER | __GFP_NOWARN);
+		ret = pages[i] ? 0 : -ENOMEM;
+	}
+	if (!ret)
+		ret = sg_alloc_table_from_pages(sgt, pages, npages, 0, size, GFP_KERNEL);
+	if (!ret) {
+		ret = dma_map_sgtable(dev, sgt, DMA_BIDIRECTIONAL, 0);
+		if (ret)
+			sg_free_table(sgt);
+	}
+	if (ret)
+		goto fail;
+	i = 0;
+	for_each_sgtable_dma_page(sgt, &it, 0)
+		dma[i++] = sg_page_iter_dma_address(&it);
+
+	mutex_lock(&nv->gsp_lock);
+	ret = nv_ce_copy_to_sg(nv, bo->node.start, sgt, size);
+	if (!ret) {
+		bo->pages = pages;
+		bo->dma = dma;
+		bo->sgt = sgt;
+		bo->vram = false;
+		bo->evicted = true;
+		mutex_lock(&nv->uapi.lru_lock);
+		list_for_each_entry(v, &bo->vmas, bo_link) {
+			write_ptes(v->cli, v, v->addr, v->range);
+			nv_vmm_flush(nv, &v->cli->vm);
+		}
+		mutex_unlock(&nv->uapi.lru_lock);
+		if (drm_mm_node_allocated(&bo->bar1) && !nv->unplugged)
+			nv_bar1_set(nv, bo->bar1.start, NV_BAR1_UNMAP, bo->bar1.size);
+	}
+	mutex_unlock(&nv->gsp_lock);
+	if (ret) {
+		dma_unmap_sgtable(dev, sgt, DMA_BIDIRECTIONAL, 0);
+		sg_free_table(sgt);
+		goto fail;
+	}
+	/* CPU mappings: zap; faults then map the system pages (evict_sem orders them after us) */
+	drm_vma_node_unmap(&bo->base.vma_node, bo->base.dev->anon_inode->i_mapping);
+	if (drm_mm_node_allocated(&bo->bar1)) {
+		mutex_lock(&nv->uapi.bar1_lock);
+		drm_mm_remove_node(&bo->bar1);
+		mutex_unlock(&nv->uapi.bar1_lock);
+	}
+	nv_mem_put(nv, &bo->node);
+	atomic64_add(size, &nv->uapi.evicted_bytes);
+	atomic64_inc(&nv->uapi.evictions);
+	dev_info_ratelimited(dev, "uapi: evicted %llu MiB to system memory (VRAM full)\n", size >> 20);
+	return 0;
+fail:
+	if (pages)
+		for (i = 0; i < npages; i++)
+			if (pages[i])
+				__free_page(pages[i]);
+	kvfree(pages);
+	kvfree(dma);
+	kfree(sgt);
+	return ret;
+}
+
+/* VRAM for `node` by evicting the oldest evictable objects until it fits. */
+static int evict_for(struct nvdrv_dev *nv, struct drm_mm_node *node, u64 size, u64 align)
+{
+	struct nv_uapi *ua = &nv->uapi;
+	int ret;
+
+	down_write(&ua->evict_sem);
+	ret = wait_gpu_idle(nv);
+	while (!ret) {
+		struct nv_bo *bo = NULL, *b;
+
+		ret = nv_mem_get(nv, node, size, align);
+		if (ret != -ENOSPC)
+			break;
+		mutex_lock(&ua->lru_lock);
+		list_for_each_entry(b, &ua->vram_bos, lru) {
+			if (b->no_evict || b->base.dma_buf || b->base.import_attach || !b->vram ||
+			    !kref_get_unless_zero(&b->base.refcount))
+				continue;
+			bo = b;
+			list_del_init(&b->lru);
+			break;
+		}
+		mutex_unlock(&ua->lru_lock);
+		if (!bo)
+			break;	/* -ENOSPC: nothing left to evict */
+		ret = evict_one(nv, bo);
+		if (ret) {	/* keep it in VRAM, try the next one */
+			mutex_lock(&ua->lru_lock);
+			bo->no_evict = true;
+			list_add_tail(&bo->lru, &ua->vram_bos);
+			mutex_unlock(&ua->lru_lock);
+			ret = 0;
+		}
+		drm_gem_object_put(&bo->base);
+	}
+	up_write(&ua->evict_sem);
+	return ret;
+}
+
 static struct nv_bo *nv_bo_new(struct drm_device *dev, u64 size, u32 domain, u64 align)
 {
 	struct nvdrv_dev *nv = dev_nv(dev);
@@ -409,6 +593,8 @@ static struct nv_bo *nv_bo_new(struct drm_device *dev, u64 size, u32 domain, u64
 		return ERR_PTR(-ENOMEM);
 	bo->nv = nv;
 	bo->base.funcs = &nv_bo_funcs;
+	INIT_LIST_HEAD(&bo->vmas);
+	INIT_LIST_HEAD(&bo->lru);
 	bo->vram = domain & NOUVEAU_GEM_DOMAIN_VRAM;
 	bo->domain = bo->vram ? NOUVEAU_GEM_DOMAIN_VRAM : NOUVEAU_GEM_DOMAIN_GART;
 	size = ALIGN(size, bo->vram ? SZ_64K : PAGE_SIZE);
@@ -417,11 +603,21 @@ static struct nv_bo *nv_bo_new(struct drm_device *dev, u64 size, u32 domain, u64
 		drm_gem_private_object_init(dev, &bo->base, size);
 		mutex_lock(&nv->gsp_lock);
 		ret = nv_fifo_init(nv);	/* CE channel; also sets up the pool under gsp_lock */
+		mutex_unlock(&nv->gsp_lock);
 		if (!ret)
 			ret = nv_mem_get(nv, &bo->node, size, max_t(u64, align, SZ_64K));
-		if (!ret)	/* never hand out old VRAM contents */
+		if (ret == -ENOSPC)	/* VRAM full: move older objects to system memory */
+			ret = evict_for(nv, &bo->node, size, max_t(u64, align, SZ_64K));
+		if (!ret) {		/* never hand out old VRAM contents */
+			mutex_lock(&nv->gsp_lock);
 			ret = nv_ce_clear(nv, bo->node.start, size);
-		mutex_unlock(&nv->gsp_lock);
+			mutex_unlock(&nv->gsp_lock);
+		}
+		if (!ret) {
+			mutex_lock(&nv->uapi.lru_lock);
+			list_add_tail(&bo->lru, &nv->uapi.vram_bos);
+			mutex_unlock(&nv->uapi.lru_lock);
+		}
 	} else {
 		ret = drm_gem_object_init(dev, &bo->base, size);
 		if (ret) {
@@ -463,10 +659,20 @@ static struct nv_bo *nv_bo_new(struct drm_device *dev, u64 size, u32 domain, u64
 /* For KMS: is obj a VRAM object of this driver, and where is it? */
 bool nv_uapi_bo_vram(struct drm_gem_object *obj, u64 *vram)
 {
-	if (obj->funcs != &nv_bo_funcs || !to_nv_bo(obj)->vram)
+	struct nv_bo *bo;
+	bool ret;
+
+	if (obj->funcs != &nv_bo_funcs)
 		return false;
-	*vram = to_nv_bo(obj)->node.start;
-	return true;
+	bo = to_nv_bo(obj);
+	down_read(&bo->nv->uapi.evict_sem);
+	ret = bo->vram;
+	if (ret) {
+		bo->no_evict = true;	/* scanned out: the display reads VRAM only */
+		*vram = bo->node.start;
+	}
+	up_read(&bo->nv->uapi.evict_sem);
+	return ret;
 }
 
 static void bo_info(struct drm_file *file, struct nv_bo *bo, u32 handle, struct drm_nouveau_gem_info *info)
@@ -633,10 +839,14 @@ static int vma_remove(struct nv_cli *cli, u64 addr, u64 range, bool sparse)
 			t->addr = end;
 			t->range = vend - end;
 			t->bo_offset += end - v->addr;
-			if (t->bo)
+			if (t->bo) {
 				drm_gem_object_get(&t->bo->base);
-			else
+				mutex_lock(&cli->nv->uapi.lru_lock);
+				list_add(&t->bo_link, &t->bo->vmas);
+				mutex_unlock(&cli->nv->uapi.lru_lock);
+			} else {
 				cli->nsparse++;
+			}
 			list_add(&t->link, &v->link);
 			v->range = addr - v->addr;
 		} else if (v->addr < addr) {
@@ -647,10 +857,14 @@ static int vma_remove(struct nv_cli *cli, u64 addr, u64 range, bool sparse)
 			v->addr = end;
 		} else {
 			list_del(&v->link);
-			if (v->bo)
+			if (v->bo) {
+				mutex_lock(&cli->nv->uapi.lru_lock);
+				list_del(&v->bo_link);
+				mutex_unlock(&cli->nv->uapi.lru_lock);
 				drm_gem_object_put(&v->bo->base);
-			else
+			} else {
 				cli->nsparse--;
+			}
 			kfree(v);
 		}
 	}
@@ -707,6 +921,12 @@ static int vm_bind_op(struct drm_file *file, struct nv_cli *cli, const struct dr
 	}
 	list_add_tail(&v->link, &cli->vmas);
 	cli->nsparse += !v->bo;
+	v->cli = cli;
+	if (v->bo) {
+		mutex_lock(&cli->nv->uapi.lru_lock);
+		list_add(&v->bo_link, &v->bo->vmas);
+		mutex_unlock(&cli->nv->uapi.lru_lock);
+	}
 	return 0;
 }
 
@@ -785,6 +1005,7 @@ static int ioctl_vm_bind(struct drm_device *dev, void *data, struct drm_file *fi
 	if (ret)
 		goto out;
 	mutex_lock(&cli->lock);
+	down_read(&nv->uapi.evict_sem);	/* object placement stable while PTEs are written */
 	mutex_lock(&nv->gsp_lock);
 	for (i = 0; i < req->op_count && !ret; i++) {
 		ret = vm_bind_op(file, cli, &ops[i]);
@@ -795,6 +1016,7 @@ static int ioctl_vm_bind(struct drm_device *dev, void *data, struct drm_file *fi
 	if (req->op_count)
 		ret = nv_vmm_flush(nv, &cli->vm) ?: ret;
 	mutex_unlock(&nv->gsp_lock);
+	up_read(&nv->uapi.evict_sem);
 	mutex_unlock(&cli->lock);
 	if (!ret) {
 		stub = dma_fence_get_stub();
@@ -850,6 +1072,7 @@ static int ioctl_channel_alloc(struct drm_device *dev, void *data, struct drm_fi
 	INIT_LIST_HEAD(&u->pending);
 	INIT_LIST_HEAD(&u->active);
 	u->fence_ctx = dma_fence_context_alloc(1);
+	INIT_LIST_HEAD(&u->all);
 
 	mutex_lock(&cli->lock);
 	id = idr_alloc(&cli->chans, u, 0, UAPI_MAX_CHANS, GFP_KERNEL);
@@ -883,6 +1106,13 @@ static int ioctl_channel_alloc(struct drm_device *dev, void *data, struct drm_fi
 		return ret;
 	}
 	mutex_unlock(&cli->lock);
+	{
+		unsigned long flags;
+
+		spin_lock_irqsave(&nv->uapi.lock, flags);
+		list_add_tail(&u->all, &nv->uapi.chans);
+		spin_unlock_irqrestore(&nv->uapi.lock, flags);
+	}
 	req->channel = id;
 	req->pushbuf_domains = NOUVEAU_GEM_DOMAIN_VRAM | NOUVEAU_GEM_DOMAIN_GART;
 	req->notifier_handle = 0;
@@ -941,6 +1171,7 @@ static int ioctl_exec(struct drm_device *dev, void *data, struct drm_file *file)
 		goto out;
 
 	mutex_lock(&cli->lock);
+	down_read(&nv->uapi.evict_sem);	/* no eviction while work is being queued */
 	u = idr_find(&cli->chans, req->channel);
 	if (!u || u->dead) {
 		ret = u ? -ENODEV : -ENOENT;
@@ -1001,6 +1232,7 @@ static int ioctl_exec(struct drm_device *dev, void *data, struct drm_file *file)
 	u->last = dma_fence_get(fence);
 	uapi_boost(nv);
 unlock:
+	up_read(&nv->uapi.evict_sem);
 	mutex_unlock(&cli->lock);
 	if (!ret)
 		ret = sync_signal(file, sigs, req->sig_count, fence);
@@ -1389,8 +1621,12 @@ void nv_uapi_postclose(struct drm_device *dev, struct drm_file *file)
 		uchan_free(cli, u);
 	idr_destroy(&cli->chans);
 	list_for_each_entry_safe(v, tmp, &cli->vmas, link) {
-		if (v->bo)
+		if (v->bo) {
+			mutex_lock(&nv->uapi.lru_lock);
+			list_del(&v->bo_link);
+			mutex_unlock(&nv->uapi.lru_lock);
 			drm_gem_object_put(&v->bo->base);
+		}
 		kfree(v);
 	}
 	if (cli->vm_ready) {
@@ -1421,6 +1657,26 @@ const struct drm_ioctl_desc *const nv_uapi_ioctls_ptr = nv_uapi_ioctls;
 const int nv_uapi_num_ioctls = ARRAY_SIZE(nv_uapi_ioctls);
 static_assert(ARRAY_SIZE(nv_uapi_ioctls) == DRM_NOUVEAU_GEM_INFO + 1);
 
+/* debugfs mem */
+void nv_uapi_mem_show(struct nvdrv_dev *nv, struct seq_file *m)
+{
+	struct nv_uapi *ua = &nv->uapi;
+	struct nv_bo *bo;
+	u64 n = 0, bytes = 0, pinned = 0;
+
+	mutex_lock(&ua->lru_lock);
+	list_for_each_entry(bo, &ua->vram_bos, lru) {
+		n++;
+		bytes += bo->base.size;
+		pinned += bo->no_evict || bo->base.dma_buf || bo->base.import_attach ? bo->base.size : 0;
+	}
+	mutex_unlock(&ua->lru_lock);
+	seq_printf(m, "VRAM pool: %llu MiB, %llu MiB used\n", nv->mem.size >> 20, nv->mem.used >> 20);
+	seq_printf(m, "GEM objects in VRAM: %llu (%llu MiB, %llu MiB not evictable)\n", n, bytes >> 20, pinned >> 20);
+	seq_printf(m, "evictions: %lld (%lld MiB moved to system memory)\n", atomic64_read(&ua->evictions),
+		   atomic64_read(&ua->evicted_bytes) >> 20);
+}
+
 void nv_uapi_init(struct nvdrv_dev *nv)
 {
 	struct nv_uapi *ua = &nv->uapi;
@@ -1429,6 +1685,10 @@ void nv_uapi_init(struct nvdrv_dev *nv)
 	INIT_LIST_HEAD(&ua->active);
 	mutex_init(&ua->bar1_lock);
 	INIT_WORK(&ua->boost_work, uapi_boost_work);
+	init_rwsem(&ua->evict_sem);
+	mutex_init(&ua->lru_lock);
+	INIT_LIST_HEAD(&ua->vram_bos);
+	INIT_LIST_HEAD(&ua->chans);
 	hrtimer_setup(&ua->timer, uapi_poll, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 }
 

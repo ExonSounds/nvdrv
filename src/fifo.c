@@ -1034,6 +1034,63 @@ int nv_ce_clear(struct nvdrv_dev *nv, u64 vram, u64 size)
 	return read_poll_timeout(READ_ONCE, sem, (s32)(sem - seq) >= 0, 20, 2000000, false, *(u32 *)ch->sem.cpu);
 }
 
+/*
+ * Copy [vram, vram + bytes) into the DMA segments of sgt (coherent system memory), both
+ * sides physical, then wait. Used to evict GEM objects from VRAM. Caller holds gsp_lock.
+ */
+#define C7B5_SET_SRC_PHYS_MODE	0x260
+#define C7B5_OFFSET_IN_UPPER_	0x400
+#define LAUNCH_COPY_PHYS	0x3186		/* non-pipelined, flush, pitch, SRC/DST_TYPE PHYSICAL */
+#define LAUNCH_SEM		0x8		/* + release one-word semaphore */
+int nv_ce_copy_to_sg(struct nvdrv_dev *nv, u64 vram, struct sg_table *sgt, u64 bytes)
+{
+	struct nv_chan *ch = &nv->chan;
+	struct scatterlist *sg;
+	u32 seq = 0, sem, batch = 0;
+	u64 off = 0;
+	int i, ret = 0;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	if (!ch->handle)
+		return -ENODEV;
+	nv_push1(ch, SUBC_CE, C7B5_SET_SRC_PHYS_MODE, 0);	/* LOCAL_FB */
+	nv_push1(ch, SUBC_CE, C7B5_SET_DST_PHYS_MODE, 1);	/* COHERENT_SYSMEM */
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		u64 dma = sg_dma_address(sg), left = min_t(u64, sg_dma_len(sg), bytes - off);
+
+		while (left) {
+			u64 n = min_t(u64, left, SZ_1G), src = vram + off;
+			bool last = off + n >= bytes;
+			u32 io[4] = { upper_32_bits(src), lower_32_bits(src), upper_32_bits(dma), lower_32_bits(dma) };
+
+			nv_push(ch, SUBC_CE, C7B5_OFFSET_IN_UPPER_, io, 4);
+			nv_push1(ch, SUBC_CE, C7B5_LINE_LENGTH_IN, n);
+			if (last) {
+				u32 semd[3] = { upper_32_bits(ch->sem_va), lower_32_bits(ch->sem_va), seq = ++ch->seq };
+
+				nv_push(ch, SUBC_CE, C7B5_SET_SEMAPHORE_A, semd, 3);
+			}
+			nv_push1(ch, SUBC_CE, C7B5_LAUNCH_DMA, LAUNCH_COPY_PHYS | (last ? LAUNCH_SEM : 0));
+			off += n;
+			dma += n;
+			left -= n;
+			if (++batch == 256 && !last) {	/* keep the push segment small */
+				nv_kick(nv, ch);
+				batch = 0;
+				nv_push1(ch, SUBC_CE, C7B5_SET_SRC_PHYS_MODE, 0);
+				nv_push1(ch, SUBC_CE, C7B5_SET_DST_PHYS_MODE, 1);
+			}
+		}
+		if (off >= bytes)
+			break;
+	}
+	if (off < bytes || !seq)
+		return -EINVAL;
+	nv_kick(nv, ch);
+	ret = read_poll_timeout(READ_ONCE, sem, (s32)(sem - seq) >= 0, 20, 5000000, false, *(u32 *)ch->sem.cpu);
+	return ret;
+}
+
 static void __maybe_unused rl_state(struct nvdrv_dev *nv, const char *when)
 {
 	struct nv_chan *ch = &nv->chan;

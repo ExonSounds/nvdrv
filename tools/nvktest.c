@@ -220,6 +220,50 @@ int main(int argc, char **argv)
 	struct drm_nouveau_channel_free cf2 = { .channel = ca2.channel };
 	CHECK(drmCommandWrite(fd, DRM_NOUVEAU_CHANNEL_FREE, &cf2, sizeof(cf2)));
 
+	/*
+	 * nvktest overcommit [GiB]: allocate more VRAM than the pool has; nvdrv evicts older
+	 * objects to system memory. Every object must keep its contents (CPU check) and stay
+	 * usable by the GPU (compute writes into the oldest, evicted one).
+	 */
+	if (argc > 1 && !strcmp(argv[1], "overcommit")) {
+		int nb = argc > 2 ? atoi(argv[2]) : 10, b, badobj = 0;
+		uint32_t hb[64];
+		volatile uint32_t *mb[64];
+
+		for (b = 0; b < nb && b < 64; b++) {
+			void *m;
+
+			CHECK(bo_new(1ull << 30, NOUVEAU_GEM_DOMAIN_VRAM, &hb[b], &m));
+			mb[b] = m;
+			for (uint64_t o = 0; o < (1ull << 30); o += 64 << 20)	/* a word every 64 MiB */
+				mb[b][o / 4] = 0xa0000000u + b * 0x100 + (uint32_t)(o >> 26);
+			CHECK(bind(hb[b], 0x100000000ull + (uint64_t)b * (1ull << 30), 1ull << 30, DRM_NOUVEAU_VM_BIND_OP_MAP));
+			printf("  object %2d: 1 GiB allocated, mapped at 0x%llx\n", b,
+			       0x100000000ull + (unsigned long long)b * (1ull << 30));
+		}
+		for (b = 0; b < nb && b < 64; b++)
+			for (uint64_t o = 0; o < (1ull << 30); o += 64 << 20)
+				if (mb[b][o / 4] != 0xa0000000u + b * 0x100 + (uint32_t)(o >> 26)) {
+					badobj++;
+					break;
+				}
+		printf("overcommit: %d GiB in %d objects, %d with wrong contents (CPU)\n", nb, nb, badobj);
+		/* GPU write into object 0 (evicted first) through its existing mapping */
+		p = pb;
+		mthd(1, 0x0000, 1, 0xc7c0);
+		mthd(1, 0x1b00, 4, 0x1, 0x00000100, 0x600d0bad, 1u << 28);	/* VA 0x1_0000_0100 */
+		ep.va = 0x10000000;
+		ep.va_len = (uint32_t)((char *)p - (char *)pb);
+		ex.channel = ca.channel;
+		ex.wait_count = 0;
+		ex.sig_ptr = (uintptr_t)&sig2;
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_EXEC, &ex, sizeof(ex)));
+		r = drmSyncobjWait(fd, &so2, 1, INT64_MAX, 0, NULL);
+		printf("GPU write into object 0: wait %d, reads 0x%08x -> %s\n", r, mb[0][0x100 / 4],
+		       !r && mb[0][0x100 / 4] == 0x600d0bad && !badobj ? "PASS" : "FAIL");
+		return 0;
+	}
+
 	/* transfer queue: a copy-engine channel copies 4 KiB VRAM -> GART (uAPI 1.4.1) */
 	{
 		struct drm_nouveau_channel_alloc cc = { .fb_ctxdma_handle = ~0u, .tt_ctxdma_handle = NOUVEAU_FIFO_ENGINE_CE };

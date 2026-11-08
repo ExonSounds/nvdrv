@@ -9,7 +9,8 @@
  *
  * Page-table formats are GP100+ (nouveau nvkm/subdev/mmu/vmmgp100.c):
  *   levels (VA bits)  PD3/root 48:47 (GSP's page), PD2 46:38, PD1 37:29,
- *                     PD0 28:21 (16-byte dual entries: [0] 64K table, [1] 4K table),
+ *                     PD0 28:21 (16-byte dual entries: [0] 64K table, [1] 4K table;
+ *                     one PD0 page per 512 MiB, up to the whole BAR: 8 GiB with ReBAR),
  *                     PT 20:16 (32 x 8-byte PTEs for 64 KiB pages)
  *   PDE  = (table address >> 4) | APERTURE_VIDEO_MEMORY (1 << 1)
  *   PTE  = (page address >> 4)  | VALID, aperture 0 = video memory, kind 0 = pitch
@@ -31,8 +32,10 @@
 #define PTE_VALID		BIT_ULL(0)
 
 #define BAR1_PT_BYTES		0x100		/* 32 PTEs */
-#define BAR1_MAX_VA		(256ULL << 21)	/* one PD0 page: 256 x 2 MiB = 512 MiB */
-#define BAR1_TABLES_SIZE	(3 * SZ_4K + 256 * BAR1_PT_BYTES)
+#define BAR1_PD0_SPAN		(256ULL << 21)	/* one PD0 page: 256 x 2 MiB = 512 MiB */
+#define BAR1_MAX_PD0		16		/* 8 GiB: all of a Resizable BAR on GA104 */
+/* PD2, PD1, n PD0 pages, then 256 page tables per PD0 page */
+#define BAR1_TABLES_SIZE(n)	((2 + (n)) * SZ_4K + (n) * 256 * BAR1_PT_BYTES)
 
 static void wr64(struct nvdrv_dev *nv, u64 addr, u64 v)
 {
@@ -55,7 +58,7 @@ static int bar1_invalidate(struct nvdrv_dev *nv)
 int nv_bar1_init(struct nvdrv_dev *nv)
 {
 	struct nv_bar1 *b = &nv->bar1;
-	u64 root = nv->gsp_info.bar1_pde_base, pd2, pd1;
+	u64 root = nv->gsp_info.bar1_pde_base, pd2, pd1, i;
 	int ret;
 
 	lockdep_assert_held(&nv->gsp_lock);
@@ -63,16 +66,18 @@ int nv_bar1_init(struct nvdrv_dev *nv)
 		return 0;
 	if (!nv->gsp_info.valid || !root)
 		return -ENODEV;
-	ret = nv_vram_alloc(nv, BAR1_TABLES_SIZE, SZ_64K, &b->tables);
+	b->npd0 = clamp_t(u64, DIV_ROUND_UP(pci_resource_len(nv->pdev, 1), BAR1_PD0_SPAN), 1, BAR1_MAX_PD0);
+	ret = nv_vram_alloc(nv, BAR1_TABLES_SIZE(b->npd0), SZ_64K, &b->tables);
 	if (ret)
 		return ret;
-	nv_vram_fill(nv, b->tables, BAR1_TABLES_SIZE, 0, NULL, NULL);
+	nv_vram_fill(nv, b->tables, BAR1_TABLES_SIZE(b->npd0), 0, NULL, NULL);
 	pd2 = b->tables;
 	pd1 = b->tables + SZ_4K;
 	b->pd0 = b->tables + 2 * SZ_4K;
-	b->pts = b->tables + 3 * SZ_4K;
+	b->pts = b->pd0 + b->npd0 * SZ_4K;
 
-	wr64(nv, pd1, (b->pd0 >> 4) | PDE_VRAM);
+	for (i = 0; i < b->npd0; i++)	/* PD1 entry i: BAR1 VA [i * 512 MiB, +512 MiB) */
+		wr64(nv, pd1 + i * 8, ((b->pd0 + i * SZ_4K) >> 4) | PDE_VRAM);
 	wr64(nv, pd2, (pd1 >> 4) | PDE_VRAM);
 	b->old_root0 = (u64)nv_vram_rd32(nv, root + 4) << 32 | nv_vram_rd32(nv, root);
 	wr64(nv, root, (pd2 >> 4) | PDE_VRAM);
@@ -82,7 +87,7 @@ int nv_bar1_init(struct nvdrv_dev *nv)
 	if (ret)
 		return ret;
 
-	b->size = min_t(u64, pci_resource_len(nv->pdev, 1), BAR1_MAX_VA);
+	b->size = min_t(u64, pci_resource_len(nv->pdev, 1), b->npd0 * BAR1_PD0_SPAN);
 	return 0;
 }
 
@@ -103,7 +108,7 @@ int nv_bar1_set(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size)
 		u64 v = va + off, pt = b->pts + (v >> 21) * BAR1_PT_BYTES;
 
 		/* PD0 dual entry: [0] = 64 KiB page table, [1] = 4 KiB table (none) */
-		wr64(nv, b->pd0 + (v >> 21) * 16, (pt >> 4) | PDE_VRAM);
+		wr64(nv, b->pd0 + (v >> 29) * SZ_4K + ((v >> 21) & 255) * 16, (pt >> 4) | PDE_VRAM);
 		wr64(nv, pt + ((v >> 16) & 31) * 8, unmap ? 0 : ((vram + off) >> 4) | PTE_VALID);
 	}
 	return bar1_invalidate(nv);
