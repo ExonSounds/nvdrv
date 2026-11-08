@@ -1500,9 +1500,64 @@ static int ioctl_getparam(struct drm_device *dev, void *data, struct drm_file *f
 	return 0;
 }
 
+/*
+ * Z-cull geometry for NVK (nouveau r570_gr_get_ctxbufs_and_zcull_info): the ten
+ * NV2080_CTRL_GR_GET_ZCULL_INFO_PARAMS fields from GSP-RM's internal subdevice, plus the
+ * Z-cull context-switch buffer size/alignment (engine context property GRAPHICS_ZCULL).
+ * NVK manages Z-cull storage itself; nothing is bound per channel (as nouveau).
+ */
+#define NV2080_CTRL_CMD_GR_GET_ZCULL_INFO	0x20801206
+#define NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO_ 0x20800a32
+#define CTXPROP_GRAPHICS_ZCULL			0x08
+#define CTXPROP_COUNT_				0x1a
+
+static int zcull_query(struct nvdrv_dev *nv)
+{
+	struct nv_gsp_static_info *si = &nv->gsp_info;
+	struct nv_uapi *ua = &nv->uapi;
+	__le32 zi[10] = {}, *info;
+	int ret, i;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	if (ua->zcull_valid)
+		return 0;
+	info = kzalloc(8 * CTXPROP_COUNT_ * 8, GFP_KERNEL);	/* [GR engines][properties] { size, align } */
+	if (!info)
+		return -ENOMEM;
+	ret = nv_rm_control(nv, si->h_internal_client, si->h_internal_subdevice, NV2080_CTRL_CMD_GR_GET_ZCULL_INFO,
+			    zi, sizeof(zi));
+	if (!ret)
+		ret = nv_rm_control(nv, si->h_internal_client, si->h_internal_subdevice,
+				    NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO_, info,
+				    8 * CTXPROP_COUNT_ * 8);
+	if (!ret) {
+		for (i = 0; i < 10; i++)
+			ua->zcull[i] = le32_to_cpu(zi[i]);
+		ua->zcull[10] = le32_to_cpu(info[CTXPROP_GRAPHICS_ZCULL * 2]);		/* ctxsw_size */
+		ua->zcull[11] = le32_to_cpu(info[CTXPROP_GRAPHICS_ZCULL * 2 + 1]);	/* ctxsw_align */
+		ua->zcull_valid = true;
+		dev_info(&nv->pdev->dev, "uapi: zcull align %ux%u, aliquots %u/%u, region x%u hdr %u/%u, %u subregions %ux%u, ctxsw %u/%u\n",
+			 ua->zcull[0], ua->zcull[1], ua->zcull[2], ua->zcull[3], ua->zcull[4], ua->zcull[5],
+			 ua->zcull[6], ua->zcull[7], ua->zcull[8], ua->zcull[9], ua->zcull[10], ua->zcull[11]);
+	}
+	kfree(info);
+	return ret;
+}
+
 static int ioctl_zcull(struct drm_device *dev, void *data, struct drm_file *file)
 {
-	return -EOPNOTSUPP;
+	struct nvdrv_dev *nv = dev_nv(dev);
+	struct drm_nouveau_get_zcull_info *out = data;
+	int ret;
+
+	static_assert(sizeof(*out) == sizeof(nv->uapi.zcull));
+	mutex_lock(&nv->gsp_lock);
+	ret = nv->gsp_running ? zcull_query(nv) : -ENODEV;
+	mutex_unlock(&nv->gsp_lock);
+	if (ret)
+		return -ENOTTY;	/* like nouveau without the info: NVK runs without Z-cull */
+	memcpy(out, nv->uapi.zcull, sizeof(*out));	/* same field order as the uAPI struct */
+	return 0;
 }
 
 /* ---- NVIF (the parts NVK uses) ----------------------------------------------------- */
@@ -1817,4 +1872,5 @@ void nv_uapi_fini(struct nvdrv_dev *nv)
 		drm_mm_takedown(&ua->bar1_mm);
 	ua->bar1_ready = false;
 	ua->gpcs = ua->tpcs = 0;
+	ua->zcull_valid = false;
 }

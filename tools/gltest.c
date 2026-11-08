@@ -142,5 +142,64 @@ int main(int argc, char **argv)
 			}
 		}
 	printf("gltest: %ld of %d pixels wrong -> %s\n", bad, W * H, bad ? "FAIL" : "PASS");
+
+	/*
+	 * Depth-heavy scene (exercises Z-cull when NVK enables it): 64 pixel-aligned rectangles
+	 * at distinct depths in random order, GL_LESS; each pixel must show the nearest one.
+	 */
+	{
+		static int rx0[64], ry0[64], rx1[64], ry1[64], rz[64];
+		static unsigned char ec[W * H * 4];
+		unsigned int seed = 12345;
+		long bad2 = 0;
+
+		for (int i = 0; i < 64; i++) {
+			int a, b;
+
+			seed = seed * 1103515245u + 12345u; a = (seed >> 8) % W;
+			seed = seed * 1103515245u + 12345u; b = (seed >> 8) % W;
+			rx0[i] = a < b ? a : b; rx1[i] = (a < b ? b : a) + 1;
+			seed = seed * 1103515245u + 12345u; a = (seed >> 8) % H;
+			seed = seed * 1103515245u + 12345u; b = (seed >> 8) % H;
+			ry0[i] = a < b ? a : b; ry1[i] = (a < b ? b : a) + 1;
+			rz[i] = (i * 37) % 64;	/* distinct depth ranks */
+		}
+		glClearColor(0, 0, 0, 1);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+		glUseProgram(pc);
+		for (int i = 0; i < 64; i++) {
+			glUniform4f(glGetUniformLocation(pc, "col"), (i & 3) / 3.0f, ((i >> 2) & 3) / 3.0f,
+				    ((i >> 4) & 3) / 3.0f, 1);
+			quad(pc, -1 + 2.0f * rx0[i] / W, -1 + 2.0f * ry0[i] / H, -1 + 2.0f * rx1[i] / W,
+			     -1 + 2.0f * ry1[i] / H, -0.9f + rz[i] * (1.8f / 64));
+		}
+		memset(ec, 0, sizeof(ec));
+		for (int y = 0; y < H; y++)
+			for (int x = 0; x < W; x++) {
+				int best = -1;
+
+				for (int i = 0; i < 64; i++)
+					if (x >= rx0[i] && x < rx1[i] && y >= ry0[i] && y < ry1[i] &&
+					    (best < 0 || rz[i] < rz[best]))
+						best = i;
+				unsigned char *e = ec + (y * W + x) * 4;
+				e[3] = 255;
+				if (best >= 0) {
+					e[0] = (best & 3) * 85;
+					e[1] = ((best >> 2) & 3) * 85;
+					e[2] = ((best >> 4) & 3) * 85;
+				}
+			}
+		glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px);
+		for (int i = 0; i < W * H; i++)
+			if (memcmp(px + i * 4, ec + i * 4, 4)) {
+				if (bad2 < 4)
+					printf("  depth (%d,%d): %02x%02x%02x, expected %02x%02x%02x\n", i % W, i / W,
+					       px[i * 4], px[i * 4 + 1], px[i * 4 + 2], ec[i * 4], ec[i * 4 + 1], ec[i * 4 + 2]);
+				bad2++;
+			}
+		printf("gltest depth: %ld of %d pixels wrong -> %s\n", bad2, W * H, bad2 ? "FAIL" : "PASS");
+		bad += bad2;
+	}
 	return bad != 0;
 }

@@ -122,6 +122,16 @@ int main(int argc, char **argv)
 		printf("  %-13s %s0x%" PRIx64 "\n", params[i].n, r ? "ERROR " : "", v);
 	}
 
+	{
+		struct drm_nouveau_get_zcull_info z = {};
+		int zr = drmCommandRead(fd, DRM_NOUVEAU_GET_ZCULL_INFO, &z, sizeof(z));
+
+		printf("zcull (%d): align %ux%u, aliquots %u/%u, region x%u, headers %u/%u, subregions %u (%ux%u), ctxsw %u/%u\n",
+		       zr, z.width_align_pixels, z.height_align_pixels, z.pixel_squares_by_aliquots, z.aliquot_total,
+		       z.zcull_region_byte_multiplier, z.zcull_region_header_size, z.zcull_subregion_header_size,
+		       z.subregion_count, z.subregion_width_align_pixels, z.subregion_height_align_pixels, z.ctxsw_size,
+		       z.ctxsw_align);
+	}
 	struct drm_nouveau_channel_alloc ca = { .fb_ctxdma_handle = ~0u, .tt_ctxdma_handle = NOUVEAU_FIFO_ENGINE_GR };
 	CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_CHANNEL_ALLOC, &ca, sizeof(ca)));
 	struct { struct nvif_hdr h; struct nvif_sclass s; } sc = {

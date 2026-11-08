@@ -438,7 +438,12 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
         at 4 KiB alignment (its nouveau backend's choice), so most mappings stay small. `tools/gltest.c` (Zink
         off-screen FBO, gradient + depth test, full readback): exact with a compressed, big-page color target.
 - [ ] **2 MiB GPU pages** (PD0 entry as PTE): needs splitting a 2 MiB PTE back into tables on partial unmap.
-- [ ] **Z-cull info** (`GET_ZCULL_INFO` from RM) so NVK enables Z-cull.
+- [x] **Z-cull** (2026-11-09): `DRM_NOUVEAU_GET_ZCULL_INFO` answered from `NV2080_CTRL_CMD_GR_GET_ZCULL_INFO`
+      (0x20801206, GSP's internal subdevice) plus the GRAPHICS_ZCULL context-buffer size/alignment (as nouveau
+      r570). GA104: align 304x32, aliquots 4864/5120, region x160, headers 224/1344, 16 subregions 304x64, ctxsw
+      821760/4096. NVK manages Z-cull storage itself (nothing bound per channel, as nouveau). Verified by dumping
+      NVK's pushes: SET_ZCULL = 1, region/storage/aliquots/bounds programmed (region width 1216 = 1024 rounded to
+      304); `tools/gltest.c` depth scene (64 rectangles, random depth order) exact with Z-cull on.
 - [ ] **Per-object fences / implicit sync**: BO reservation fences (dma-buf with other devices), VM_BIND unmap and
       CPU_PREP without waiting for the whole client; asynchronous VM_BIND; full sparse-binding semantics.
 - [ ] **Preemption buffers** (GFXP pool/control block, spill, beta CB; CILP) so long compute work can be preempted.
