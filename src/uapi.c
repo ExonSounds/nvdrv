@@ -60,6 +60,7 @@ MODULE_PARM_DESC(dump_push, "Debug: print the dwords of every EXEC push buffer (
 #define AMPERE_B			0xc797
 #define KEPLER_INLINE_TO_MEMORY_B	0xa140
 #define AMPERE_COMPUTE_B		0xc7c0
+static const u32 ce_classes[] = { AMPERE_DMA_COPY_B };	/* transfer-queue channels */
 static const u32 gr_classes[] = { AMPERE_DMA_COPY_B, FERMI_TWOD_A, AMPERE_B, KEPLER_INLINE_TO_MEMORY_B,
 				  AMPERE_COMPUTE_B };
 
@@ -82,6 +83,8 @@ struct nv_uchan {
 	int id;
 	u32 nobj;
 	bool gr_ctx;			/* GR context promoted (on the first GR class object) */
+	bool copy;			/* copy-engine channel (transfer queue) */
+	u32 copy_engine;		/* its NV2080_ENGINE_TYPE_COPYn */
 	u32 submitted;			/* last fence seqno pushed */
 	u64 fence_ctx;
 	struct list_head pending;	/* struct nv_fence, under nv->uapi.lock */
@@ -832,12 +835,18 @@ static int ioctl_channel_alloc(struct drm_device *dev, void *data, struct drm_fi
 
 	if (!cli->vm_ready)
 		return -EINVAL;	/* VM_BIND uAPI only */
-	if (req->fb_ctxdma_handle != ~0u || req->tt_ctxdma_handle != NOUVEAU_FIFO_ENGINE_GR)
-		return -ENOSYS;	/* GR channels only for now (no transfer queue) */
+	if (req->fb_ctxdma_handle != ~0u ||
+	    (req->tt_ctxdma_handle != NOUVEAU_FIFO_ENGINE_GR && req->tt_ctxdma_handle != NOUVEAU_FIFO_ENGINE_CE))
+		return -ENOSYS;
+	/* CE channels go to nvdrv's async copy engine (one with physical CEs, own runlist) */
+	if (req->tt_ctxdma_handle == NOUVEAU_FIFO_ENGINE_CE && !nv->chan.handle)
+		return -ENODEV;
 	u = kzalloc(sizeof(*u), GFP_KERNEL);
 	if (!u)
 		return -ENOMEM;
 	u->cli = cli;
+	u->copy = req->tt_ctxdma_handle == NOUVEAU_FIFO_ENGINE_CE;
+	u->copy_engine = 0x09 /* NV2080_ENGINE_TYPE_COPY0 */ + nv->chan.ce;
 	INIT_LIST_HEAD(&u->pending);
 	INIT_LIST_HEAD(&u->active);
 	u->fence_ctx = dma_fence_context_alloc(1);
@@ -854,8 +863,12 @@ static int ioctl_channel_alloc(struct drm_device *dev, void *data, struct drm_fi
 	chid = nv_chid_get(nv);
 	ret = chid < 0 ? chid : 0;
 	if (!ret) {
-		ret = nv_chan_create(nv, &u->ch, &cli->vm, H_UCHAN(id), chid, 0x01 /* GR0 */, f->gr_runlist,
-				     f->gr_rl_base);
+		if (u->copy)
+			ret = nv_chan_create(nv, &u->ch, &cli->vm, H_UCHAN(id), chid, u->copy_engine,
+					     nv->chan.runlist, nv->chan.rl_base);
+		else
+			ret = nv_chan_create(nv, &u->ch, &cli->vm, H_UCHAN(id), chid, 0x01 /* GR0 */, f->gr_runlist,
+					     f->gr_rl_base);
 		if (ret && !u->ch.chid)
 			nv_chid_put(nv, chid);
 	}
@@ -874,7 +887,7 @@ static int ioctl_channel_alloc(struct drm_device *dev, void *data, struct drm_fi
 	req->pushbuf_domains = NOUVEAU_GEM_DOMAIN_VRAM | NOUVEAU_GEM_DOMAIN_GART;
 	req->notifier_handle = 0;
 	req->nr_subchan = 0;
-	drm_dbg(dev, "uapi: channel %d = chid %u (GR)\n", id, u->ch.chid);
+	drm_dbg(dev, "uapi: channel %d = chid %u (%s)\n", id, u->ch.chid, u->copy ? "CE" : "GR");
 	return 0;
 }
 
@@ -1206,14 +1219,18 @@ static int nvif_engine_obj(struct nv_cli *cli, struct nv_uchan *u, s32 oclass)
 {
 	struct nvdrv_dev *nv = cli->nv;
 	struct { __le32 version, engine_type; } ce = { cpu_to_le32(1), 0 };
+	const u32 *cls = u->copy ? ce_classes : gr_classes;
+	int n = u->copy ? ARRAY_SIZE(ce_classes) : ARRAY_SIZE(gr_classes);
 	bool known = false;
 	int i, ret;
 
-	for (i = 0; i < ARRAY_SIZE(gr_classes); i++)
-		known |= gr_classes[i] == oclass;
+	for (i = 0; i < n; i++)
+		known |= cls[i] == oclass;
 	if (!known)
 		return -EINVAL;
-	if (oclass == AMPERE_DMA_COPY_B) {
+	if (oclass == AMPERE_DMA_COPY_B && u->copy) {
+		ce.engine_type = cpu_to_le32(u->copy_engine);
+	} else if (oclass == AMPERE_DMA_COPY_B) {
 		if (!nv->fifo.gr_ce)
 			return -ENODEV;
 		ce.engine_type = cpu_to_le32(0x09 /* COPY0 */ + nv->fifo.gr_ce - 1);
@@ -1224,7 +1241,7 @@ static int nvif_engine_obj(struct nv_cli *cli, struct nv_uchan *u, s32 oclass)
 	 * object: RM initialises it on that allocation.
 	 */
 	ret = 0;
-	if (!u->gr_ctx) {
+	if (!u->gr_ctx && !u->copy) {	/* copy channels have no GR context */
 		ret = nv_gr_chan_ctx(nv, &u->ch);
 		u->gr_ctx = !ret;
 	}
@@ -1265,11 +1282,16 @@ static int nvif_ioctl(struct drm_file *file, void *buf, u32 size)
 		if (!u || left < sizeof(*sc))
 			return -EINVAL;
 		max = min_t(u32, sc->count, (left - sizeof(*sc)) / sizeof(sc->oclass[0]));
-		for (i = 0; i < ARRAY_SIZE(gr_classes) && i < max; i++) {
-			sc->oclass[i].oclass = gr_classes[i];
-			sc->oclass[i].minver = sc->oclass[i].maxver = -1;
+		{
+			const u32 *cls = u->copy ? ce_classes : gr_classes;
+			u32 n = u->copy ? ARRAY_SIZE(ce_classes) : ARRAY_SIZE(gr_classes);
+
+			for (i = 0; i < n && i < max; i++) {
+				sc->oclass[i].oclass = cls[i];
+				sc->oclass[i].minver = sc->oclass[i].maxver = -1;
+			}
+			sc->count = n;
 		}
-		sc->count = ARRAY_SIZE(gr_classes);
 		return 0;
 	}
 	case NVIF_NEW: {

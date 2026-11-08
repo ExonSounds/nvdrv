@@ -220,6 +220,49 @@ int main(int argc, char **argv)
 	struct drm_nouveau_channel_free cf2 = { .channel = ca2.channel };
 	CHECK(drmCommandWrite(fd, DRM_NOUVEAU_CHANNEL_FREE, &cf2, sizeof(cf2)));
 
+	/* transfer queue: a copy-engine channel copies 4 KiB VRAM -> GART (uAPI 1.4.1) */
+	{
+		struct drm_nouveau_channel_alloc cc = { .fb_ctxdma_handle = ~0u, .tt_ctxdma_handle = NOUVEAU_FIFO_ENGINE_CE };
+		uint32_t *vsrc = (uint32_t *)vram + 0x1000 / 4, *gdst = (uint32_t *)gart + 0x8000 / 4, bad = 0, k;
+
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_CHANNEL_ALLOC, &cc, sizeof(cc)));
+		struct { struct nvif_hdr h; struct nvif_sclass s; } cs = {
+			.h = { .type = 1, .route = 0xff, .token = cc.channel }, .s = { .count = 16 } };
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_NVIF, &cs, sizeof(cs)));
+		printf("copy channel %d, %u classes:", cc.channel, cs.s.count);
+		for (i = 0; i < cs.s.count; i++)
+			printf(" %04x", cs.s.list[i].oclass);
+		printf("\n");
+		struct { struct nvif_hdr h; struct nvif_new n; } on = {
+			.h = { .type = 2, .route = 0xff, .token = cc.channel }, .n = { .oclass = 0xc7b5 } };
+		CHECK(drmCommandWrite(fd, DRM_NOUVEAU_NVIF, &on, sizeof(on)));
+		for (k = 0; k < 1024; k++) {
+			vsrc[k] = 0x5eed0000u ^ (k * 2654435761u);
+			gdst[k] = 0;
+		}
+		p = (uint32_t *)((char *)pb + 0x8000);
+		uint32_t *start = p;
+		mthd(4, 0x0000, 1, 0xc7b5);					/* SET_OBJECT */
+		mthd(4, 0x0400, 4, 0x0, 0x20001000, 0x0, 0x30008000);		/* OFFSET_IN/OUT_UPPER/LOWER */
+		mthd(4, 0x0418, 1, 4096);					/* LINE_LENGTH_IN */
+		mthd(4, 0x0300, 1, 0x186);	/* LAUNCH_DMA: non-pipelined, flush, pitch -> pitch */
+		ep.va = 0x10008000;
+		ep.va_len = (uint32_t)((char *)p - (char *)start);
+		uint32_t so3;
+		CHECK(drmSyncobjCreate(fd, 0, &so3));
+		struct drm_nouveau_sync sig3 = { .flags = DRM_NOUVEAU_SYNC_SYNCOBJ, .handle = so3 };
+		ex.channel = cc.channel;
+		ex.wait_count = 0;
+		ex.sig_ptr = (uintptr_t)&sig3;
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_EXEC, &ex, sizeof(ex)));
+		r = drmSyncobjWait(fd, &so3, 1, INT64_MAX, 0, NULL);
+		for (k = 0; k < 1024; k++)
+			bad += gdst[k] != vsrc[k];
+		printf("copy engine: syncobj wait %d, %u/1024 mismatches -> %s\n", r, bad, !r && !bad ? "PASS" : "FAIL");
+		struct drm_nouveau_channel_free cf3 = { .channel = cc.channel };
+		CHECK(drmCommandWrite(fd, DRM_NOUVEAU_CHANNEL_FREE, &cf3, sizeof(cf3)));
+	}
+
 	/*
 	 * nvktest fault: a compute semaphore release to an unmapped address. RM recovers the
 	 * channel (MMU fault, RC) and sends RC_TRIGGERED asynchronously: exercises the GSP

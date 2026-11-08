@@ -397,7 +397,11 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
         only (replies stay polled, as in RM's _kgspRpcRecvPoll): verified with a deliberate channel fault
         (`nvktest fault`): MMU_FAULT_QUEUED, NOCAT and RC_TRIGGERED arrive with no RPC in flight.
       - GSP health check every 5 s (RISC-V still active), reported once; debugfs `intr` shows counters.
-- [ ] **Transfer queue**: CE channels (async copy engines) in CHANNEL_ALLOC, report uAPI 1.4.1.
+- [x] **Transfer queue** (2026-11-09): CHANNEL_ALLOC with `NOUVEAU_FIFO_ENGINE_CE` creates an unprivileged channel
+      on nvdrv's async copy engine (the CE with physical engines, CE2 / runlist 1 on GA104), class list just
+      AMPERE_DMA_COPY_B (engine type COPYn, no GR context). The DRM driver reports 1.4.1, so NVK exposes a
+      transfer queue family (2 queues, TRANSFER | SPARSE_BINDING) and uses copy channels for uploads. nvktest:
+      CE copy 4 KiB VRAM -> GART bit-exact under a syncobj; vkmark and Zink unchanged.
 - [ ] **VRAM eviction / overcommit** to system memory; today the pool is fixed and allocations fail when full.
 - [ ] **BAR1 beyond 512 MiB** (Resizable BAR exposes all 8 GiB): more PD0 pages, larger host-visible VRAM heap.
 - [ ] **64 KiB / 2 MiB GPU pages** (big-page tables) and **compression** (comptags, compressible kinds).
