@@ -283,6 +283,8 @@ static_assert(sizeof(struct nv_channel_alloc) == 368);
  * MEMORY 3. nvdrv asks for a memory error notifier so RM reports why it recovers a channel.
  */
 #define KCHAN_INTERNAL_FLAGS	(0x1 | 3 << 2 | 1 << 4)
+#define KCHAN_PRIVILEGE_MASK	0x3	/* USER = 0 */
+#define NVOS04_FLAGS_PRIVILEGED	BIT(5)
 
 /*
  * The GPU address space nvdrv's channels run in (r535_mmu_vaspace_new, not external):
@@ -574,7 +576,14 @@ int nv_chan_create(struct nvdrv_dev *nv, struct nv_chan *ch, struct nv_vmm *vm, 
 		return -ENOMEM;
 	a->gpfifo_offset = cpu_to_le64(ch->gpfifo_va);
 	a->gpfifo_entries = cpu_to_le32(GPFIFO_ENTRIES);
-	a->flags = cpu_to_le32(NVOS04_FLAGS_BASE | 0 << NVOS04_RUNQUEUE_SHIFT |
+	/*
+	 * Channels in client VMs run userspace push buffers: unprivileged (NVOS04
+	 * PRIVILEGED_CHANNEL, bit 5, clear; internal PRIVILEGE_USER), as nouveau's user
+	 * channels. Besides keeping privileged methods away from userspace, RM gives USER
+	 * contexts the restricted priv access map, which is the one promoted for them.
+	 */
+	a->flags = cpu_to_le32((NVOS04_FLAGS_BASE & ~(vm->external ? NVOS04_FLAGS_PRIVILEGED : 0)) |
+			       0 << NVOS04_RUNQUEUE_SHIFT |
 			       (chid % 8) << NVOS04_USERD_IDX_SHIFT | (chid / 8) << NVOS04_USERD_PAGE_SHIFT);
 	a->h_vaspace = cpu_to_le32(vm->handle);
 	a->engine_type = cpu_to_le32(engine);
@@ -582,7 +591,7 @@ int nv_chan_create(struct nvdrv_dev *nv, struct nv_chan *ch, struct nv_vmm *vm, 
 	a->userd_mem = (struct nv_memdesc){ cpu_to_le64(f->userd + chid * USERD_SIZE), cpu_to_le64(USERD_SIZE), cpu_to_le32(2), cpu_to_le32(1) };
 	a->ramfc_mem = (struct nv_memdesc){ cpu_to_le64(ch->inst), cpu_to_le64(0x200), cpu_to_le32(2), cpu_to_le32(1) };
 	a->mthdbuf_mem = (struct nv_memdesc){ cpu_to_le64(ch->mthdbuf.dma), cpu_to_le64(mthdbuf_size), cpu_to_le32(1), 0 };
-	a->internal_flags = cpu_to_le32(KCHAN_INTERNAL_FLAGS);
+	a->internal_flags = cpu_to_le32(KCHAN_INTERNAL_FLAGS & ~(vm->external ? KCHAN_PRIVILEGE_MASK : 0));
 	a->error_notifier_mem = (struct nv_memdesc){ cpu_to_le64(ch->errnotif.dma), cpu_to_le64(SZ_4K), cpu_to_le32(1), 0 };
 	ret = nv_rm_alloc(nv, vm->h_client, vm->h_device, handle, AMPERE_CHANNEL_GPFIFO_A, a, sizeof(*a));
 	kfree(a);

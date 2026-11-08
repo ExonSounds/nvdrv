@@ -183,6 +183,43 @@ int main(int argc, char **argv)
 	a = *(volatile uint32_t *)vram;
 	printf("exec 2: syncobj wait %d, VRAM 0x%08x -> %s\n", r, a, !r && a == 0xcafe0003 ? "PASS" : "FAIL");
 
+	/* a second GR channel in the same VM; alternate work between the two (context switches) */
+	struct drm_nouveau_channel_alloc ca2 = { .fb_ctxdma_handle = ~0u, .tt_ctxdma_handle = NOUVEAU_FIFO_ENGINE_GR };
+	CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_CHANNEL_ALLOC, &ca2, sizeof(ca2)));
+	{
+		struct { struct nvif_hdr h; struct nvif_new n; } on = {
+			.h = { .type = 2, .route = 0xff, .token = ca2.channel }, .n = { .handle = 1, .oclass = 0xc7c0 } };
+		CHECK(drmCommandWrite(fd, DRM_NOUVEAU_NVIF, &on, sizeof(on)));
+		on.n.oclass = 0xc797;
+		CHECK(drmCommandWrite(fd, DRM_NOUVEAU_NVIF, &on, sizeof(on)));
+	}
+	for (i = 0; i < 6; i++) {
+		int c = i & 1 ? ca2.channel : ca.channel;
+
+		p = (uint32_t *)((char *)pb + 0x1000 * (i + 1));
+		uint32_t *start = p;
+		if (getenv("THREED")) {	/* 3D class on subchannel 0: SET_REPORT_SEMAPHORE (0x1b00) */
+			mthd(0, 0x0000, 1, 0xc797);
+			mthd(0, 0x1b00, 4, 0x0, 0x20000000 + 4 * i, 0xd0000000 + i, 1u << 28);
+		} else {
+			mthd(1, 0x0000, 1, 0xc7c0);
+			mthd(1, 0x1b00, 4, 0x0, 0x20000000 + 4 * i, 0xd0000000 + i, 1u << 28);
+		}
+		ep.va = 0x10000000 + 0x1000 * (i + 1);
+		ep.va_len = (uint32_t)((char *)p - (char *)start);
+		ex.channel = c;
+		ex.wait_count = 0;
+		ex.sig_ptr = (uintptr_t)&sig2;
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_EXEC, &ex, sizeof(ex)));
+	}
+	r = drmSyncobjWait(fd, &so2, 1, INT64_MAX, 0, NULL);
+	usleep(100000);
+	for (i = 0; i < 6; i++)
+		printf("  alternate %d (channel %d): 0x%08x\n", i, i & 1 ? ca2.channel : ca.channel,
+		       ((volatile uint32_t *)vram)[i]);
+	struct drm_nouveau_channel_free cf2 = { .channel = ca2.channel };
+	CHECK(drmCommandWrite(fd, DRM_NOUVEAU_CHANNEL_FREE, &cf2, sizeof(cf2)));
+
 	CHECK(bind(0, 0x20000000, 0x10000, DRM_NOUVEAU_VM_BIND_OP_UNMAP));
 	struct drm_nouveau_channel_free cf = { .channel = ca.channel };
 	CHECK(drmCommandWrite(fd, DRM_NOUVEAU_CHANNEL_FREE, &cf, sizeof(cf)));

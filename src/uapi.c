@@ -17,6 +17,7 @@
 #include <linux/dma-fence.h>
 #include <linux/dma-fence-chain.h>
 #include <linux/dma-mapping.h>
+#include <linux/highmem.h>
 #include <linux/hrtimer.h>
 #include <linux/idr.h>
 #include <linux/iopoll.h>
@@ -39,6 +40,10 @@
 bool nv_nvk;
 module_param_named(nvk, nv_nvk, bool, 0444);
 MODULE_PARM_DESC(nvk, "Offer nouveau's uAPI for Mesa NVK (DRM driver named \"nouveau\"; experimental)");
+
+static bool dump_push;
+module_param(dump_push, bool, 0644);
+MODULE_PARM_DESC(dump_push, "Debug: print the dwords of every EXEC push buffer (GART objects only)");
 
 #define UAPI_GPFIFO_ENTRIES	512		/* must match fifo.c */
 #define UAPI_PUSH_MAX		(UAPI_GPFIFO_ENTRIES / 2 - 1)
@@ -74,6 +79,7 @@ struct nv_uchan {
 	struct nv_cli *cli;
 	int id;
 	u32 nobj;
+	bool gr_ctx;			/* GR context promoted (on the first GR class object) */
 	u32 submitted;			/* last fence seqno pushed */
 	u64 fence_ctx;
 	struct list_head pending;	/* struct nv_fence, under nv->uapi.lock */
@@ -141,7 +147,8 @@ static bool uchan_poll_locked(struct nv_uchan *u)
 
 	if (dead && !u->dead) {
 		u->dead = true;
-		pr_warn("nvdrv: channel %u recovered by RM: error %u\n", u->ch.chid, n[2]);
+		pr_warn("nvdrv: channel %u recovered by RM: error %u (info16 0x%x), semaphore %u/%u, GP_GET %u/%u\n",
+			u->ch.chid, n[2], n[3] & 0xffff, sem, u->submitted, ioread32(u->ch.userd_cpu + 0x88), u->ch.gp_put);
 	}
 	list_for_each_entry_safe(f, tmp, &u->pending, link) {
 		if (!dead && (s32)(sem - f->seqno) < 0)
@@ -731,8 +738,12 @@ static int ioctl_vm_bind(struct drm_device *dev, void *data, struct drm_file *fi
 		goto out;
 	mutex_lock(&cli->lock);
 	mutex_lock(&nv->gsp_lock);
-	for (i = 0; i < req->op_count && !ret; i++)
+	for (i = 0; i < req->op_count && !ret; i++) {
 		ret = vm_bind_op(file, cli, &ops[i]);
+		pr_debug("nvdrv: vm_bind %s 0x%llx+0x%llx handle %u off 0x%llx flags 0x%x: %d\n",
+			 ops[i].op ? "unmap" : "map", ops[i].addr, ops[i].range, ops[i].handle, ops[i].bo_offset,
+			 ops[i].flags, ret);
+	}
 	if (req->op_count)
 		ret = nv_vmm_flush(nv, &cli->vm) ?: ret;
 	mutex_unlock(&nv->gsp_lock);
@@ -803,8 +814,6 @@ static int ioctl_channel_alloc(struct drm_device *dev, void *data, struct drm_fi
 		if (ret && !u->ch.chid)
 			nv_chid_put(nv, chid);
 	}
-	if (!ret)
-		ret = nv_gr_chan_ctx(nv, &u->ch);
 	mutex_unlock(&nv->gsp_lock);
 	if (ret) {
 		idr_remove(&cli->chans, id);
@@ -839,6 +848,7 @@ static int ioctl_channel_free(struct drm_device *dev, void *data, struct drm_fil
 	return 0;
 }
 
+static void push_dump(struct nv_cli *cli, u32 chid, u64 va, u32 len);
 #define HOST_SEM_ADDR_LO	0x5c
 #define HOST_SEM_EXECUTE_RELEASE_WFI	(0x1 | 1 << 20)	/* RELEASE, RELEASE_WFI, 32-bit payload */
 
@@ -896,6 +906,9 @@ static int ioctl_exec(struct drm_device *dev, void *data, struct drm_file *file)
 			goto unlock;
 		}
 	}
+	if (dump_push)
+		for (i = 0; i < req->push_count; i++)
+			push_dump(cli, ch->chid, push[i].va, push[i].va_len);
 	gp = ch->gpfifo.cpu;
 	for (i = 0; i < req->push_count; i++) {
 		u64 va = push[i].va;
@@ -934,6 +947,41 @@ out:
 	if (!IS_ERR(sigs))
 		kvfree(sigs);
 	return ret;
+}
+
+
+/* Print a submitted push buffer (debug aid; system-memory objects only). */
+static void push_dump(struct nv_cli *cli, u32 chid, u64 va, u32 len)
+{
+	struct nv_vma *v;
+
+	list_for_each_entry(v, &cli->vmas, link) {
+		u64 off, i;
+
+		if (!v->bo || va < v->addr || va + len > v->addr + v->range)
+			continue;
+		if (v->bo->vram) {
+			pr_info("nvdrv: chid %u push 0x%llx+%u is in VRAM, not dumped\n", chid, va, len);
+			return;
+		}
+		off = v->bo_offset + va - v->addr;
+		pr_info("nvdrv: chid %u push 0x%llx, %u dwords:\n", chid, va, len / 4);
+		for (i = 0; i < len / 4; i += 8) {
+			u32 d[8] = {}, j;
+
+			for (j = 0; j < 8 && i + j < len / 4; j++) {
+				u64 o = off + (i + j) * 4;
+				u32 *pg = kmap_local_page(v->bo->pages[o >> PAGE_SHIFT]);
+
+				d[j] = pg[(o & ~PAGE_MASK) / 4];
+				kunmap_local(pg);
+			}
+			pr_info("  %04llx: %08x %08x %08x %08x %08x %08x %08x %08x\n", i, d[0], d[1], d[2], d[3],
+				d[4], d[5], d[6], d[7]);
+		}
+		return;
+	}
+	pr_info("nvdrv: chid %u push 0x%llx+%u not in any mapping\n", chid, va, len);
 }
 
 /* ---- GETPARAM ---------------------------------------------------------------------- */
@@ -1084,11 +1132,22 @@ static int nvif_engine_obj(struct nv_cli *cli, struct nv_uchan *u, s32 oclass)
 		ce.engine_type = cpu_to_le32(0x09 /* COPY0 */ + nv->fifo.gr_ce - 1);
 	}
 	mutex_lock(&nv->gsp_lock);
-	ret = nv_rm_alloc(nv, cli->vm.h_client, u->ch.handle, H_UOBJ(u->ch.chid, u->nobj), oclass,
+	/*
+	 * Like nouveau (r535_gr_chan_new), promote the GR context right before the first
+	 * object: RM initialises it on that allocation.
+	 */
+	ret = 0;
+	if (!u->gr_ctx) {
+		ret = nv_gr_chan_ctx(nv, &u->ch);
+		u->gr_ctx = !ret;
+	}
+	if (!ret)
+		ret = nv_rm_alloc(nv, cli->vm.h_client, u->ch.handle, H_UOBJ(u->ch.chid, u->nobj), oclass,
 			  oclass == AMPERE_DMA_COPY_B ? &ce : NULL, oclass == AMPERE_DMA_COPY_B ? sizeof(ce) : 0);
 	mutex_unlock(&nv->gsp_lock);
 	if (!ret)
 		u->nobj++;
+	pr_debug("nvdrv: chid %u: object %04x: %d\n", u->ch.chid, oclass, ret);
 	return ret;
 }
 

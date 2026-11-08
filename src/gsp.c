@@ -45,6 +45,7 @@ static const char *rpc_event_name(u32 fn)
 	case 0x100f:				return "PERF_BRIDGELESS_INFO_UPDATE";
 	case 0x101c:				return "GSP_LOCKDOWN_NOTICE";
 	case 0x1020:				return "GSP_POST_NOCAT_RECORD";
+	case 0x1005:				return "MMU_FAULT_QUEUED";
 	default:				return "?";
 	}
 }
@@ -197,6 +198,15 @@ int nv_gsp_handle_event(struct nvdrv_dev *nv, u32 fn, struct nv_rpc_header *h, v
 	case 0x1020:	/* GSP_POST_NOCAT_RECORD */
 		print_hex_dump(KERN_INFO, "gsp nocat: ", DUMP_PREFIX_OFFSET, 16, 4,
 			       payload, min(len, 128u), true);
+		break;
+	case 0x1004:	/* RC_TRIGGERED: rpc_rc_triggered_v17_02 */
+		if (len >= 48) {
+			const __le32 *w = payload;
+
+			dev_err(dev, "gsp: RC on engine 0x%x chid %u: exceptLevel %u exceptType %u (robust-channel code) scope %u, MMU fault addr 0x%08x%08x type %u\n",
+				le32_to_cpu(w[0]), le32_to_cpu(w[1]), le32_to_cpu(w[3]), le32_to_cpu(w[4]),
+				le32_to_cpu(w[5]), le32_to_cpu(w[8]), le32_to_cpu(w[7]), le32_to_cpu(w[9]));
+		}
 		break;
 	case NV_RPC_EVENT_OS_ERROR_LOG:
 		/* rpc_os_error_log_v17_00: exceptType, runlistId, chid, errString[0x100] */
