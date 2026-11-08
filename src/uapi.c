@@ -48,6 +48,7 @@ MODULE_PARM_DESC(dump_push, "Debug: print the dwords of every EXEC push buffer (
 #define UAPI_GPFIFO_ENTRIES	512		/* must match fifo.c */
 #define UAPI_PUSH_MAX		(UAPI_GPFIFO_ENTRIES / 2 - 1)
 #define UAPI_POLL_NS		(100 * NSEC_PER_USEC)
+#define UAPI_POLL_IRQ_NS	(4 * NSEC_PER_MSEC)
 #define UAPI_MAX_CHANS		16
 #define H_CLIENT_BASE		0xc1e00000	/* + file number */
 #define H_UCHAN(i)		(0xd000c000 + (i))
@@ -163,23 +164,46 @@ static bool uchan_poll_locked(struct nv_uchan *u)
 	return !list_empty(&u->pending);
 }
 
+/* Signal what the semaphores have passed; returns whether fences are still pending. */
+static bool uapi_signal_locked(struct nv_uapi *ua)
+{
+	struct nv_uchan *u, *tmp;
+
+	list_for_each_entry_safe(u, tmp, &ua->active, active)
+		if (!uchan_poll_locked(u))
+			list_del_init(&u->active);
+	return !list_empty(&ua->active);
+}
+
+/* Nonstall interrupt (src/intr.c): a channel released its fence semaphore. */
+void nv_uapi_fence_irq(struct nvdrv_dev *nv)
+{
+	struct nv_uapi *ua = &nv->uapi;
+	unsigned long flags;
+
+	spin_lock_irqsave(&ua->lock, flags);
+	uapi_signal_locked(ua);
+	spin_unlock_irqrestore(&ua->lock, flags);
+}
+
+/*
+ * The poll timer: the only fence signalling without interrupts (every 100 us), a safety net
+ * with them (every 4 ms, e.g. for a lost interrupt).
+ */
 static enum hrtimer_restart uapi_poll(struct hrtimer *t)
 {
 	struct nv_uapi *ua = container_of(t, struct nv_uapi, timer);
-	struct nv_uchan *u, *tmp;
+	struct nvdrv_dev *nv = container_of(ua, struct nvdrv_dev, uapi);
 	unsigned long flags;
 	bool more;
 
 	spin_lock_irqsave(&ua->lock, flags);
-	list_for_each_entry_safe(u, tmp, &ua->active, active)
-		if (!uchan_poll_locked(u))
-			list_del_init(&u->active);
-	more = !list_empty(&ua->active);
+	more = uapi_signal_locked(ua);
 	ua->polling = more;
 	spin_unlock_irqrestore(&ua->lock, flags);
 	if (!more)
 		return HRTIMER_NORESTART;
-	hrtimer_forward_now(t, ns_to_ktime(UAPI_POLL_NS));
+	hrtimer_forward_now(t, ns_to_ktime(READ_ONCE(nv->intr.active) ? UAPI_POLL_IRQ_NS : UAPI_POLL_NS));
 	return HRTIMER_RESTART;
 }
 
@@ -200,8 +224,11 @@ static struct dma_fence *uchan_fence(struct nvdrv_dev *nv, struct nv_uchan *u, u
 	if (list_empty(&u->active))
 		list_add_tail(&u->active, &ua->active);
 	if (!ua->polling) {	/* the callback clears it under this lock when it stops */
+		struct nvdrv_dev *nv = container_of(ua, struct nvdrv_dev, uapi);
+
 		ua->polling = true;
-		hrtimer_start(&ua->timer, ns_to_ktime(UAPI_POLL_NS), HRTIMER_MODE_REL);
+		hrtimer_start(&ua->timer, ns_to_ktime(READ_ONCE(nv->intr.active) ? UAPI_POLL_IRQ_NS : UAPI_POLL_NS),
+			      HRTIMER_MODE_REL);
 	}
 	spin_unlock_irqrestore(&ua->lock, flags);
 	return &f->base;
@@ -868,6 +895,8 @@ static int ioctl_channel_free(struct drm_device *dev, void *data, struct drm_fil
 
 static void push_dump(struct nv_cli *cli, u32 chid, u64 va, u32 len);
 static void uapi_boost(struct nvdrv_dev *nv);
+#define HOST_NON_STALL_INTERRUPT	0x20
+#define HOST_MEM_OP_A		0x28
 #define HOST_SEM_ADDR_LO	0x5c
 #define HOST_SEM_EXECUTE_RELEASE_WFI	(0x1 | 1 << 20)	/* RELEASE, RELEASE_WFI, 32-bit payload */
 
@@ -941,6 +970,7 @@ static int ioctl_exec(struct drm_device *dev, void *data, struct drm_file *file)
 	{
 		u32 sem[5] = { lower_32_bits(ch->sem_va), upper_32_bits(ch->sem_va), u->submitted + 1, 0,
 			       HOST_SEM_EXECUTE_RELEASE_WFI };
+		u32 membar[4] = { 0, 0, 0 /* SYS_MEMBAR */, 5u << 27 /* OPERATION_MEMBAR */ };
 
 		fence = uchan_fence(nv, u, u->submitted + 1);
 		if (!fence) {
@@ -949,6 +979,9 @@ static int ioctl_exec(struct drm_device *dev, void *data, struct drm_file *file)
 		}
 		u->submitted++;
 		nv_push(ch, 0, HOST_SEM_ADDR_LO, sem, 5);
+		/* semaphore visible before the interrupt (nouveau gv100_fence_emit32), then nonstall */
+		nv_push(ch, 0, HOST_MEM_OP_A, membar, 4);
+		nv_push1(ch, 0, HOST_NON_STALL_INTERRUPT, 0);
 		nv_kick(nv, ch);
 	}
 	dma_fence_put(u->last);

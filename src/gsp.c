@@ -340,7 +340,10 @@ static int gsp_boot_locked(struct nvdrv_dev *nv)
 		return ret;
 
 	/* 9. our own client/device/subdevice inside GSP-RM (Phase 7) */
-	return nv_rm_init_objects(nv);
+	ret = nv_rm_init_objects(nv);
+	if (!ret)
+		nv_intr_init(nv);	/* optional: without it fences are polled */
+	return ret;
 }
 
 int nv_gsp_boot(struct nvdrv_dev *nv)
@@ -362,6 +365,7 @@ void nv_gsp_fini(struct nvdrv_dev *nv)
 {
 	if (!nv->gsp_touched)
 		return;
+	nv_intr_fini(nv);		/* interrupt handler off before the reset */
 	mutex_lock(&nv->gsp_lock);
 	nv_rm_fini_objects(nv);		/* exercises FREE; the FLR below would drop them anyway */
 	mutex_unlock(&nv->gsp_lock);

@@ -587,6 +587,13 @@ static const struct file_operations i2c_fops = {
 	.release = single_release,
 };
 
+static int intr_show(struct seq_file *m, void *unused)
+{
+	nv_intr_show(m->private, m);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(intr);
+
 static int sensors_show(struct seq_file *m, void *unused)
 {
 	nv_sensors_show(m->private, m);
@@ -733,6 +740,7 @@ static void nv_debugfs_init(struct nvdrv_dev *nv)
 	if (nv_hw_writes_allowed()) {
 		debugfs_create_file("perf", 0600, nv->dbg, nv, &perf_fops);
 		debugfs_create_file("sensors", 0400, nv->dbg, nv, &sensors_fops);
+		debugfs_create_file("intr", 0400, nv->dbg, nv, &intr_fops);
 		debugfs_create_file("i2c", 0600, nv->dbg, nv, &i2c_fops);	/* experiment, read-only bus access */
 		debugfs_create_file("bar1_bench", 0200, nv->dbg, nv, &bar1_bench_fops);
 		debugfs_create_file("drm_stats", 0400, nv->dbg, nv, &drm_stats_fops);

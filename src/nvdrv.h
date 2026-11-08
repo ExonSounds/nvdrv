@@ -9,6 +9,7 @@
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/types.h>
+#include <linux/workqueue.h>
 
 #define DRV_NAME "nvdrv"
 
@@ -396,6 +397,19 @@ struct nv_fifo {
 	u32 gr_ce;				/* a copy engine on the GR runlist (GRCE) */
 };
 
+/* Interrupts (src/intr.c): GR/CE nonstall (fences) and the GSP message-queue vector */
+struct nv_intr {
+	int irq;
+	bool active;
+	u32 gsp_vec, gr_vec;
+	u32 enabled[8];				/* per leaf: vectors nvdrv owns */
+	u32 fence_mask[8];			/* per leaf: nonstall vectors */
+	struct work_struct msg_work;
+	struct delayed_work health_work;	/* GSP RISC-V still running? every 5 s */
+	bool gsp_dead;
+	atomic_t fence_irqs, gsp_events;
+};
+
 /* nouveau-compatible uAPI state (src/uapi.c) */
 struct nv_uapi {
 	spinlock_t lock;			/* fence lock: pending lists, active channels */
@@ -445,6 +459,7 @@ struct nvdrv_dev {
 	struct nv_fifo fifo;
 	struct nv_mem mem;
 	struct nv_uapi uapi;
+	struct nv_intr intr;
 	bool gsp_touched;	/* Booter/FWSEC ran: GSP may DMA into our memory */
 	bool gsp_running;	/* GSP_INIT_DONE received */
 
@@ -590,6 +605,12 @@ enum nv_i2c_type {			/* NV402C_CTRL_I2C_TRANSACTION_TYPE */
 int nv_i2c_xfer(struct nvdrv_dev *nv, u32 h_i2c, u8 port, u16 addr8, enum nv_i2c_type type, bool write,
 		u8 reg, bool ping, u16 *val);
 
+/* src/intr.c */
+int nv_intr_init(struct nvdrv_dev *nv);
+void nv_intr_fini(struct nvdrv_dev *nv);
+void nv_intr_show(struct nvdrv_dev *nv, struct seq_file *m);
+void nv_uapi_fence_irq(struct nvdrv_dev *nv);
+
 /* src/sensors.c */
 int nv_sensor_temp(struct nvdrv_dev *nv, long *mc);
 void nv_sensors_show(struct nvdrv_dev *nv, struct seq_file *m);
@@ -664,6 +685,7 @@ int nv_rpc_recv(struct nvdrv_dev *nv, struct nv_rpc_header **hdr, void **payload
 int nv_rpc_queue_preboot(struct nvdrv_dev *nv);
 int nv_rpc_wait(struct nvdrv_dev *nv, u32 fn, unsigned int timeout_ms,
 		struct nv_rpc_header **hdr, void **payload, u32 *len);
+int nv_rpc_drain_events(struct nvdrv_dev *nv);
 int nv_rpc_call(struct nvdrv_dev *nv, u32 fn, const void *req, u32 req_len,
 		void *reply, u32 reply_len);
 

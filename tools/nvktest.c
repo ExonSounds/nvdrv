@@ -220,6 +220,26 @@ int main(int argc, char **argv)
 	struct drm_nouveau_channel_free cf2 = { .channel = ca2.channel };
 	CHECK(drmCommandWrite(fd, DRM_NOUVEAU_CHANNEL_FREE, &cf2, sizeof(cf2)));
 
+	/*
+	 * nvktest fault: a compute semaphore release to an unmapped address. RM recovers the
+	 * channel (MMU fault, RC) and sends RC_TRIGGERED asynchronously: exercises the GSP
+	 * message interrupt. The channel is dead afterwards; the test ends here.
+	 */
+	if (argc > 1 && !strcmp(argv[1], "fault")) {
+		p = pb;
+		mthd(1, 0x1b00, 4, 0x0, 0x70000000 /* never mapped */, 0xbad, 1u << 28);
+		ep.va = 0x10000000;
+		ep.va_len = (uint32_t)((char *)p - (char *)pb);
+		ex.channel = ca.channel;
+		ex.wait_count = 0;
+		ex.sig_ptr = (uintptr_t)&sig2;
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_EXEC, &ex, sizeof(ex)));
+		r = drmSyncobjWait(fd, &so2, 1, INT64_MAX, 0, NULL);
+		printf("fault: syncobj wait %d (the fence carries the error)\n", r);
+		sleep(1);
+		return 0;
+	}
+
 	CHECK(bind(0, 0x20000000, 0x10000, DRM_NOUVEAU_VM_BIND_OP_UNMAP));
 	struct drm_nouveau_channel_free cf = { .channel = ca.channel };
 	CHECK(drmCommandWrite(fd, DRM_NOUVEAU_CHANNEL_FREE, &cf, sizeof(cf)));

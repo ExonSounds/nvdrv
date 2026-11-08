@@ -309,6 +309,27 @@ int nv_rpc_wait(struct nvdrv_dev *nv, u32 fn, unsigned int timeout_ms,
  * failure in rpc_result (kept in nv->rpc.last_result). The reply is copied out
  * even then, because RM reads the RM-level status from it (rpcRmApiAlloc_GSP).
  */
+/*
+ * Handle every pending GSP message as an asynchronous event (GSP message-queue interrupt).
+ * Caller holds gsp_lock, so no synchronous RPC is waiting for a reply meanwhile.
+ */
+int nv_rpc_drain_events(struct nvdrv_dev *nv)
+{
+	struct nv_rpc_header *hdr;
+	void *payload;
+	u32 len;
+	int ret, n = 0;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	while (!(ret = nv_rpc_recv(nv, &hdr, &payload, &len))) {
+		ret = nv_gsp_handle_event(nv, le32_to_cpu(hdr->function), hdr, payload, len);
+		n++;
+		if (ret)
+			return ret;
+	}
+	return ret == -EAGAIN ? n : ret;
+}
+
 int nv_rpc_call(struct nvdrv_dev *nv, u32 fn, const void *req, u32 req_len,
 		void *reply, u32 reply_len)
 {

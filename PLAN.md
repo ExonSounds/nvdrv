@@ -384,8 +384,19 @@ contexts, nouveau uAPI subset for Mesa NVK (`nvk=1`), Zink GL, zero-copy scanout
 To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
 
 ### Rendering and memory
-- [ ] **Interrupts**: nonstall (fence) interrupts instead of the 100 µs fence poll; GSP message notification
-      instead of polling the queue; GSP health check while running.
+- [x] **Interrupts** (`src/intr.c`, 2026-11-09): one MSI vector. Vectors from
+      `INTERNAL_INTR_GET_KERNEL_TABLE` (0x20800a5c, internal subdevice; 25 entries on GA104; r570 MC indices GSP 50,
+      GR0 84, CE0 15..): GR nonstall = 0, GSP stall = 155. CPU interrupt tree as nouveau (vfn tu102.c): leaf status
+      0xb81000+4l (W1C), enable set/clear +0x1200/+0x1400, top +0x1600, arm/unarm +0x1608/+0x1610. Foreign enabled
+      sources are masked, not serviced.
+      - Fences: EXEC's fence = host semaphore release + membar (MEM_OP_A..D, MEMBAR) + NON_STALL_INTERRUPT
+        (nouveau gv100_fence_emit32); the handler signals fences in hardirq; the hrtimer poll stays as a 4 ms
+        safety net (100 us without interrupts). vkmark: 17.5k -> 35.9k fps (fence latency was the limit).
+      - GSP events: GSP falcon SWGEN0 (IRQSTAT 0x110008 bit 6, IRQSCLR 0x110004, retrigger 0x1103e8) -> work item
+        drains the message queue under gsp_lock (`nv_rpc_drain_events`). GSP raises it for *asynchronous* events
+        only (replies stay polled, as in RM's _kgspRpcRecvPoll): verified with a deliberate channel fault
+        (`nvktest fault`): MMU_FAULT_QUEUED, NOCAT and RC_TRIGGERED arrive with no RPC in flight.
+      - GSP health check every 5 s (RISC-V still active), reported once; debugfs `intr` shows counters.
 - [ ] **Transfer queue**: CE channels (async copy engines) in CHANNEL_ALLOC, report uAPI 1.4.1.
 - [ ] **VRAM eviction / overcommit** to system memory; today the pool is fixed and allocations fail when full.
 - [ ] **BAR1 beyond 512 MiB** (Resizable BAR exposes all 8 GiB): more PD0 pages, larger host-visible VRAM heap.
