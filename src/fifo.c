@@ -53,6 +53,18 @@ static u64 rd64(struct nvdrv_dev *nv, u64 addr)
 	return nv_vram_rd32(nv, addr) | (u64)nv_vram_rd32(nv, addr + 4) << 32;
 }
 
+/*
+ * Zero VRAM: with the copy engine once nvdrv's CE channel runs (physical mode, fast),
+ * through the PRAMIN window before that (~20 MB/s; a GR context alone took ~55 ms).
+ */
+static int vram_zero(struct nvdrv_dev *nv, u64 addr, u64 size)
+{
+	if (nv->chan.handle && !nv_ce_clear(nv, addr, size))
+		return 0;
+	nv_vram_fill(nv, addr, size, 0, NULL, NULL);
+	return 0;
+}
+
 /* A zeroed 4K page-table page: carve-out for nvdrv's VM, the freeable pool for client VMs. */
 static int pt_page(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 *out)
 {
@@ -73,8 +85,7 @@ static int pt_page(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 *out)
 		if (ret)
 			return ret;
 	}
-	nv_vram_fill(nv, *out, SZ_4K, 0, NULL, NULL);
-	return 0;
+	return vram_zero(nv, *out, SZ_4K);
 }
 
 /* Next-level table behind entry (addr), allocated on first use. */
@@ -908,7 +919,7 @@ int nv_gr_chan_ctx(struct nvdrv_dev *nv, struct nv_chan *ch)
 			if (ret)
 				break;
 			vram = ch->ctx[k].start;
-			nv_vram_fill(nv, vram, size, 0, NULL, NULL);
+			vram_zero(nv, vram, size);
 			e->initialize = 1;
 			e->gpu_phys_addr = cpu_to_le64(vram);
 			e->size = cpu_to_le64(size);

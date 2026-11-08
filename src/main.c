@@ -821,6 +821,7 @@ static void nv_release(struct kref *ref)
 
 	mutex_destroy(&nv->gsp_lock);
 	mutex_destroy(&nv->mem.lock);
+	mutex_destroy(&nv->evo.win_lock);
 	pci_dev_put(nv->pdev);
 	kfree(nv);
 }
@@ -855,6 +856,7 @@ static int nvdrv_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	nv->pdev = pci_dev_get(pdev);	/* teardown after unbind still frees DMA memory against it */
 	mutex_init(&nv->gsp_lock);
 	mutex_init(&nv->mem.lock);
+	mutex_init(&nv->evo.win_lock);
 	nv_uapi_init(nv);
 	ret = devm_add_action_or_reset(&pdev->dev, nv_put_action, nv);
 	if (ret)

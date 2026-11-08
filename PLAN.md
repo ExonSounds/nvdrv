@@ -348,6 +348,22 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
     (RC 44 GR_FAULT_DURING_CTXSW, MMU fault 0x20000). Found by dumping NVK's push (`dump_push=1`) and decoding it.
   - GR context promoted on a channel's first object (as r535_gr_chan_new); RC_TRIGGERED decoded in gsp.c.
   - Results: vulkaninfo (NVK GA104, Vulkan 1.4), vkmark headless ~17k fps, Zink GLES 3.2 via GBM, kmsgl.
+- **Hyprland on NVK/Zink (2026-11-09): runs smoothly.** Problems found on the way, all fixed:
+  - Window push buffer: `nv_disp_scanout` reserved 16 bytes for 48 bytes of methods; the overflowed batch was
+    half-dropped and the software PUT ran ahead of the hardware, so every wrap waited 2 s (one frame per 2 s).
+    Overflowed batches now roll back to where they began.
+  - Xwayland deadlock (not nvdrv): Zink made the Vulkan loader load the proprietary nvidia-utils ICD too, whose
+    init calls XOpenDisplay(":0") on Xwayland itself while it starts. Session-side fix: `VK_DRIVER_FILES` set to
+    the NVK ICD (guarded on `/sys/module/nvdrv/parameters/nvk`).
+  - Stutter every 1-2 s: VM_BIND ~30 ms (four uncached PRAMIN reads per level per 4K PTE) under gsp_lock, flips
+    queued behind it (78 ms seen). Last page table cached per VM: one walk per 2 MiB.
+  - Mouse lag when apps start: GR context setup 59 ms (PRAMIN zero-fill ~20 MB/s) -> CE clears, now 6-8 ms; and
+    page flips no longer take gsp_lock at all (evo.win_lock, order gsp_lock -> win_lock): kmsgl holds 60 fps
+    while 12 Vulkan clients start in parallel.
+  - GPU stays in P8 under a compositor (RM's governor does not raise it); EXEC re-arms a 3 s boost. Not the
+    stutter cause, but correct.
+  - Teardown with files open after unbind oopsed (BAR0 gone); nvdrv_dev is refcounted and file/object teardown
+    after DRM unplug keeps to software state (verified: orphans closing after unbind, clean unload).
 - **Zero-copy scanout:** DRM framebuffers on nvdrv VRAM objects flip window 0 to them (ctxdma over the pool,
   SET_OFFSET >> 8, PLANAR_STORAGE pitch >> 6). Pitfall: the modeset leaves the window INTERLOCK_WITH_CORE, so a
   window-only UPDATE stalls until a core update; flips clear the interlock flags.
@@ -361,7 +377,7 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
 ## Next steps
 
 0. **GPU acceleration for Hyprland:** nouveau uAPI subset for NVK ✅ (`nvk=1`), Zink GL ✅, zero-copy
-   scanout ✅ (kmsgl 58 fps @60 Hz, confirmed on screen). Next: Hyprland on it; then nonstall interrupts
+   scanout ✅ (kmsgl 58 fps @60 Hz, confirmed on screen), **Hyprland smooth on the GPU ✅**. Next: nonstall interrupts
    instead of the 100 µs fence poll, a CE transfer queue (report 1.4.1), per-object fences for VM_BIND
    unmap (it waits for the client to idle), block-linear scanout modifiers, BAR1 beyond 512 MiB.
 1. **Desktop polish:** gamma LUT property

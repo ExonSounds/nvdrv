@@ -401,12 +401,14 @@ int nv_evo_window_init(struct nvdrv_dev *nv, u32 win)
 
 	if (win >= ARRAY_SIZE(e->win))
 		return -EINVAL;
-	if (e->win[win].handle)
-		return 0;
-	ret = evo_channel_alloc(nv, &e->win[win], NVC67E_WINDOW_CHANNEL_DMA, NVDRV_H_WIN(win), win,
-				NV_PDISP_CHN_NUM_WIN(win));
-	if (ret)
-		evo_channel_free_mem(nv, &e->win[win]);
+	lockdep_assert_held(&e->win_lock);	/* called from the modeset, which holds it */
+	ret = 0;
+	if (!e->win[win].handle) {
+		ret = evo_channel_alloc(nv, &e->win[win], NVC67E_WINDOW_CHANNEL_DMA, NVDRV_H_WIN(win), win,
+					NV_PDISP_CHN_NUM_WIN(win));
+		if (ret)
+			evo_channel_free_mem(nv, &e->win[win]);
+	}
 	return ret;
 }
 
@@ -419,6 +421,7 @@ void nv_evo_fini(struct nvdrv_dev *nv)
 	struct nv_evo *e = &nv->evo;
 	u32 i;
 
+	mutex_lock(&e->win_lock);
 	evo_channel_free_mem(nv, &e->core);
 	for (i = 0; i < ARRAY_SIZE(e->win); i++)
 		evo_channel_free_mem(nv, &e->win[i]);
@@ -426,7 +429,10 @@ void nv_evo_fini(struct nvdrv_dev *nv)
 		iounmap(e->fb_cpu);
 	if (e->sysfb.cpu)
 		dma_free_coherent(&nv->pdev->dev, e->sysfb.size, e->sysfb.cpu, e->sysfb.dma);
-	memset(e, 0, sizeof(*e));
+	/* everything but the lock, which lives as long as nvdrv_dev */
+	memset((char *)e + offsetofend(struct nv_evo, win_lock), 0,
+	       sizeof(*e) - offsetofend(struct nv_evo, win_lock));
+	mutex_unlock(&e->win_lock);
 }
 
 /* Caller holds gsp_lock. */

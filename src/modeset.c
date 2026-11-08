@@ -228,7 +228,7 @@ static void win_methods(struct nv_evo_chan *win, u32 flags, u32 ctxdma, u32 w, u
 
 }
 
-int nv_disp_modeset_locked(struct nvdrv_dev *nv, u32 flags)
+static int modeset_win_locked(struct nvdrv_dev *nv, u32 flags)
 {
 	struct device *dev = &nv->pdev->dev;
 	struct nv_disp *dp = &nv->disp;
@@ -478,20 +478,26 @@ int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch)
 	if (vram && (!nv->mem.ready || vram < nv->mem.base || vram >= nv->mem.base + nv->mem.size ||
 		     (vram & 255) || (pitch & 63)))
 		return -EINVAL;
-	mutex_lock(&nv->gsp_lock);
-	if (!win->handle || !e->active) {
+	if (vram && !READ_ONCE(e->pool_ctxdma)) {	/* once: instmem + RM, needs gsp_lock */
+		mutex_lock(&nv->gsp_lock);
+		mutex_lock(&e->win_lock);
+		if (!e->pool_ctxdma && win->handle)
+			ret = nv_evo_ctxdma(nv, NVDRV_H_POOL_CTXDMA, nv->mem.base, nv->mem.size, win->chn, false);
+		if (!ret && win->handle)
+			e->pool_ctxdma = true;
+		mutex_unlock(&e->win_lock);
+		mutex_unlock(&nv->gsp_lock);
+		if (ret)
+			return ret;
+	}
+	mutex_lock(&e->win_lock);
+	if (!win->handle || !e->active || (vram && !e->pool_ctxdma)) {
 		ret = -ENODEV;
 		goto out;
 	}
 	if (vram == e->scanout_cur)
 		goto out;
 	if (vram) {
-		if (!e->pool_ctxdma) {
-			ret = nv_evo_ctxdma(nv, NVDRV_H_POOL_CTXDMA, nv->mem.base, nv->mem.size, win->chn, false);
-			if (ret)
-				goto out;
-			e->pool_ctxdma = true;
-		}
 		ctxdma = NVDRV_H_POOL_CTXDMA;
 		offset = vram - nv->mem.base;
 	} else {
@@ -511,7 +517,7 @@ int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch)
 	if (!ret)
 		e->scanout_cur = vram;
 out:
-	mutex_unlock(&nv->gsp_lock);
+	mutex_unlock(&e->win_lock);
 	return ret;
 }
 
@@ -530,17 +536,18 @@ int nv_disp_flip(struct nvdrv_dev *nv, u32 flags)
 	ret = -ENODEV;
 	if (!d || !win->handle || !e->active)
 		goto out;
+	mutex_lock(&e->win_lock);
 	w = d->mode.hdisplay;
 	h = d->mode.vdisplay;
 	nv_wr32(nv, 0x611020 + win->chn * 12, 0);	/* clear the latched exception info (best effort) */
 	ret = nv_evo_begin(nv, win, 768);
 	if (ret)
-		goto out;
+		goto out_win;
 	ctxdma = NVDRV_H_FB_CTXDMA;
 	if (flags & NV_FLIP_SYSMEM) {
 		ret = sysfb_prepare(nv, w, h);
 		if (ret)
-			goto out;
+			goto out_win;
 		ctxdma = NVDRV_H_SYSFB_CTXDMA;
 	}
 	win_methods(win, flags, ctxdma, w, h, ALIGN(w * 4, 256), false);
@@ -549,6 +556,8 @@ int nv_disp_flip(struct nvdrv_dev *nv, u32 flags)
 	dev_info(&nv->pdev->dev, "flip 0x%x: %d, window except 0x%08x arg 0x%08x err 0x%08x, scanline %u\n",
 		 flags, ret, nv_rd32(nv, 0x611020 + win->chn * 12), nv_rd32(nv, 0x611024 + win->chn * 12),
 		 nv_rd32(nv, 0x611028 + win->chn * 12), ioread32(e->core.user + C67D_GET_RG_SCAN_LINE(0)) & 0xffff);
+out_win:
+	mutex_unlock(&e->win_lock);
 out:
 	mutex_unlock(&nv->gsp_lock);
 	return ret;
@@ -614,7 +623,7 @@ out:
  * pulse): window without surface, SOR without owner, display ID cleared, one
  * interlocked update. The raster generator of the head stops with it.
  */
-int nv_disp_detach_locked(struct nvdrv_dev *nv)
+static int detach_win_locked(struct nvdrv_dev *nv)
 {
 	struct nv_evo *e = &nv->evo;
 	struct nv_evo_chan *core = &e->core, *win = &e->win[0];
@@ -676,4 +685,29 @@ int nv_bar1_bench(struct nvdrv_dev *nv)
 		 ns / 1000000, (u64)n * frame * 1000 / ns, (u64)n * 1000000000ULL / ns);
 	e->pattern_dirty = true;	/* redraw the test pattern on the next modeset */
 	return 0;
+}
+
+/*
+ * Lock order: gsp_lock, then evo.win_lock. Everything that drives window channel 0 holds
+ * win_lock; nv_disp_scanout (DRM page flips) holds only win_lock, so long GSP-RM work
+ * (channel setup, context promotion) under gsp_lock no longer delays flips.
+ */
+int nv_disp_modeset_locked(struct nvdrv_dev *nv, u32 flags)
+{
+	int ret;
+
+	mutex_lock(&nv->evo.win_lock);
+	ret = modeset_win_locked(nv, flags);
+	mutex_unlock(&nv->evo.win_lock);
+	return ret;
+}
+
+int nv_disp_detach_locked(struct nvdrv_dev *nv)
+{
+	int ret;
+
+	mutex_lock(&nv->evo.win_lock);
+	ret = detach_win_locked(nv);
+	mutex_unlock(&nv->evo.win_lock);
+	return ret;
 }

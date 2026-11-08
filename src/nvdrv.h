@@ -318,6 +318,7 @@ struct nv_evo_chan {
 };
 
 struct nv_evo {
+	struct mutex win_lock;			/* window channel 0: flips take only this, not gsp_lock */
 	u64 vram_bottom, vram_top, vram_next;	/* nvdrv's VRAM carve-out (top-down) */
 	u64 pramin_base;			/* current BAR0 window (VRAM, 64K units) */
 	u64 instmem;				/* display instance memory (VRAM) */
