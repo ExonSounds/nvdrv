@@ -554,6 +554,39 @@ static int drm_stats_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(drm_stats);
 
+static int i2c_show(struct seq_file *m, void *unused)
+{
+	nv_i2c_experiment_show(m);
+	return 0;
+}
+
+static int i2c_open(struct inode *inode, struct file *f)
+{
+	return single_open(f, i2c_show, inode->i_private);
+}
+
+static ssize_t i2c_write(struct file *f, const char __user *buf, size_t count, loff_t *ppos)
+{
+	struct nvdrv_dev *nv = file_inode(f)->i_private;
+	char cmd[64];
+	int ret;
+
+	if (count >= sizeof(cmd) || copy_from_user(cmd, buf, count))
+		return -EINVAL;
+	cmd[count] = 0;
+	ret = nv_i2c_experiment(nv, strim(cmd));
+	return ret ? ret : count;
+}
+
+static const struct file_operations i2c_fops = {
+	.owner = THIS_MODULE,
+	.open = i2c_open,
+	.read = seq_read,
+	.write = i2c_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static int sensors_show(struct seq_file *m, void *unused)
 {
 	nv_sensors_show(m->private, m);
@@ -700,6 +733,7 @@ static void nv_debugfs_init(struct nvdrv_dev *nv)
 	if (nv_hw_writes_allowed()) {
 		debugfs_create_file("perf", 0600, nv->dbg, nv, &perf_fops);
 		debugfs_create_file("sensors", 0400, nv->dbg, nv, &sensors_fops);
+		debugfs_create_file("i2c", 0600, nv->dbg, nv, &i2c_fops);	/* experiment, read-only bus access */
 		debugfs_create_file("bar1_bench", 0200, nv->dbg, nv, &bar1_bench_fops);
 		debugfs_create_file("drm_stats", 0400, nv->dbg, nv, &drm_stats_fops);
 		debugfs_create_file("ce_test", 0200, nv->dbg, nv, &ce_test_fops);

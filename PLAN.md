@@ -414,10 +414,23 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       (`PERF_GET_LEVEL_INFO_V2`: 5 levels, domain 0x10 = memory clock up to 7001 MHz, domain 0x1 ~420 MHz).
       Temperature register 0x020460 as nouveau reads it; on GA104 bits 31:30 mark it (nouveau's Pascal valid bit 29
       is clear), checked against load: 35 C idle -> 54 C under vkmark -> falling after.
-- [ ] **Fan speed, board power, live graphics clock**: no published interface (the RM thermal/fan/power/clock
-      controls are stubs in the open SDK; the closed firmware is not reverse-engineered, per the ground rules).
-      Possible public route: nouveau-style board sensors (INA power monitors on the GPU's I2C buses), but GSP-RM
-      owns those buses; needs an RM-mediated I2C path first.
+- [x] **Fan speed** (2026-11-09): hwmon `fan1_input` ("GPU fan"). The VBIOS DCB GPIO table names the FAN_SENSE
+      (0x3d) line (GA104: line 13; FAN PWM is line 16); its input is bit 14 of 0x021200 + 4·line (nouveau ga102
+      gpio), timed over four level changes = one rotation (nouveau therm/fan.c). Passive; GSP-RM keeps driving the
+      fan. Checked under load: ~1290 RPM up to ~50 C, then rising to 1800 RPM at 58 C.
+- [ ] **Board power** - experiments (debugfs `i2c`, read-only):
+      - Older open SDK releases (515/525/535) stub the thermal/fan/clk/pmgr controls too: no published route.
+      - RM-mediated I2C: `NV40_I2C` (0x402c) allocates; `I2C_TABLE_GET_DEV_INFO` lists one board device (type 0x47,
+        not in the DCB 4.x type list but in its power-controller range: the VRM, addr 0x25, port 2) and no INA
+        power sensor. `NV2080_CTRL_CMD_I2C_READ_REG` "succeeds" with zeros even at the reserved address 0x7f, so
+        in GSP-RM it does not reach the bus. The working path would be `NV402C_CTRL_CMD_I2C_TRANSACTION`, which
+        needs FINN serialisation (public, in the open RM's generated code); then PMBus reads (READ_VOUT/IOUT/POUT)
+        of the VRM, if it is PMBus at all.
+      - The BIT 'P' power-sensor pointer leads to a version 0x68 table (nouveau only knows 0x10/0x20, Maxwell/
+        Pascal); Ampere's layout is not public, so it is not decoded.
+      - No blind I2C address scans: a register read writes a pointer byte first, not harmless on a VRM.
+- [ ] **Live graphics clock**: no public description of GA104 PLL or clock-counter registers (nouveau's desktop
+      clock code ends at Kepler; open RM and open-gpu-doc have none). Per-level clocks are reported instead.
 - [x] **P-state governor**: GSP-RM's governor works by itself (P8 -> P0 within 2.5 s at ~90 % graphics
       utilisation, back to P8 at idle; a desktop's light load correctly stays at P8). The EXEC boost is now off
       (module parameter `exec_boost=1` re-enables it).

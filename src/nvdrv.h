@@ -582,6 +582,8 @@ void nv_kick(struct nvdrv_dev *nv, struct nv_chan *ch);
 int nv_sensor_temp(struct nvdrv_dev *nv, long *mc);
 void nv_sensors_show(struct nvdrv_dev *nv, struct seq_file *m);
 void nv_hwmon_init(struct nvdrv_dev *nv);
+int nv_i2c_experiment(struct nvdrv_dev *nv, const char *cmd);
+void nv_i2c_experiment_show(struct seq_file *m);
 
 /* src/uapi.c */
 struct drm_file;

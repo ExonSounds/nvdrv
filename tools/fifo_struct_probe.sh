@@ -25,6 +25,8 @@ cat > "$T/probe.c" <<'EOF'
 #include "class/clc797.h"
 #include "ctrl/ctrl2080/ctrl2080gr.h"
 #include "ctrl/ctrl2080/ctrl2080perf.h"
+#include "ctrl/ctrl2080/ctrl2080i2c.h"
+#include "ctrl/ctrl402c.h"
 #include "ctrl/ctrl0080/ctrl0080dma.h"
 #include "class/clc7c0.h"
 
@@ -151,6 +153,13 @@ int main(void)
 	F(NV2080_CTRL_PERF_GET_LEVEL_INFO_V2_PARAMS, level); F(NV2080_CTRL_PERF_GET_LEVEL_INFO_V2_PARAMS, flags);
 	F(NV2080_CTRL_PERF_GET_LEVEL_INFO_V2_PARAMS, perfGetClkInfoList); F(NV2080_CTRL_PERF_GET_LEVEL_INFO_V2_PARAMS, perfGetClkInfoListSize);
 	S(NV2080_CTRL_PERF_GET_CLK_INFO);
+	/* board I2C through RM (sensor experiments) */
+	S(NV402C_CTRL_I2C_TABLE_GET_DEV_INFO_PARAMS); F(NV402C_CTRL_I2C_TABLE_GET_DEV_INFO_PARAMS, i2cDevInfo);
+	S(NV402C_CTRL_I2C_DEVICE_INFO); F(NV402C_CTRL_I2C_DEVICE_INFO, i2cAddress); F(NV402C_CTRL_I2C_DEVICE_INFO, i2cLogicalPort);
+	F(NV402C_CTRL_I2C_DEVICE_INFO, i2cDevIdx);
+	S(NV2080_CTRL_I2C_RW_REG_PARAMS); F(NV2080_CTRL_I2C_RW_REG_PARAMS, reg); F(NV2080_CTRL_I2C_RW_REG_PARAMS, bufsize);
+	F(NV2080_CTRL_I2C_RW_REG_PARAMS, buffer);
+	S(NV402C_CTRL_I2C_GET_PORT_INFO_PARAMS);
 	return 0;
 }
 EOF
