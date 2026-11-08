@@ -26,18 +26,20 @@ What works today (see [PLAN.md](PLAN.md) for the phase table, findings and next 
 - secure boot chain: FWSEC-FRTS, Booter on SEC2, GSP-RM boot to `GSP_INIT_DONE`
 - GSP RPC queues, synchronous calls, `GET_GSP_STATIC_INFO`
 - RM objects (client / device / subdevice), RM controls, error paths
-- display: DisplayPort sink discovery, EDID, link training, and a modeset that
-  scans out a test pattern from VRAM
+- display: DisplayPort sink discovery, EDID, link training, modeset scanning out
+  from VRAM, BAR1 CPU mapping
+- a DRM/KMS device with fbdev emulation: the Linux text console runs on nvdrv
 
-Not there yet: memory management, GPU channels/copy engine, a DRM/KMS interface,
-compute, and a clean firmware unload (unbind currently resets the GPU).
+Not there yet: mode changes and hotplug through DRM, memory management, GPU
+channels/copy engine, compute, interrupts, and a clean firmware unload (unbind
+currently resets the GPU).
 
 ## Building and running
 
 ```sh
 make                                    # out-of-tree module against the running kernel
 sudo HW=1 ./scripts/bind.sh             # load with allow_hw_writes=1, bind via driver_override
-sudo KEEP=1 ./tests/phase12_display.sh  # boot GSP-RM, train the DP link, show the test pattern
+sudo KEEP=1 DRM=1 ./tests/phase12_display.sh  # boot GSP-RM, light the DP display, console on tty3
 sudo ./scripts/unbind.sh                # unbind (resets the GPU) and unload
 ```
 

@@ -226,7 +226,7 @@ static void win_methods(struct nv_evo_chan *win, u32 flags, u32 ctxdma, u32 w, u
 
 }
 
-static int modeset_locked(struct nvdrv_dev *nv, u32 flags)
+int nv_disp_modeset_locked(struct nvdrv_dev *nv, u32 flags)
 {
 	struct device *dev = &nv->pdev->dev;
 	struct nv_disp *dp = &nv->disp;
@@ -254,15 +254,37 @@ static int modeset_locked(struct nvdrv_dev *nv, u32 flags)
 	pitch = ALIGN(w * 4, 256);
 	fb_size = ALIGN((u64)pitch * h, SZ_64K);
 
-	/* 1. framebuffer + test pattern, ctxdma bound to window 0's channel */
+	/*
+	 * 1. one fixed framebuffer big enough for any mode we drive, mapped through BAR1
+	 * once; the test pattern is (re)drawn for the current mode through that mapping.
+	 */
+	if (fb_size > NV_FB_MAX)
+		return -E2BIG;
 	if (!e->fb) {
-		ret = nv_vram_alloc(nv, fb_size, SZ_1M, &e->fb);
+		ret = nv_vram_alloc(nv, NV_FB_MAX, SZ_1M, &e->fb);
 		if (ret)
 			return ret;
-		e->fb_size = fb_size;
+		e->fb_size = NV_FB_MAX;
+	}
+	if (!e->fb_cpu) {
+		ret = nv_bar1_init(nv);
+		if (ret)
+			return ret;
+		e->fb_cpu = nv_bar1_map(nv, 0, e->fb, e->fb_size);
+		if (!e->fb_cpu)
+			return -EIO;
+	}
+	if (e->fb_w != w || e->fb_h != h) {
+		u64 px, n = (u64)(pitch / 4) * h;
+
 		pat = (struct pattern){ w, h, pitch / 4 };
-		nv_vram_fill(nv, e->fb, fb_size, 0, pattern_px, &pat);
-		dev_info(dev, "modeset: framebuffer %ux%u pitch %u at VRAM 0x%llx\n", w, h, pitch, e->fb);
+		for (px = 0; px < n; px++)
+			iowrite32(pattern_px(&pat, px), e->fb_cpu + px * 4);
+		wmb();
+		(void)ioread32(e->fb_cpu);
+		e->fb_w = w;
+		e->fb_h = h;
+		dev_info(dev, "modeset: framebuffer %ux%u pitch %u at VRAM 0x%llx (BAR1)\n", w, h, pitch, e->fb);
 	}
 	ret = nv_evo_window_init(nv, 0);
 	if (ret)
@@ -335,6 +357,8 @@ static int modeset_locked(struct nvdrv_dev *nv, u32 flags)
 	trailing = m->vtotal - (leading + h);
 
 	m1(core, C67D_SOR_SET_CONTROL(d->sor), BIT(head) | d->protocol << 8);
+	e->sor = d->sor;
+	e->head = head;
 	m1(core, C67D_HEAD(head, HEAD_SET_PROCAMP), 0);
 	m1(core, C67D_HEAD(head, HEAD_SET_CONTROL_OUTPUT_RESOURCE),
 	   1 | (!m->hsync_pos) << 2 | (!m->vsync_pos) << 3 | 4 << 4);	/* CRC raster, BPP_24_444 */
@@ -395,7 +419,7 @@ int nv_disp_modeset(struct nvdrv_dev *nv, u32 flags)
 	int ret;
 
 	mutex_lock(&nv->gsp_lock);
-	ret = modeset_locked(nv, flags);
+	ret = nv_disp_modeset_locked(nv, flags);
 	mutex_unlock(&nv->gsp_lock);
 	return ret;
 }
@@ -523,5 +547,46 @@ int nv_bar1_test(struct nvdrv_dev *nv)
 	ret = bad ? -EIO : 0;
 out:
 	mutex_unlock(&nv->gsp_lock);
+	return ret;
+}
+
+/*
+ * Detach the stream before the link can be retrained (what DPlib does on a long HPD
+ * pulse): window without surface, SOR without owner, display ID cleared, one
+ * interlocked update. The raster generator of the head stops with it.
+ */
+int nv_disp_detach_locked(struct nvdrv_dev *nv)
+{
+	struct nv_evo *e = &nv->evo;
+	struct nv_evo_chan *core = &e->core, *win = &e->win[0];
+	u32 i;
+	int ret;
+
+	if (!e->active)
+		return 0;
+	ret = nv_evo_begin(nv, core, 128);
+	if (!ret)
+		ret = nv_evo_begin(nv, win, 128);
+	if (ret)
+		return ret;
+	for (i = 0; i < 6; i++)
+		m1(win, C67E_SET_CONTEXT_DMA_ISO(i), 0);
+	m1(win, C67E_SET_INTERLOCK_FLAGS, 1);
+	m1(win, C67E_SET_WINDOW_INTERLOCK_FLAGS, 0);
+	m1(win, C67E_UPDATE, 1);
+	m1(core, C67D_SOR_SET_CONTROL(e->sor), 0);
+	m1(core, C67D_HEAD(e->head, HEAD_SET_DISPLAY_ID0), 0);
+	m1(core, C67D_SET_INTERLOCK_FLAGS, 0);
+	m1(core, C67D_SET_WINDOW_INTERLOCK_FLAGS, BIT(0));
+	m1(core, C67D_UPDATE, 1);
+	ret = nv_evo_kick_nowait(nv, win);
+	if (!ret)
+		ret = nv_evo_kick(nv, core);
+	if (!ret)
+		ret = nv_evo_wait(nv, win);
+	dev_info(&nv->pdev->dev, "modeset: detached head %u from SOR%u: %d, except core 0x%08x win 0x%08x err 0x%08x\n",
+		 e->head, e->sor, ret, nv_rd32(nv, 0x611020), nv_rd32(nv, 0x611020 + win->chn * 12),
+		 nv_rd32(nv, 0x611028 + win->chn * 12));
+	e->active = false;
 	return ret;
 }

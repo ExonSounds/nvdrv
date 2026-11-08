@@ -483,6 +483,70 @@ static const struct file_operations bar1_test_fops = {
 	.write = bar1_test_write,
 };
 
+static ssize_t drm_register_write(struct file *f, const char __user *buf,
+				  size_t count, loff_t *ppos)
+{
+	bool go;
+	int ret = kstrtobool_from_user(buf, count, &go);
+
+	if (ret)
+		return ret;
+	if (go)
+		ret = nv_drm_register(f->private_data);
+	return ret ? ret : count;
+}
+
+static const struct file_operations drm_register_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = drm_register_write,
+};
+
+static int dp_status_show(struct seq_file *m, void *unused)
+{
+	nv_disp_dp_status_show(m->private, m);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(dp_status);
+
+static ssize_t disp_retrain_write(struct file *f, const char __user *buf,
+				  size_t count, loff_t *ppos)
+{
+	bool go;
+	int ret = kstrtobool_from_user(buf, count, &go);
+
+	if (ret)
+		return ret;
+	if (go)
+		ret = nv_disp_retrain(f->private_data);
+	return ret ? ret : count;
+}
+
+static const struct file_operations disp_retrain_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = disp_retrain_write,
+};
+
+static ssize_t disp_up_write(struct file *f, const char __user *buf,
+			     size_t count, loff_t *ppos)
+{
+	bool go;
+	int ret = kstrtobool_from_user(buf, count, &go);
+
+	if (ret)
+		return ret;
+	if (go)
+		ret = nv_disp_bringup(f->private_data);
+	return ret ? ret : count;
+}
+
+static const struct file_operations disp_up_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = disp_up_write,
+};
+
 static void nv_debugfs_init(struct nvdrv_dev *nv)
 {
 	nv->dbg = debugfs_create_dir(pci_name(nv->pdev), nvdrv_dbg_root);
@@ -508,6 +572,14 @@ static void nv_debugfs_init(struct nvdrv_dev *nv)
 		debugfs_create_file("vram", 0400, nv->dbg, nv, &vram_fops);
 	if (nv_hw_writes_allowed())
 		debugfs_create_file("bar1_test", 0200, nv->dbg, nv, &bar1_test_fops);
+	if (nv_hw_writes_allowed())
+		debugfs_create_file("drm_register", 0200, nv->dbg, nv, &drm_register_fops);
+	if (nv_hw_writes_allowed())
+		debugfs_create_file("dp_status", 0400, nv->dbg, nv, &dp_status_fops);
+	if (nv_hw_writes_allowed())
+		debugfs_create_file("disp_retrain", 0200, nv->dbg, nv, &disp_retrain_fops);
+	if (nv_hw_writes_allowed())
+		debugfs_create_file("disp_up", 0200, nv->dbg, nv, &disp_up_fops);
 
 	if (nv->vbios.data) {
 		nv->vbios_blob.data = nv->vbios.data;
@@ -671,6 +743,7 @@ static void nvdrv_remove(struct pci_dev *pdev)
 	struct nvdrv_dev *nv = pci_get_drvdata(pdev);
 
 	debugfs_remove_recursive(nv->dbg);
+	nv_drm_unregister(nv);	/* before the FLR in nv_gsp_fini: no BAR1 access after it */
 	nv_gsp_fini(nv);	/* FLR first if GSP ever ran: it DMAs into what follows */
 	nv_rpc_fini(nv);
 	nv_libos_fini(nv);

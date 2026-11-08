@@ -323,9 +323,12 @@ struct nv_evo {
 	u32 h_disp;				/* NVC670_DISPLAY */
 	struct nv_evo_chan core;
 	struct nv_evo_chan win[2];
-	u64 fb, fb_size;			/* scanout surface (VRAM) */
+	u64 fb, fb_size;			/* scanout surface (VRAM), NV_FB_MAX */
+	void __iomem *fb_cpu;			/* its BAR1 mapping (write-combined) */
+	u32 fb_w, fb_h;				/* mode the test pattern was drawn for */
 	struct nv_dma_buf sysfb;		/* scanout test surface in sysmem */
 	bool fb_bound, win_mapped, active;
+	u32 sor, head;				/* of the active modeset */
 };
 
 /* BAR1 page tables under GSP-RM's root (src/bar1.c). */
@@ -334,6 +337,8 @@ struct nv_bar1 {
 	u64 old_root0;		/* GSP's original root entry 0 */
 	u64 size;		/* usable BAR1 VA */
 };
+
+struct nv_drm;
 
 struct nvdrv_dev {
 	struct pci_dev *pdev;
@@ -361,6 +366,7 @@ struct nvdrv_dev {
 	struct nv_disp disp;
 	struct nv_evo evo;
 	struct nv_bar1 bar1;
+	struct nv_drm *drm;	/* DRM device once registered (src/drm.c) */
 	bool gsp_touched;	/* Booter/FWSEC ran: GSP may DMA into our memory */
 	bool gsp_running;	/* GSP_INIT_DONE received */
 
@@ -431,6 +437,9 @@ int nv_rm_selftest(struct nvdrv_dev *nv);
 int nv_disp_probe(struct nvdrv_dev *nv);
 void nv_disp_forget(struct nvdrv_dev *nv);
 int nv_disp_link(struct nvdrv_dev *nv);
+int nv_disp_retrain(struct nvdrv_dev *nv);
+int nv_disp_bringup(struct nvdrv_dev *nv);
+void nv_disp_dp_status_show(struct nvdrv_dev *nv, struct seq_file *m);
 void nv_disp_show(struct nvdrv_dev *nv, struct seq_file *m);
 
 /* evo.c */
@@ -450,8 +459,15 @@ int nv_evo_wait(struct nvdrv_dev *nv, struct nv_evo_chan *c);
 int nv_bar1_init(struct nvdrv_dev *nv);
 void __iomem *nv_bar1_map(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size);
 
+/* drm.c */
+int nv_drm_register(struct nvdrv_dev *nv);
+void nv_drm_unregister(struct nvdrv_dev *nv);
+
 /* modeset.c */
 int nv_disp_modeset(struct nvdrv_dev *nv, u32 flags);
+int nv_disp_modeset_locked(struct nvdrv_dev *nv, u32 flags);
+int nv_disp_detach_locked(struct nvdrv_dev *nv);
+#define NV_FB_MAX		(64ULL << 20)	/* fits 4096x4096 XRGB8888 */
 /*
  * Experiment flags for disp_modeset / disp_flip. 0 = the configuration known to
  * work on GA104: composition bypass, identity FMT, CSC/LUT methods not sent.

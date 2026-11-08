@@ -1,0 +1,342 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * DRM/KMS device on top of the running modeset (src/modeset.c).
+ *
+ * Structure follows drivers/gpu/drm/tiny/cirrus-qemu.c (GPL-2.0, Red Hat): GEM-shmem
+ * buffers, a shadow-buffered primary plane whose damaged rectangles are copied into
+ * the scanout surface, software vblank timer, fbdev emulation through the client
+ * library. Here the scanout surface is nvdrv's VRAM framebuffer, which the CPU reaches
+ * through BAR1 (src/bar1.c). The head keeps the mode nvdrv set (EDID preferred mode);
+ * other modes are rejected for now.
+ */
+#include <linux/aperture.h>
+#include <linux/iosys-map.h>
+
+#include <drm/clients/drm_client_setup.h>
+#include <drm/drm_atomic.h>
+#include <drm/drm_atomic_helper.h>
+#include <drm/drm_damage_helper.h>
+#include <drm/drm_drv.h>
+#include <drm/drm_edid.h>
+#include <drm/drm_fbdev_shmem.h>
+#include <drm/drm_file.h>
+#include <drm/drm_format_helper.h>
+#include <drm/drm_framebuffer.h>
+#include <drm/drm_print.h>
+#include <drm/drm_fourcc.h>
+#include <drm/drm_gem_atomic_helper.h>
+#include <drm/drm_gem_framebuffer_helper.h>
+#include <drm/drm_gem_shmem_helper.h>
+#include <drm/drm_managed.h>
+#include <drm/drm_modeset_helper_vtables.h>
+#include <drm/drm_probe_helper.h>
+#include <drm/drm_vblank.h>
+#include <drm/drm_vblank_helper.h>
+
+#include "nvdrv.h"
+
+struct nv_drm {
+	struct drm_device dev;
+	struct nvdrv_dev *nv;
+	struct drm_plane primary;
+	struct drm_crtc crtc;
+	struct drm_encoder encoder;
+	struct drm_connector connector;
+	void __iomem *scanout;		/* BAR1 mapping of the VRAM framebuffer */
+	unsigned int pitch;
+	struct drm_display_mode mode;	/* the one mode the head runs */
+	const struct drm_edid *edid;
+};
+
+static struct nv_drm *to_nv_drm(struct drm_device *dev)
+{
+	return container_of(dev, struct nv_drm, dev);
+}
+
+/* ---- plane ------------------------------------------------------------- */
+
+static const u32 nv_formats[] = { DRM_FORMAT_XRGB8888 };
+static const u64 nv_modifiers[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID };
+
+static int nv_plane_atomic_check(struct drm_plane *plane, struct drm_atomic_commit *state)
+{
+	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_crtc_state *cs = NULL;
+
+	if (ps->crtc)
+		cs = drm_atomic_get_new_crtc_state(state, ps->crtc);
+	return drm_atomic_helper_check_plane_state(ps, cs, DRM_PLANE_NO_SCALING,
+						   DRM_PLANE_NO_SCALING, false, false);
+}
+
+static void nv_plane_atomic_update(struct drm_plane *plane, struct drm_atomic_commit *state)
+{
+	struct nv_drm *d = to_nv_drm(plane->dev);
+	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_plane_state *old = drm_atomic_get_old_plane_state(state, plane);
+	struct drm_shadow_plane_state *sps = to_drm_shadow_plane_state(ps);
+	struct iosys_map vaddr = IOSYS_MAP_INIT_VADDR_IOMEM(d->scanout);
+	struct drm_framebuffer *fb = ps->fb;
+	struct drm_atomic_helper_damage_iter iter;
+	struct drm_rect damage;
+	int idx;
+
+	if (!fb || !drm_dev_enter(&d->dev, &idx))
+		return;
+	drm_atomic_helper_damage_iter_init(&iter, old, ps);
+	drm_atomic_for_each_plane_damage(&iter, &damage) {
+		struct drm_rect dst_clip = ps->dst;
+		struct iosys_map dst;
+
+		/* plane src == dst (no scaling); clip damage to the visible area */
+		drm_rect_translate(&damage, ps->dst.x1 - (ps->src.x1 >> 16), ps->dst.y1 - (ps->src.y1 >> 16));
+		if (!drm_rect_intersect(&dst_clip, &damage))
+			continue;
+		dst = IOSYS_MAP_INIT_OFFSET(&vaddr, drm_fb_clip_offset(d->pitch, fb->format, &dst_clip));
+		drm_rect_translate(&dst_clip, (ps->src.x1 >> 16) - ps->dst.x1, (ps->src.y1 >> 16) - ps->dst.y1);
+		drm_fb_memcpy(&dst, &d->pitch, sps->data, fb, &dst_clip);
+	}
+	drm_dev_exit(idx);
+}
+
+static void nv_plane_atomic_disable(struct drm_plane *plane, struct drm_atomic_commit *state)
+{
+	struct nv_drm *d = to_nv_drm(plane->dev);
+	int idx;
+
+	if (!drm_dev_enter(&d->dev, &idx))
+		return;
+	memset_io(d->scanout, 0, (size_t)d->pitch * d->mode.vdisplay);	/* black */
+	drm_dev_exit(idx);
+}
+
+static const struct drm_plane_helper_funcs nv_plane_helper_funcs = {
+	DRM_GEM_SHADOW_PLANE_HELPER_FUNCS,
+	.atomic_check = nv_plane_atomic_check,
+	.atomic_update = nv_plane_atomic_update,
+	.atomic_disable = nv_plane_atomic_disable,
+};
+
+static const struct drm_plane_funcs nv_plane_funcs = {
+	.update_plane = drm_atomic_helper_update_plane,
+	.disable_plane = drm_atomic_helper_disable_plane,
+	.destroy = drm_plane_cleanup,
+	DRM_GEM_SHADOW_PLANE_FUNCS,
+};
+
+/* ---- crtc / encoder / connector ---------------------------------------- */
+
+static int nv_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *state)
+{
+	struct nv_drm *d = to_nv_drm(crtc->dev);
+	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
+
+	if (!cs->enable)
+		return 0;
+	if (!drm_mode_equal(&cs->mode, &d->mode))
+		return -EINVAL;		/* only the mode the head already runs */
+	return drm_atomic_helper_check_crtc_primary_plane(cs);
+}
+
+static void nv_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
+{
+	drm_crtc_vblank_on(crtc);	/* the head itself stays configured by nvdrv */
+}
+
+static const struct drm_crtc_helper_funcs nv_crtc_helper_funcs = {
+	.atomic_check = nv_crtc_atomic_check,
+	.atomic_flush = drm_crtc_vblank_atomic_flush,
+	.atomic_enable = nv_crtc_atomic_enable,
+	.atomic_disable = drm_crtc_vblank_atomic_disable,
+};
+
+static const struct drm_crtc_funcs nv_crtc_funcs = {
+	.reset = drm_atomic_helper_crtc_reset,
+	.destroy = drm_crtc_cleanup,
+	.set_config = drm_atomic_helper_set_config,
+	.page_flip = drm_atomic_helper_page_flip,
+	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
+	DRM_CRTC_VBLANK_TIMER_FUNCS,
+};
+
+static const struct drm_encoder_funcs nv_encoder_funcs = {
+	.destroy = drm_encoder_cleanup,
+};
+
+static int nv_connector_get_modes(struct drm_connector *connector)
+{
+	struct nv_drm *d = to_nv_drm(connector->dev);
+	struct drm_display_mode *m;
+
+	drm_edid_connector_update(connector, d->edid);	/* EDID property + display info */
+	m = drm_mode_duplicate(connector->dev, &d->mode);
+	if (!m)
+		return 0;
+	m->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
+	drm_mode_probed_add(connector, m);
+	return 1;
+}
+
+static const struct drm_connector_helper_funcs nv_connector_helper_funcs = {
+	.get_modes = nv_connector_get_modes,
+};
+
+static const struct drm_connector_funcs nv_connector_funcs = {
+	.fill_modes = drm_helper_probe_single_connector_modes,
+	.destroy = drm_connector_cleanup,
+	.reset = drm_atomic_helper_connector_reset,
+	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
+};
+
+static const struct drm_mode_config_funcs nv_mode_config_funcs = {
+	.fb_create = drm_gem_fb_create_with_dirty,
+	.atomic_check = drm_atomic_helper_check,
+	.atomic_commit = drm_atomic_helper_commit,
+};
+
+DEFINE_DRM_GEM_FOPS(nv_drm_fops);
+
+static const struct drm_driver nv_drm_driver = {
+	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC,
+	.name = DRV_NAME,
+	.desc = "nvdrv GSP-RM display",
+	.major = 0,
+	.minor = 1,
+	.fops = &nv_drm_fops,
+	DRM_GEM_SHMEM_DRIVER_OPS,
+	DRM_FBDEV_SHMEM_DRIVER_OPS,
+};
+
+static void nv_mode_to_drm(const struct nv_mode *m, struct drm_display_mode *dm)
+{
+	memset(dm, 0, sizeof(*dm));
+	dm->clock = m->clock_khz;
+	dm->hdisplay = m->hdisplay;
+	dm->hsync_start = m->hsync_start;
+	dm->hsync_end = m->hsync_end;
+	dm->htotal = m->htotal;
+	dm->vdisplay = m->vdisplay;
+	dm->vsync_start = m->vsync_start;
+	dm->vsync_end = m->vsync_end;
+	dm->vtotal = m->vtotal;
+	dm->flags = (m->hsync_pos ? DRM_MODE_FLAG_PHSYNC : DRM_MODE_FLAG_NHSYNC) |
+		    (m->vsync_pos ? DRM_MODE_FLAG_PVSYNC : DRM_MODE_FLAG_NVSYNC);
+	dm->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
+	drm_mode_set_name(dm);
+}
+
+/*
+ * Register the DRM device for the display nvdrv has already lit (disp_modeset).
+ * Caller must not hold gsp_lock (drm_client_setup may draw through atomic commits).
+ */
+int nv_drm_register(struct nvdrv_dev *nv)
+{
+	struct pci_dev *pdev = nv->pdev;
+	struct nv_evo *e = &nv->evo;
+	struct nv_disp_dpy *dpy = NULL;
+	struct drm_device *dev;
+	struct nv_drm *d;
+	u32 i;
+	int ret;
+
+	if (nv->drm)
+		return -EBUSY;
+	mutex_lock(&nv->gsp_lock);
+	for (i = 0; i < nv->disp.ndpy; i++)
+		if (nv->disp.dpy[i].connected && nv->disp.dpy[i].mode.valid)
+			dpy = &nv->disp.dpy[i];
+	ret = -ENODEV;
+	if (!dpy || !e->active || !e->fb) {
+		mutex_unlock(&nv->gsp_lock);
+		return ret;
+	}
+	mutex_unlock(&nv->gsp_lock);
+
+	/* the firmware framebuffer (simpledrm) is dead since the first FLR; take over */
+	ret = aperture_remove_conflicting_pci_devices(pdev, nv_drm_driver.name);
+	if (ret)
+		return ret;
+
+	d = devm_drm_dev_alloc(&pdev->dev, &nv_drm_driver, struct nv_drm, dev);
+	if (IS_ERR(d))
+		return PTR_ERR(d);
+	dev = &d->dev;
+	d->nv = nv;
+	d->pitch = ALIGN(dpy->mode.hdisplay * 4, 256);
+	nv_mode_to_drm(&dpy->mode, &d->mode);
+	d->edid = drm_edid_alloc(dpy->edid, dpy->edid_size);
+
+	d->scanout = e->fb_cpu;		/* owned by evo.c, mapped once */
+	if (!d->scanout)
+		return -EIO;
+
+	ret = drmm_mode_config_init(dev);
+	if (ret)
+		goto err;
+	dev->mode_config.min_width = d->mode.hdisplay;
+	dev->mode_config.max_width = d->mode.hdisplay;
+	dev->mode_config.min_height = d->mode.vdisplay;
+	dev->mode_config.max_height = d->mode.vdisplay;
+	dev->mode_config.preferred_depth = 24;
+	dev->mode_config.funcs = &nv_mode_config_funcs;
+
+	ret = drm_universal_plane_init(dev, &d->primary, 0, &nv_plane_funcs, nv_formats,
+				       ARRAY_SIZE(nv_formats), nv_modifiers, DRM_PLANE_TYPE_PRIMARY, NULL);
+	if (ret)
+		goto err;
+	drm_plane_helper_add(&d->primary, &nv_plane_helper_funcs);
+	drm_plane_enable_fb_damage_clips(&d->primary);
+
+	ret = drm_crtc_init_with_planes(dev, &d->crtc, &d->primary, NULL, &nv_crtc_funcs, NULL);
+	if (ret)
+		goto err;
+	drm_crtc_helper_add(&d->crtc, &nv_crtc_helper_funcs);
+
+	ret = drm_encoder_init(dev, &d->encoder, &nv_encoder_funcs, DRM_MODE_ENCODER_TMDS, NULL);
+	if (ret)
+		goto err;
+	d->encoder.possible_crtcs = drm_crtc_mask(&d->crtc);
+
+	ret = drm_connector_init(dev, &d->connector, &nv_connector_funcs, DRM_MODE_CONNECTOR_DisplayPort);
+	if (ret)
+		goto err;
+	drm_connector_helper_add(&d->connector, &nv_connector_helper_funcs);
+	ret = drm_connector_attach_encoder(&d->connector, &d->encoder);
+	if (ret)
+		goto err;
+	ret = drm_vblank_init(dev, 1);
+	if (ret)
+		goto err;
+
+	drm_mode_config_reset(dev);
+	ret = drm_dev_register(dev, 0);
+	if (ret)
+		goto err;
+	nv->drm = d;
+	drm_client_setup(dev, NULL);
+	/* make the fbdev client commit its mode now instead of on the next VT switch */
+	drm_kms_helper_hotplug_event(dev);
+	drm_info(dev, "%s on %s, scanout VRAM 0x%llx via BAR1, pitch %u\n", d->mode.name,
+		 pci_name(pdev), e->fb, d->pitch);
+	return 0;
+err:
+	d->scanout = NULL;
+	return ret;
+}
+
+/* .remove, before the GPU is reset: stop all access to BAR1. */
+void nv_drm_unregister(struct nvdrv_dev *nv)
+{
+	struct nv_drm *d = nv->drm;
+
+	if (!d)
+		return;
+	drm_dev_unplug(&d->dev);
+	drm_atomic_helper_shutdown(&d->dev);
+	d->scanout = NULL;
+	drm_edid_free(d->edid);
+	d->edid = NULL;
+	nv->drm = NULL;
+}

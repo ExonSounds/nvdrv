@@ -413,6 +413,8 @@ void nv_evo_fini(struct nvdrv_dev *nv)
 	evo_channel_free_mem(nv, &e->core);
 	for (i = 0; i < ARRAY_SIZE(e->win); i++)
 		evo_channel_free_mem(nv, &e->win[i]);
+	if (e->fb_cpu)
+		iounmap(e->fb_cpu);
 	if (e->sysfb.cpu)
 		dma_free_coherent(&nv->pdev->dev, e->sysfb.size, e->sysfb.cpu, e->sysfb.dma);
 	memset(e, 0, sizeof(*e));

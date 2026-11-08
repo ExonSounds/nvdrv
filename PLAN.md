@@ -51,7 +51,7 @@ Most of the work is the boot chain and the RPC layer.
 | 9 | **Channels + Copy Engine** | GPFIFO channel, USERD/doorbell, push buffer, run a CE memcpy between VRAM and sysmem and fence on a semaphore. **First "real work" milestone.** |
 | 10 | **userspace API** | DRM render node and a small uAPI (BO alloc/map, channel create, submit, wait). |
 | 11 | **Compute** | Allocate compute class, launch a hand-assembled or NAK-compiled kernel. |
-| 12 | **Display** (pulled forward) | DP sink discovery + EDID ✅, SOR assignment + DP link training via RM ✅, display instmem/ctxdma/push buffers done by nvdrv in CPU-RM's place ✅, core + window channels ✅, **modeset with a test pattern scanned out from VRAM, confirmed on the monitor (2026-11-08)** ✅ (`tests/phase12_display.sh`). Next: KMS/DRM interface, input LUT, cursor. |
+| 12 | **Display** (pulled forward) | DP sink discovery + EDID ✅, SOR assignment + DP link training via RM ✅, display instmem/ctxdma/push buffers done by nvdrv in CPU-RM's place ✅, core + window channels ✅, **modeset with a test pattern scanned out from VRAM, confirmed on the monitor (2026-11-08)** ✅, BAR1 CPU mapping ✅, robust bring-up (sink settle, link verify, detach + retrain) ✅, **DRM/KMS device with fbdev: the Linux text console runs on nvdrv, confirmed on the monitor** ✅ (`DRM=1 tests/phase12_display.sh`). Next: mode changes and hotplug in DRM, input LUT, cursor. |
 
 Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`phase3.sh` FLRs the GPU).
 
@@ -246,14 +246,33 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
   entry 0 with its own PD2/PD1/PD0 + 64 KiB page tables (GP100 formats: PDE/PTE = addr>>4 | aperture/valid) in its
   carve-out, invalidates via 0xb830a0/a4/b0 (type 7), and ioremap_wc()s BAR1 (8 GiB with resizable BAR). CPU writes
   through BAR1 read back identically via PRAMIN.
+- **The monitor has two identities** (direct DP cable): asleep it answers with a fallback EDID/DPCD (1920x1080,
+  DPCD `12 14 c4 81 ... 00 00`). A moment after it wakes, and *woken by our first modeset*, it switches to its real
+  one (2560x1440, DPCD 1.4 with extended receiver caps, byte 0x00E = 0x83). That kills the trained link (all lanes
+  0x00, AUX briefly dead), and the OSD says "No signal". Once the head is active, RM refuses `DP_CTRL` retraining
+  (NV_ERR_GENERIC). **`disp_up` therefore:** probes until EDID+DPCD are unchanged over 3 reads (250 ms apart,
+  sink set to D0), trains, modesets, checks DPCD 0x202..0x205 one second later, and on link loss **detaches the
+  stream** (window ISO ctxdma 0, SOR owner 0, HEAD_SET_DISPLAY_ID 0, one interlocked update) and repeats. In practice
+  attempt 1 wakes the monitor and attempt 2 holds.
+- **DRM/KMS + console (2026-11-08):** `src/drm.c`, modeled on tiny/cirrus-qemu: GEM-shmem buffers, a shadow-buffered
+  primary plane whose damage rectangles are memcpy'd into the VRAM scanout surface through BAR1, software vblank
+  timer (`DRM_CRTC_VBLANK_TIMER_FUNCS`), fbdev via `drm_client_setup`. Only the mode the head runs is offered.
+  `aperture_remove_conflicting_pci_devices` retires simpledrm. The scanout surface is one fixed 64 MiB VRAM block
+  (one ctxdma, mapped through BAR1 once), so re-modesets only re-send methods.
+  - On this machine the **desktop session (Hyprland on tty1, via logind) grabs the new card and holds DRM master**,
+    so fbdev cannot commit on tty1. The console shows on the text VTs (`chvt 3`). On a hotplug-only status change
+    (`detect`), fbdev does not recommit.
+  - Unbind with fbcon bound: `drm_dev_unplug` + `drm_atomic_helper_shutdown` before the FLR. The console falls back to
+    the dummy device with no warnings, and later BAR1 access is impossible.
 - **Open:** `DP_CONFIG_STREAM` returns NV_ERR_ILLEGAL_ACTION (0x16) before the modeset; the link works with RM's
   defaults. The core channel also latches EXCEPT 0x10000080 arg 0x41 during the modeset update, but the update takes
   effect. The EDID read during one early probe gave 1920x1080; later reads give 2560x1440 (sink waking up?).
 
 ## Next steps
 
-0. **DRM/KMS device** on top of BAR1: dumb buffers in VRAM mapped through BAR1, one CRTC/plane/encoder/connector,
-   fbdev emulation so the console runs on nvdrv. Then identity input LUT, DP_CONFIG_STREAM, core exception.
+0. **Display robustness:** a link/hotplug poller (no interrupts yet) that redoes `disp_up` when the sink drops the
+   link and tells DRM about mode changes; mode changes through DRM atomic (needs a real modeset path per commit);
+   identity input LUT; DP_CONFIG_STREAM; core exception. Interrupts (display + GSP message) would replace polling.
 1. **Phase 8 groundwork:** a VA space (`FERMI_VASPACE_A`, 0x90f1) under our device and memory allocations
    (`NV01_MEMORY_LOCAL_USER` / sysmem). Check the GA10x class list via `NV2080_CTRL_CMD_GPU_GET_ENGINES_V2` /
    classlist first (note: GET_ENGINES / GET_ENGINE_CLASSLIST *are* FINN-serialized; use the V2 variants or check).
@@ -274,6 +293,7 @@ sudo ./tests/phase6_boot.sh 0000:01:00.0 3                                   # 3
 sudo ./tests/phase6_static.sh 0000:01:00.0 3                                 # + GET_GSP_STATIC_INFO cross-check
 sudo ./tests/phase7_rm.sh 0000:01:00.0 3                                     # + RM objects, controls, error paths
 sudo KEEP=1 ./tests/phase12_display.sh                                       # boot + DP link + modeset, image stays up
+sudo KEEP=1 DRM=1 ./tests/phase12_display.sh                                 # ... + DRM device, text console on tty3
 sudo sh -c 'echo 1 > /sys/kernel/debug/nvdrv/0000:01:00.0/rm_selftest'      # RM error paths on a booted GSP
 ```
 

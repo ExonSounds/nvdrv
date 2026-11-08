@@ -364,6 +364,186 @@ int nv_disp_link(struct nvdrv_dev *nv)
 	return ret;
 }
 
+/* Retrain an already configured link with its current lane count / rate (link loss). */
+static int dp_retrain(struct nvdrv_dev *nv, struct nv_disp_dpy *d)
+{
+	struct nv0073_dp_ctrl c = {};
+	u8 d0 = 1, st[3];
+	int ret;
+
+	if (dp_aux(nv, d->id, true, 0x600, &d0, 1))
+		dev_warn(&nv->pdev->dev, "disp: retrain: could not set D0\n");
+	c.display_id = cpu_to_le32(d->id);
+	c.cmd = cpu_to_le32(BIT(0) | BIT(1) | (d->enhanced_framing ? BIT(7) : 0));
+	c.data = cpu_to_le32(d->link_lanes | d->link_bw << 8);
+	ret = nv_rm_control(nv, nv->rm.h_client, nv->disp.h_common, NV0073_CTRL_CMD_DP_CTRL, &c, sizeof(c));
+	if (!dp_aux(nv, d->id, false, 0x202, st, 3))
+		dev_info(&nv->pdev->dev, "disp: retrain %u x 0x%02x: %d (err 0x%x), lane status %*ph\n",
+			 d->link_lanes, d->link_bw, ret, le32_to_cpu(c.err), 3, st);
+	return ret;
+}
+
+int nv_disp_retrain(struct nvdrv_dev *nv)
+{
+	struct nv_disp *dp = &nv->disp;
+	int ret = -ENODEV;
+	u32 i;
+
+	mutex_lock(&nv->gsp_lock);
+	for (i = 0; i < dp->ndpy; i++)
+		if (dp->dpy[i].connected && dp->dpy[i].link_lanes)
+			ret = dp_retrain(nv, &dp->dpy[i]);
+	mutex_unlock(&nv->gsp_lock);
+	return ret;
+}
+
+/*
+ * Is the link healthy from the sink's point of view? Lanes CR/EQ/symbol lock
+ * (0x202/0x203), interlane align (0x204 bit 0), sink in sync (0x205 bit 0).
+ */
+static bool dp_link_ok(struct nvdrv_dev *nv, struct nv_disp_dpy *d, u8 st[4])
+{
+	u32 i;
+
+	if (dp_aux(nv, d->id, false, 0x202, st, 4))
+		return false;
+	for (i = 0; i < d->link_lanes; i++)
+		if (((st[i / 2] >> ((i & 1) * 4)) & 0x7) != 0x7)
+			return false;
+	return (st[2] & 1) && (st[3] & 1);
+}
+
+static struct nv_disp_dpy *first_dp(struct nvdrv_dev *nv)
+{
+	u32 i;
+
+	for (i = 0; i < nv->disp.ndpy; i++) {
+		struct nv_disp_dpy *d = &nv->disp.dpy[i];
+
+		if (d->connected && (d->protocol == 0x8 || d->protocol == 0x9))
+			return d;
+	}
+	return NULL;
+}
+
+/*
+ * Wake the sink and wait until it presents a stable identity. The monitor on this
+ * machine answers with a fallback EDID/DPCD while asleep (1920x1080, DP 1.2) and
+ * switches to its real one (2560x1440, DP 1.4) a moment after waking, dropping any
+ * link trained in between.
+ */
+static int dp_settle(struct nvdrv_dev *nv)
+{
+	struct device *dev = &nv->pdev->dev;
+	u8 caps[16], prev[16] = {}, d0 = 1;
+	u32 prev_w = 0, prev_h = 0, stable = 0, i;
+	struct nv_disp_dpy *d;
+	int ret;
+
+	for (i = 0; i < 20; i++) {
+		ret = disp_probe_locked(nv);
+		if (ret)
+			return ret;
+		d = first_dp(nv);
+		if (!d) {
+			msleep(250);
+			continue;
+		}
+		dp_aux(nv, d->id, true, 0x600, &d0, 1);
+		if (dp_aux(nv, d->id, false, 0x000, caps, 16)) {
+			stable = 0;
+		} else if (!memcmp(caps, prev, 16) && d->mode.hdisplay == prev_w && d->mode.vdisplay == prev_h) {
+			if (++stable >= 3) {
+				dev_info(dev, "disp: sink stable after %u probes: %ux%u, DPCD %*ph\n", i + 1,
+					 prev_w, prev_h, 16, caps);
+				return 0;
+			}
+		} else {
+			stable = 0;
+			memcpy(prev, caps, 16);
+			prev_w = d->mode.hdisplay;
+			prev_h = d->mode.vdisplay;
+		}
+		msleep(250);
+	}
+	dev_warn(dev, "disp: sink did not settle (last %ux%u), going ahead\n", prev_w, prev_h);
+	return first_dp(nv) ? 0 : -ENODEV;
+}
+
+/*
+ * The whole display bring-up in one go, retried until the link survives the modeset:
+ * settle the sink, train, modeset (re-modeset on an active head), check the link a
+ * moment later.
+ */
+int nv_disp_bringup(struct nvdrv_dev *nv)
+{
+	struct device *dev = &nv->pdev->dev;
+	struct nv_disp_dpy *d;
+	u8 st[4] = {};
+	u32 attempt;
+	int ret = -EIO;
+
+	mutex_lock(&nv->gsp_lock);
+	for (attempt = 1; attempt <= 4; attempt++) {
+		if (attempt > 1)
+			nv_disp_detach_locked(nv);	/* RM will not retrain under an active head */
+		ret = dp_settle(nv);
+		if (!ret)
+			ret = nv_evo_init(nv);
+		d = first_dp(nv);
+		if (!ret && d)
+			ret = dp_link_up(nv, d);
+		if (!ret)
+			ret = nv_disp_modeset_locked(nv, 0);
+		if (ret) {
+			dev_warn(dev, "disp: bring-up attempt %u failed: %d\n", attempt, ret);
+			continue;
+		}
+		msleep(1000);
+		if (dp_link_ok(nv, d, st)) {
+			dev_info(dev, "disp: attempt %u: link holds after modeset (%*ph), %ux%u up\n",
+				 attempt, 4, st, d->mode.hdisplay, d->mode.vdisplay);
+			break;
+		}
+		dev_warn(dev, "disp: attempt %u: link lost after modeset (status %*ph), retrying\n",
+			 attempt, 4, st);
+		ret = -ENOLINK;
+	}
+	mutex_unlock(&nv->gsp_lock);
+	return ret;
+}
+
+/* DPCD view of the link from the sink side (debugfs dp_status). */
+void nv_disp_dp_status_show(struct nvdrv_dev *nv, struct seq_file *m)
+{
+	struct nv_disp *dp = &nv->disp;
+	u8 st[6], pwr, rev[3];
+	u32 i;
+
+	mutex_lock(&nv->gsp_lock);
+	for (i = 0; i < dp->ndpy; i++) {
+		struct nv_disp_dpy *d = &dp->dpy[i];
+
+		if (!d->connected || !d->link_lanes)
+			continue;
+		seq_printf(m, "dpy 0x%08x SOR%u, trained %u lanes x 0x%02x\n", d->id, d->sor, d->link_lanes, d->link_bw);
+		{
+			u8 caps[16];
+
+			if (!dp_aux(nv, d->id, false, 0x000, caps, 16))
+				seq_printf(m, "  0x000 caps %*ph (max link 0x%02x x %u)\n", 16, caps, caps[1], caps[2] & 0x1f);
+		}
+		if (!dp_aux(nv, d->id, false, 0x200, st, 6))
+			seq_printf(m, "  0x200 sink count 0x%02x, irq 0x%02x, lane0/1 0x%02x lane2/3 0x%02x, align 0x%02x, sink status 0x%02x%s\n",
+				   st[0], st[1], st[2], st[3], st[4], st[5], st[5] & 1 ? " (in sync)" : " (NOT in sync)");
+		if (!dp_aux(nv, d->id, false, 0x600, &pwr, 1))
+			seq_printf(m, "  0x600 power state 0x%02x%s\n", pwr, pwr == 1 ? " (D0)" : "");
+		if (!dp_aux(nv, d->id, false, 0x100, rev, 3))
+			seq_printf(m, "  0x100 link bw set 0x%02x, lane count set 0x%02x, pattern 0x%02x\n", rev[0], rev[1], rev[2]);
+	}
+	mutex_unlock(&nv->gsp_lock);
+}
+
 /* Called from nv_rm_fini_objects: the objects die with the client. */
 void nv_disp_forget(struct nvdrv_dev *nv)
 {
