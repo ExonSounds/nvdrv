@@ -1,8 +1,8 @@
 # nvdrv
 
-A from-scratch Linux kernel driver for NVIDIA Ampere GPUs that boots NVIDIA's
-GSP-RM firmware and talks to it directly. It contains no nouveau code and does not
-use the NVIDIA kernel modules.
+A Linux kernel driver for NVIDIA Ampere GPUs that boots NVIDIA's GSP-RM firmware and
+talks to it directly, written mostly from scratch. It does not use the NVIDIA kernel
+modules; parts taken from nouveau keep their original license headers.
 
 > [!WARNING]
 > **Work in progress and unstable.** This repository is pushed after every change,

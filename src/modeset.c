@@ -11,6 +11,7 @@
  * Supervisor interrupts (clocks, SOR attach) are handled by GSP-RM.
  */
 #include <linux/delay.h>
+#include <linux/dma-mapping.h>
 #include <linux/iopoll.h>
 #include <linux/seq_file.h>
 
@@ -85,6 +86,7 @@
 #define SCALE_1X				1024	/* NV_EVO_SCALE_FACTOR_1X */
 
 #define NVDRV_H_FB_CTXDMA			0xd000f100
+#define NVDRV_H_SYSFB_CTXDMA			0xd000f101
 
 #define NV0073_CTRL_CMD_DP_CONFIG_STREAM	0x731362
 #define NV0073_CTRL_CMD_DP_GET_CAPS		0x731369
@@ -171,13 +173,14 @@ static u32 pattern_px(void *ctx, u64 i)
 }
 
 /* Window channel methods for a pitch-linear X8R8G8B8 surface (EvoFlipC3Common/C5Common). */
-static void win_methods(struct nv_evo_chan *win, u32 flags, u32 w, u32 h, u32 pitch, bool interlock_core)
+static void win_methods(struct nv_evo_chan *win, u32 flags, u32 ctxdma, u32 w, u32 h, u32 pitch,
+			bool interlock_core)
 {
 	u32 i;
 
 	m1(win, C67E_SET_PRESENT_CONTROL, 0);		/* MIN_PRESENT_INTERVAL 0, NON_TEARING, MONO */
 	for (i = 0; i < 6; i++) {
-		m1(win, C67E_SET_CONTEXT_DMA_ISO(i), i ? 0 : NVDRV_H_FB_CTXDMA);
+		m1(win, C67E_SET_CONTEXT_DMA_ISO(i), i ? 0 : ctxdma);
 		m1(win, C67E_SET_OFFSET(i), 0);
 	}
 	m1(win, C67E_SET_SIZE, w | h << 16);
@@ -265,7 +268,7 @@ static int modeset_locked(struct nvdrv_dev *nv, u32 flags)
 	if (ret)
 		return ret;
 	if (!e->fb_bound) {
-		ret = nv_evo_ctxdma(nv, NVDRV_H_FB_CTXDMA, e->fb, e->fb_size, win->chn);
+		ret = nv_evo_ctxdma(nv, NVDRV_H_FB_CTXDMA, e->fb, e->fb_size, win->chn, false);
 		if (ret)
 			return ret;
 		e->fb_bound = true;
@@ -321,7 +324,7 @@ static int modeset_locked(struct nvdrv_dev *nv, u32 flags)
 	}
 
 	/* 3. window 0 */
-	win_methods(win, flags, w, h, pitch, true);
+	win_methods(win, flags, NVDRV_H_FB_CTXDMA, w, h, pitch, true);
 
 	/* 4. core: window -> head, SOR, raster, viewport, usage bounds */
 	hsw = m->hsync_end - m->hsync_start;
@@ -397,13 +400,44 @@ int nv_disp_modeset(struct nvdrv_dev *nv, u32 flags)
 	return ret;
 }
 
+/*
+ * A second test surface in coherent system memory (diagonal stripes, so it is easy to
+ * tell from the VRAM bars), reached by the display through a PCI_COHERENT ctxdma.
+ */
+static int sysfb_prepare(struct nvdrv_dev *nv, u32 w, u32 h)
+{
+	struct nv_evo *e = &nv->evo;
+	struct nv_dma_buf *b = &e->sysfb;
+	u32 pitch = ALIGN(w * 4, 256), x, y, *px;
+	int ret;
+
+	if (b->cpu)
+		return 0;
+	b->size = ALIGN((u64)pitch * h, PAGE_SIZE);
+	b->cpu = dma_alloc_coherent(&nv->pdev->dev, b->size, &b->dma, GFP_KERNEL);
+	if (!b->cpu)
+		return -ENOMEM;
+	for (y = 0; y < h; y++) {
+		px = b->cpu + (size_t)y * pitch;
+		for (x = 0; x < w; x++)
+			px[x] = ((x + y) / 64) & 1 ? 0xff2060ff : 0xffffa000;	/* blue / orange */
+	}
+	wmb();
+	ret = nv_evo_ctxdma(nv, NVDRV_H_SYSFB_CTXDMA, b->dma, b->size, e->win[0].chn, true);
+	if (ret) {
+		dma_free_coherent(&nv->pdev->dev, b->size, b->cpu, b->dma);
+		b->cpu = NULL;
+	}
+	return ret;
+}
+
 /* Re-send only the window state (no core interlock) and report what the hardware thinks. */
 int nv_disp_flip(struct nvdrv_dev *nv, u32 flags)
 {
 	struct nv_evo *e = &nv->evo;
 	struct nv_evo_chan *win = &e->win[0];
 	struct nv_disp_dpy *d = NULL;
-	u32 i, w, h;
+	u32 i, w, h, ctxdma;
 	int ret;
 
 	mutex_lock(&nv->gsp_lock);
@@ -419,12 +453,74 @@ int nv_disp_flip(struct nvdrv_dev *nv, u32 flags)
 	ret = nv_evo_begin(nv, win, 768);
 	if (ret)
 		goto out;
-	win_methods(win, flags, w, h, ALIGN(w * 4, 256), false);
+	ctxdma = NVDRV_H_FB_CTXDMA;
+	if (flags & NV_FLIP_SYSMEM) {
+		ret = sysfb_prepare(nv, w, h);
+		if (ret)
+			goto out;
+		ctxdma = NVDRV_H_SYSFB_CTXDMA;
+	}
+	win_methods(win, flags, ctxdma, w, h, ALIGN(w * 4, 256), false);
 	ret = nv_evo_kick(nv, win);
 	msleep(50);
 	dev_info(&nv->pdev->dev, "flip 0x%x: %d, window except 0x%08x arg 0x%08x err 0x%08x, scanline %u\n",
 		 flags, ret, nv_rd32(nv, 0x611020 + win->chn * 12), nv_rd32(nv, 0x611024 + win->chn * 12),
 		 nv_rd32(nv, 0x611028 + win->chn * 12), ioread32(e->core.user + C67D_GET_RG_SCAN_LINE(0)) & 0xffff);
+out:
+	mutex_unlock(&nv->gsp_lock);
+	return ret;
+}
+
+/*
+ * BAR1 check: map the scanout framebuffer through BAR1, draw a magenta rectangle with
+ * a green frame into the middle of it with ordinary CPU writes, and read a few pixels
+ * back through PRAMIN to prove both paths see the same VRAM.
+ */
+int nv_bar1_test(struct nvdrv_dev *nv)
+{
+	struct device *dev = &nv->pdev->dev;
+	struct nv_evo *e = &nv->evo;
+	struct nv_disp_dpy *d = NULL;
+	u32 i, w, h, pitch, x, y, x0, y0, bad = 0;
+	void __iomem *fb;
+	int ret;
+
+	mutex_lock(&nv->gsp_lock);
+	for (i = 0; i < nv->disp.ndpy; i++)
+		if (nv->disp.dpy[i].connected && nv->disp.dpy[i].mode.valid)
+			d = &nv->disp.dpy[i];
+	ret = -ENODEV;
+	if (!d || !e->fb || !e->active)
+		goto out;
+	ret = nv_bar1_init(nv);
+	if (ret)
+		goto out;
+	ret = -EIO;
+	fb = nv_bar1_map(nv, 0, e->fb, e->fb_size);
+	if (!fb)
+		goto out;
+	w = d->mode.hdisplay;
+	h = d->mode.vdisplay;
+	pitch = ALIGN(w * 4, 256);
+	x0 = w / 4;
+	y0 = h / 4;
+	for (y = y0; y < y0 + h / 2; y++)
+		for (x = x0; x < x0 + w / 2; x++) {
+			bool edge = x < x0 + 16 || y < y0 + 16 || x >= x0 + w / 2 - 16 || y >= y0 + h / 2 - 16;
+
+			iowrite32(edge ? 0xff00ff00 : 0xffff00ff, fb + (size_t)y * pitch + x * 4);
+		}
+	wmb();
+	(void)ioread32(fb);
+	for (i = 0; i < 64; i++) {
+		x = x0 + 16 + (i * 37) % (w / 2 - 32);
+		y = y0 + 16 + (i * 53) % (h / 2 - 32);
+		bad += nv_vram_rd32(nv, e->fb + (u64)y * pitch + x * 4) != 0xffff00ff;
+	}
+	dev_info(dev, "bar1: framebuffer mapped at BAR1+0 (%llu KiB), rectangle drawn, PRAMIN read-back %u/64 mismatches\n",
+		 e->fb_size >> 10, bad);
+	iounmap(fb);
+	ret = bad ? -EIO : 0;
 out:
 	mutex_unlock(&nv->gsp_lock);
 	return ret;

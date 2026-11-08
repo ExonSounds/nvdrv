@@ -324,7 +324,15 @@ struct nv_evo {
 	struct nv_evo_chan core;
 	struct nv_evo_chan win[2];
 	u64 fb, fb_size;			/* scanout surface (VRAM) */
+	struct nv_dma_buf sysfb;		/* scanout test surface in sysmem */
 	bool fb_bound, win_mapped, active;
+};
+
+/* BAR1 page tables under GSP-RM's root (src/bar1.c). */
+struct nv_bar1 {
+	u64 tables, pd0, pts;	/* VRAM */
+	u64 old_root0;		/* GSP's original root entry 0 */
+	u64 size;		/* usable BAR1 VA */
 };
 
 struct nvdrv_dev {
@@ -352,6 +360,7 @@ struct nvdrv_dev {
 	struct nv_rm rm;
 	struct nv_disp disp;
 	struct nv_evo evo;
+	struct nv_bar1 bar1;
 	bool gsp_touched;	/* Booter/FWSEC ran: GSP may DMA into our memory */
 	bool gsp_running;	/* GSP_INIT_DONE received */
 
@@ -430,12 +439,16 @@ void nv_vram_wr32(struct nvdrv_dev *nv, u64 off, u32 val);
 u32 nv_vram_rd32(struct nvdrv_dev *nv, u64 off);
 void nv_vram_fill(struct nvdrv_dev *nv, u64 off, u64 len, u32 val,
 		  u32 (*fn)(void *ctx, u64 i), void *ctx);
-int nv_evo_ctxdma(struct nvdrv_dev *nv, u32 handle, u64 base, u64 size, u32 chn);
+int nv_evo_ctxdma(struct nvdrv_dev *nv, u32 handle, u64 base, u64 size, u32 chn, bool sysmem);
 void nv_evo_mthd(struct nv_evo_chan *c, u32 mthd, const u32 *data, u32 n);
 int nv_evo_kick(struct nvdrv_dev *nv, struct nv_evo_chan *c);
 int nv_evo_kick_nowait(struct nvdrv_dev *nv, struct nv_evo_chan *c);
 int nv_evo_begin(struct nvdrv_dev *nv, struct nv_evo_chan *c, u32 need);
 int nv_evo_wait(struct nvdrv_dev *nv, struct nv_evo_chan *c);
+
+/* bar1.c */
+int nv_bar1_init(struct nvdrv_dev *nv);
+void __iomem *nv_bar1_map(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size);
 
 /* modeset.c */
 int nv_disp_modeset(struct nvdrv_dev *nv, u32 flags);
@@ -448,7 +461,9 @@ int nv_disp_modeset(struct nvdrv_dev *nv, u32 flags);
 #define NV_FLIP_MCLK_WAR		BIT(2)	/* bookend UPDATE with SW_SET_MCLK_SWITCH */
 #define NV_FLIP_NO_FMT			BIT(3)
 #define NV_FLIP_CSC			BIT(4)	/* send CSC/ILUT/TMO disables (err 0x2 with bypass) */
+#define NV_FLIP_SYSMEM			BIT(5)	/* scan out a test surface from coherent sysmem */
 int nv_disp_flip(struct nvdrv_dev *nv, u32 flags);
+int nv_bar1_test(struct nvdrv_dev *nv);
 int nv_evo_init(struct nvdrv_dev *nv);
 int nv_evo_window_init(struct nvdrv_dev *nv, u32 win);
 void nv_evo_fini(struct nvdrv_dev *nv);

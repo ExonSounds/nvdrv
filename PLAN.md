@@ -1,13 +1,15 @@
-# nvdrv — a from-scratch NVIDIA GPU driver (no nouveau)
+# nvdrv — an NVIDIA GPU driver on top of GSP-RM
 
 Target hardware: **GA104 (RTX 3060 Ti LHR, 10de:2489), Ampere**, PCI 0000:01:00.0
 Kernel: Arch 7.2.x, out-of-tree C module (Kbuild), GPL-2.0.
 
 ## Ground rules
 
-- **No nouveau code.** References allowed: NVIDIA `open-gpu-doc` (register/class
-  headers, MIT) and `open-gpu-kernel-modules` (MIT/GPL dual) for register offsets
-  and GSP message layouts, plus public specs (PCI Firmware spec, RISC-V).
+- **References:** NVIDIA `open-gpu-doc` (register/class headers, MIT), `open-gpu-kernel-modules`
+  (MIT/GPL dual) for register offsets and GSP message layouts, public specs (PCI Firmware spec,
+  RISC-V), and, **since 2026-11-08, nouveau** (the user lifted the original no-nouveau rule to speed
+  things up). nouveau code may be used and built on; keep its copyright/license headers (MIT) on
+  anything taken from it, and note the origin in the file.
 - **One firmware version, pinned: `570.144`** (`/lib/firmware/nvidia/ga104/gsp/*-570.144.bin.zst`,
   from linux-firmware). The GSP RPC ABI changes with every release, so every
   struct we define must match that tag of `open-gpu-kernel-modules`.
@@ -237,14 +239,21 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
   (0x80 = UPDATE) and RESTART_MODE. SKIP (0x1000_0000) means GSP-RM rejected the update. `EXCEPTERR` (+8) holds the
   class error code. Comparing the assembly copy (user area) with the armed copy (+0x800 window, +0x8000 core) shows
   what actually took effect.
+- **Scanout from sysmem is rejected** on this dGPU: a window ctxdma with TARGET_NODE PHYSICAL_PCI_COHERENT fails
+  with window error 0x1d, so ISO surfaces stay in VRAM.
+- **BAR1 (2026-11-08), done the way nouveau does it** (r535 bar.c): under GSP-RM, BAR1 is in virtual mode. GSP builds a
+  root → PD2 → PD1 → PD0 chain at `bar1PdeBase` (0x1f28ba000) with one empty 64K page table. nvdrv replaces root
+  entry 0 with its own PD2/PD1/PD0 + 64 KiB page tables (GP100 formats: PDE/PTE = addr>>4 | aperture/valid) in its
+  carve-out, invalidates via 0xb830a0/a4/b0 (type 7), and ioremap_wc()s BAR1 (8 GiB with resizable BAR). CPU writes
+  through BAR1 read back identically via PRAMIN.
 - **Open:** `DP_CONFIG_STREAM` returns NV_ERR_ILLEGAL_ACTION (0x16) before the modeset; the link works with RM's
   defaults. The core channel also latches EXCEPT 0x10000080 arg 0x41 during the modeset update, but the update takes
   effect. The EDID read during one early probe gave 1920x1080; later reads give 2560x1440 (sink waking up?).
 
 ## Next steps
 
-0. **Display follow-ups:** identity input LUT (to enable normal composition), understand DP_CONFIG_STREAM and the core
-   exception, then a DRM/KMS device (dumb buffers + fbdev) so the console can run on nvdrv.
+0. **DRM/KMS device** on top of BAR1: dumb buffers in VRAM mapped through BAR1, one CRTC/plane/encoder/connector,
+   fbdev emulation so the console runs on nvdrv. Then identity input LUT, DP_CONFIG_STREAM, core exception.
 1. **Phase 8 groundwork:** a VA space (`FERMI_VASPACE_A`, 0x90f1) under our device and memory allocations
    (`NV01_MEMORY_LOCAL_USER` / sysmem). Check the GA10x class list via `NV2080_CTRL_CMD_GPU_GET_ENGINES_V2` /
    classlist first (note: GET_ENGINES / GET_ENGINE_CLASSLIST *are* FINN-serialized; use the V2 variants or check).

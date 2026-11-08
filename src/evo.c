@@ -203,7 +203,7 @@ static u32 evo_hash(u32 h_client, u32 h_ctxdma, u32 chn)
  * for a pitch-linear VRAM range and enter (handle -> object) into the hash table for
  * one channel. Returns the handle the channel methods refer to.
  */
-int nv_evo_ctxdma(struct nvdrv_dev *nv, u32 handle, u64 base, u64 size, u32 chn)
+int nv_evo_ctxdma(struct nvdrv_dev *nv, u32 handle, u64 base, u64 size, u32 chn, bool sysmem)
 {
 	struct nv_evo *e = &nv->evo;
 	u32 h_client = nv->rm.h_client, inst, entry, i, n = NV_UDISP_HASH_SIZE / 8;
@@ -214,7 +214,8 @@ int nv_evo_ctxdma(struct nvdrv_dev *nv, u32 handle, u64 base, u64 size, u32 chn)
 	inst = e->inst_next;
 	e->inst_next += 2;
 	obj = e->instmem + (inst << 4);
-	nv_vram_wr32(nv, obj + 0, 0x1 /* TARGET_NODE PHYSICAL_NVM */ | BIT(2) /* READ_AND_WRITE */);
+	/* TARGET_NODE: 1 = PHYSICAL_NVM (VRAM), 3 = PHYSICAL_PCI_COHERENT (sysmem bus address) */
+	nv_vram_wr32(nv, obj + 0, (sysmem ? 0x3 : 0x1) | BIT(2) /* READ_AND_WRITE */);
 	nv_vram_wr32(nv, obj + 4, lower_32_bits(base >> 8));
 	nv_vram_wr32(nv, obj + 8, upper_32_bits(base >> 8) & 0x7f);
 	nv_vram_wr32(nv, obj + 12, lower_32_bits(limit >> 8));
@@ -231,8 +232,8 @@ int nv_evo_ctxdma(struct nvdrv_dev *nv, u32 handle, u64 base, u64 size, u32 chn)
 	nv_vram_wr32(nv, e->instmem + entry * 8 + 4,
 		     (h_client & 0x3fff) | ((inst >> 1) & 0x7ff) << 14 | (chn & 0x7f) << 25);
 	(void)nv_rd32(nv, NV_PBUS_BAR0_WINDOW);
-	dev_info(&nv->pdev->dev, "evo: ctxdma 0x%08x -> VRAM 0x%llx+0x%llx (inst 0x%x, hash %u, chn %u)\n",
-		 handle, base, size, inst, entry, chn);
+	dev_info(&nv->pdev->dev, "evo: ctxdma 0x%08x -> %s 0x%llx+0x%llx (inst 0x%x, hash %u, chn %u)\n",
+		 handle, sysmem ? "sysmem" : "VRAM", base, size, inst, entry, chn);
 	return 0;
 }
 
@@ -412,6 +413,8 @@ void nv_evo_fini(struct nvdrv_dev *nv)
 	evo_channel_free_mem(nv, &e->core);
 	for (i = 0; i < ARRAY_SIZE(e->win); i++)
 		evo_channel_free_mem(nv, &e->win[i]);
+	if (e->sysfb.cpu)
+		dma_free_coherent(&nv->pdev->dev, e->sysfb.size, e->sysfb.cpu, e->sysfb.dma);
 	memset(e, 0, sizeof(*e));
 }
 

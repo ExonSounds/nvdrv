@@ -427,6 +427,62 @@ static const struct file_operations disp_flip_fops = {
 	.write = disp_flip_write,
 };
 
+/*
+ * vram: pread() at offset N = VRAM byte N, through the PRAMIN window (moves
+ * NV_PBUS_BAR0_WINDOW, so only with allow_hw_writes=1; serialized by gsp_lock).
+ */
+static ssize_t vram_read(struct file *f, char __user *buf, size_t count, loff_t *ppos)
+{
+	struct nvdrv_dev *nv = f->private_data;
+	loff_t pos = *ppos;
+	size_t done = 0;
+
+	if (pos < 0 || (pos & 3) || (count & 3))
+		return -EINVAL;
+	if (pos >= nv->fb.fb_size)
+		return 0;
+	count = min_t(size_t, count, min_t(u64, nv->fb.fb_size - pos, SZ_64K));
+	mutex_lock(&nv->gsp_lock);
+	while (done < count) {
+		__le32 w = cpu_to_le32(nv_vram_rd32(nv, pos + done));
+
+		if (copy_to_user(buf + done, &w, 4))
+			break;
+		done += 4;
+	}
+	mutex_unlock(&nv->gsp_lock);
+	if (!done)
+		return -EFAULT;
+	*ppos = pos + done;
+	return done;
+}
+
+static const struct file_operations vram_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = vram_read,
+	.llseek = default_llseek,
+};
+
+static ssize_t bar1_test_write(struct file *f, const char __user *buf,
+			       size_t count, loff_t *ppos)
+{
+	bool go;
+	int ret = kstrtobool_from_user(buf, count, &go);
+
+	if (ret)
+		return ret;
+	if (go)
+		ret = nv_bar1_test(f->private_data);
+	return ret ? ret : count;
+}
+
+static const struct file_operations bar1_test_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = bar1_test_write,
+};
+
 static void nv_debugfs_init(struct nvdrv_dev *nv)
 {
 	nv->dbg = debugfs_create_dir(pci_name(nv->pdev), nvdrv_dbg_root);
@@ -448,6 +504,10 @@ static void nv_debugfs_init(struct nvdrv_dev *nv)
 		debugfs_create_file("disp_modeset", 0200, nv->dbg, nv, &disp_modeset_fops);
 	if (nv_hw_writes_allowed())
 		debugfs_create_file("disp_flip", 0200, nv->dbg, nv, &disp_flip_fops);
+	if (nv_hw_writes_allowed())
+		debugfs_create_file("vram", 0400, nv->dbg, nv, &vram_fops);
+	if (nv_hw_writes_allowed())
+		debugfs_create_file("bar1_test", 0200, nv->dbg, nv, &bar1_test_fops);
 
 	if (nv->vbios.data) {
 		nv->vbios_blob.data = nv->vbios.data;
