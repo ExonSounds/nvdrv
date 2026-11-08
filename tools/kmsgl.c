@@ -163,6 +163,13 @@ int main(int argc, char **argv)
 		}
 		prev = bo;
 		frames++;
+		if (getenv("KMSGL_VERBOSE") && (int)t != (int)(now() - t0)) {
+			static int last;
+
+			printf("  %ds: %d fps\n", (int)(now() - t0), frames - last);
+			fflush(stdout);
+			last = frames;
+		}
 	}
 	printf("%d frames in %.1f s: %.1f fps\n", frames, t, frames / t);
 	return 0;

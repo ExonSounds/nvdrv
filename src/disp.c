@@ -568,12 +568,29 @@ int nv_disp_set_mode(struct nvdrv_dev *nv, const struct nv_mode *m)
 		goto out;
 	}
 	d->mode = *m;
-	for (attempt = 1; attempt <= 3; attempt++) {
-		if (attempt > 1) {
+	for (attempt = 1; attempt <= 5; attempt++) {
+		if (attempt == 2 || attempt == 3) {
 			nv_disp_detach_locked(nv);
 			ret = dp_retrain(nv, d);
 			if (ret)
 				continue;
+		} else if (attempt >= 4) {
+			/*
+			 * The sink may be switching identities after the timing change (see
+			 * dp_settle): full bring-up path. Settling re-probes and resets the mode
+			 * to the sink's preferred one; the last attempt keeps that, so a failed
+			 * mode change never leaves the head detached (which stalls the display
+			 * channels).
+			 */
+			nv_disp_detach_locked(nv);
+			ret = dp_settle(nv);
+			d = first_dp(nv);
+			if (!ret && d)
+				ret = dp_link_up(nv, d);
+			if (ret || !d)
+				continue;
+			if (attempt == 4)
+				d->mode = *m;
 		}
 		ret = nv_disp_modeset_locked(nv, 0);
 		if (ret)
@@ -586,7 +603,12 @@ int nv_disp_set_mode(struct nvdrv_dev *nv, const struct nv_mode *m)
 	dev_info(dev, "disp: mode %ux%u %u kHz (%u Hz): %d after %d attempt(s), link %*ph\n", m->hdisplay,
 		 m->vdisplay, m->clock_khz,
 		 (u32)DIV_ROUND_CLOSEST_ULL((u64)m->clock_khz * 1000, (u64)m->htotal * m->vtotal),
-		 ret, attempt > 3 ? 3 : attempt, 4, st);
+		 ret, attempt > 5 ? 5 : attempt, 4, st);
+	if (attempt == 5 && !ret) {
+		dev_warn(dev, "disp: fell back to the sink's preferred mode %ux%u\n", d->mode.hdisplay,
+			 d->mode.vdisplay);
+		ret = -EAGAIN;
+	}
 out:
 	mutex_unlock(&nv->gsp_lock);
 	return ret;
