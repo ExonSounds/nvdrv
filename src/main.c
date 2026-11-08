@@ -554,6 +554,13 @@ static int drm_stats_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(drm_stats);
 
+static int sensors_show(struct seq_file *m, void *unused)
+{
+	nv_sensors_show(m->private, m);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(sensors);
+
 static int perf_show(struct seq_file *m, void *unused)
 {
 	nv_rm_perf_show(m->private, m);
@@ -692,6 +699,7 @@ static void nv_debugfs_init(struct nvdrv_dev *nv)
 		debugfs_create_file("disp_up", 0200, nv->dbg, nv, &disp_up_fops);
 	if (nv_hw_writes_allowed()) {
 		debugfs_create_file("perf", 0600, nv->dbg, nv, &perf_fops);
+		debugfs_create_file("sensors", 0400, nv->dbg, nv, &sensors_fops);
 		debugfs_create_file("bar1_bench", 0200, nv->dbg, nv, &bar1_bench_fops);
 		debugfs_create_file("drm_stats", 0400, nv->dbg, nv, &drm_stats_fops);
 		debugfs_create_file("ce_test", 0200, nv->dbg, nv, &ce_test_fops);
@@ -884,6 +892,7 @@ static int nvdrv_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	dev_info(&pdev->dev, "%s (chipset 0x%03x rev %02x)\n", nv->name, nv->chipset, nv->rev);
 
 	nv_init_readonly(nv);
+	nv_hwmon_init(nv);	/* temperature: BAR0 only */
 	nv_debugfs_init(nv);
 	return 0;
 }
@@ -912,11 +921,38 @@ static const struct pci_device_id nvdrv_ids[] = {
 	{ }
 };
 
+/*
+ * System sleep is not supported yet: it needs GSP-RM save/restore (UNLOADING_GUEST_DRIVER
+ * with a PM transition, then a resume boot), moving VRAM objects to system memory and back,
+ * and restoring display and channels. Without that the GPU would come back powered off
+ * under a driver that believes it is running, so refuse instead of breaking. Once GSP-RM
+ * has never run (read-only probing), sleep is harmless.
+ */
+static int nvdrv_pm_suspend(struct device *dev)
+{
+	struct nvdrv_dev *nv = dev_get_drvdata(dev);
+
+	if (!nv->gsp_touched)
+		return 0;
+	dev_warn(dev, "system suspend is not supported while GSP-RM runs (unbind nvdrv first)\n");
+	return -EBUSY;
+}
+
+static int nvdrv_pm_resume(struct device *dev)
+{
+	return 0;
+}
+
+static const struct dev_pm_ops nvdrv_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(nvdrv_pm_suspend, nvdrv_pm_resume)
+};
+
 static struct pci_driver nvdrv_driver = {
 	.name = DRV_NAME,
 	.id_table = nvdrv_ids,
 	.probe = nvdrv_probe,
 	.remove = nvdrv_remove,
+	.driver.pm = pm_sleep_ptr(&nvdrv_pm_ops),
 };
 
 static int __init nvdrv_init(void)

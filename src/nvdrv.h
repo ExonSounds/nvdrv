@@ -578,6 +578,11 @@ void nv_chid_put(struct nvdrv_dev *nv, u32 chid);
 void nv_push(struct nv_chan *ch, u32 subc, u32 mthd, const u32 *data, u32 n);
 void nv_push1(struct nv_chan *ch, u32 subc, u32 mthd, u32 v);
 void nv_kick(struct nvdrv_dev *nv, struct nv_chan *ch);
+/* src/sensors.c */
+int nv_sensor_temp(struct nvdrv_dev *nv, long *mc);
+void nv_sensors_show(struct nvdrv_dev *nv, struct seq_file *m);
+void nv_hwmon_init(struct nvdrv_dev *nv);
+
 /* src/uapi.c */
 struct drm_file;
 struct drm_device;

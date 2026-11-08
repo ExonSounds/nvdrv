@@ -1005,9 +1005,10 @@ static void push_dump(struct nv_cli *cli, u32 chid, u64 va, u32 len)
 }
 
 /*
- * GSP-RM keeps the GPU in P8 / PCIe Gen1 under a compositor's load (its governor does not
- * raise clocks for it), so rendering runs at idle clocks and stutters. Every submission
- * re-arms a short boost to P0 / Gen3, at most one request per second; idle drops back.
+ * Optional (exec_boost=1): every submission re-arms a short boost to P0 / PCIe Gen3, at
+ * most one request per second. GSP-RM keeps a compositor's light, bursty load at P8,
+ * which is its normal policy (the 1-2 s Hyprland stutter was VM_BIND under gsp_lock, not
+ * clocks; pinning P0 did not change it).
  */
 #define UAPI_BOOST_SECONDS	3
 
@@ -1019,11 +1020,19 @@ static void uapi_boost_work(struct work_struct *w)
 		nv_rm_perf_boost(nv, UAPI_BOOST_SECONDS);
 }
 
+/*
+ * Off by default: GSP-RM's own governor raises the P-state under real load (P8 -> P0
+ * within 2.5 s at ~90 % graphics utilisation) and keeps a desktop at P8, which is right.
+ */
+static bool exec_boost;
+module_param(exec_boost, bool, 0644);
+MODULE_PARM_DESC(exec_boost, "Force P0 for a few seconds whenever GPU work is submitted (default off; RM's governor scales)");
+
 static void uapi_boost(struct nvdrv_dev *nv)
 {
 	struct nv_uapi *ua = &nv->uapi;
 
-	if (time_after_eq(jiffies, READ_ONCE(ua->boost_next))) {
+	if (exec_boost && time_after_eq(jiffies, READ_ONCE(ua->boost_next))) {
 		WRITE_ONCE(ua->boost_next, jiffies + HZ);
 		schedule_work(&ua->boost_work);
 	}

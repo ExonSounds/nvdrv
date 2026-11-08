@@ -408,9 +408,23 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
 - [ ] fbdev restore after the last DRM master closes; mode changes through a real per-commit modeset path.
 
 ### Power, thermals, stability
-- [ ] ▶ **Sensors**: GPU temperature, fan speed, power draw, clocks, utilisation through hwmon (`sensors`) and debugfs.
-- [ ] ▶ **Power management**: let RM's performance governor pick P-states (replace the boost workaround),
-      runtime power-down when idle, **system suspend/resume** (GSP-RM save/restore).
+- [x] **Sensors (public interfaces only)** (`src/sensors.c`, 2026-11-09): GPU temperature through hwmon
+      (`sensors` -> `nvdrv-pci-0100`, `temp1_input`) and debugfs `sensors`: temperature, P-state + PCIe link,
+      utilisation (graphics/memory/NVENC/NVDEC, `PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2`), per-perf-level clocks
+      (`PERF_GET_LEVEL_INFO_V2`: 5 levels, domain 0x10 = memory clock up to 7001 MHz, domain 0x1 ~420 MHz).
+      Temperature register 0x020460 as nouveau reads it; on GA104 bits 31:30 mark it (nouveau's Pascal valid bit 29
+      is clear), checked against load: 35 C idle -> 54 C under vkmark -> falling after.
+- [ ] **Fan speed, board power, live graphics clock**: no published interface (the RM thermal/fan/power/clock
+      controls are stubs in the open SDK; the closed firmware is not reverse-engineered, per the ground rules).
+      Possible public route: nouveau-style board sensors (INA power monitors on the GPU's I2C buses), but GSP-RM
+      owns those buses; needs an RM-mediated I2C path first.
+- [x] **P-state governor**: GSP-RM's governor works by itself (P8 -> P0 within 2.5 s at ~90 % graphics
+      utilisation, back to P8 at idle; a desktop's light load correctly stays at P8). The EXEC boost is now off
+      (module parameter `exec_boost=1` re-enables it).
+- [ ] ▶ **System suspend/resume**: GSP-RM save/restore (UNLOADING_GUEST_DRIVER with a PM transition, resume boot),
+      VRAM objects to system memory and back (needs eviction), display and channel restore. Until then nvdrv
+      *refuses* system suspend while GSP-RM runs (-EBUSY, logged) instead of resuming into a dead GPU.
+- [ ] Runtime power-down when idle (GC6 / D3cold): not available on a desktop board with an active display.
 - [ ] **Clean unload** instead of FLR: UNLOADING_GUEST_DRIVER RPC, wait for halt, Booter-Unload on SEC2.
 - [ ] Fan control / power limits (read-only first; writing them is an explicit user decision).
 
