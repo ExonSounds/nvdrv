@@ -444,8 +444,20 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       821760/4096. NVK manages Z-cull storage itself (nothing bound per channel, as nouveau). Verified by dumping
       NVK's pushes: SET_ZCULL = 1, region/storage/aliquots/bounds programmed (region width 1216 = 1024 rounded to
       304); `tools/gltest.c` depth scene (64 rectangles, random depth order) exact with Z-cull on.
-- [ ] **Per-object fences / implicit sync**: BO reservation fences (dma-buf with other devices), VM_BIND unmap and
-      CPU_PREP without waiting for the whole client; asynchronous VM_BIND; full sparse-binding semantics.
+- [x] **Per-object fences / async VM_BIND** (2026-11-09):
+      - VM_BIND unmap no longer waits for the client's GPU work: once PTEs are cleared and the TLB is flushed the
+        GPU cannot reach the memory (Vulkan already requires the app to be done; a buggy app faults its own
+        channel). Unmapped objects are released only after the flush, so their memory is never reused before it.
+        0.06 ms while the GPU is busy (was: up to the 10 s idle wait).
+      - GEM_CPU_PREP waits per object: its reservation fences plus the work of every client that maps it.
+      - EXEC adds its fence to shared objects' (dma-buf exported/imported) reservations, BOOKKEEP usage, as nouveau
+        does through drm_gpuvm.
+      - DRM_NOUVEAU_VM_BIND_RUN_ASYNC: ops run in an ordered per-client worker after their wait syncobjs; the signal
+        syncobjs get a fence the worker signals. Synchronous binds drain the queue first; file close drains it.
+      - `nvktest sync`: stalled channel (host semaphore acquire released by the CPU), instant unmap, CPU_PREP
+        busy/idle across two clients with a dma-buf, async bind returning at once and taking effect after the GPU
+        signals its wait.
+- [ ] Full sparse-binding semantics (unmap inside a sparse region, residency queries).
 - [ ] **Preemption buffers** (GFXP pool/control block, spill, beta CB; CILP) so long compute work can be preempted.
 - [ ] **GPU recovery**: channel/engine reset after faults, device-lost reporting, GPU reset without reload.
 

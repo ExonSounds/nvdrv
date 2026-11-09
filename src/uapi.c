@@ -75,6 +75,9 @@ struct nv_cli {
 	struct list_head vmas;		/* struct nv_vma, sorted by addr */
 	u32 nsparse;			/* sparse regions among them */
 	struct idr chans;		/* struct nv_uchan */
+	struct list_head dead;		/* unmapped nv_vma, freed after the TLB flush */
+	struct workqueue_struct *bind_wq;	/* asynchronous VM_BIND, in order */
+	atomic_t binds_queued;
 };
 
 struct nv_uchan {
@@ -114,6 +117,7 @@ struct nv_bo {
 	struct sg_table *sgt;
 	struct list_head vmas;		/* struct nv_vma.bo_link, under uapi.evict_sem */
 	struct list_head lru;		/* uapi.vram_bos while in VRAM */
+	u64 exec_gen;			/* last EXEC that fenced it (shared objects) */
 };
 
 struct nv_vma {
@@ -270,24 +274,6 @@ static void uchan_drain(struct nvdrv_dev *nv, struct nv_uchan *u)
 	spin_unlock_irqrestore(&ua->lock, flags);
 	dma_fence_put(u->last);
 	u->last = NULL;
-}
-
-/* Wait for every channel of the client to go idle: 0, -EBUSY (timeout) or an error. */
-static int cli_wait_idle(struct nv_cli *cli, bool intr, long timeout)
-{
-	struct nv_uchan *u;
-	int id;
-
-	idr_for_each_entry(&cli->chans, u, id) {
-		long t;
-
-		if (!u->last)
-			continue;
-		t = dma_fence_wait_timeout(u->last, intr, timeout);
-		if (t <= 0)
-			return t ?: -EBUSY;
-	}
-	return 0;
 }
 
 /* ---- GEM objects ------------------------------------------------------------- */
@@ -728,17 +714,67 @@ static int ioctl_gem_info(struct drm_device *dev, void *data, struct drm_file *f
 	return 0;
 }
 
-/* No per-object fences: wait for the whole client to be idle. */
+/*
+ * Wait until the GPU is done with one object: its reservation fences (dma-buf implicit
+ * sync, jobs that used it as a shared object) and the work of every client that maps it.
+ * Without per-job object lists, "every client that maps it" is the precise bound nvdrv has.
+ */
 static int ioctl_gem_cpu_prep(struct drm_device *dev, void *data, struct drm_file *file)
 {
 	struct drm_nouveau_gem_cpu_prep *req = data;
-	struct nv_cli *cli = file->driver_priv;
-	long t;
+	struct nvdrv_dev *nv = dev_nv(dev);
+	struct nv_uapi *ua = &nv->uapi;
+	bool nowait = req->flags & NOUVEAU_GEM_CPU_PREP_NOWAIT;
+	long timeout = nowait ? 0 : 30 * HZ, t;
+	struct dma_fence *f[UAPI_MAX_CHANS * 4];
+	struct nv_cli *clis[16];
+	struct drm_gem_object *obj;
+	struct nv_uchan *u;
+	struct nv_vma *v;
+	unsigned long flags;
+	int ncli = 0, n = 0, i, j, ret = 0;
+	bool all_clients = false;
 
-	mutex_lock(&cli->lock);
-	t = cli_wait_idle(cli, true, req->flags & NOUVEAU_GEM_CPU_PREP_NOWAIT ? 0 : 30 * HZ);
-	mutex_unlock(&cli->lock);
-	return t;
+	obj = drm_gem_object_lookup(file, req->handle);
+	if (!obj)
+		return -ENOENT;
+	t = dma_resv_wait_timeout(obj->resv, req->flags & NOUVEAU_GEM_CPU_PREP_WRITE ? DMA_RESV_USAGE_BOOKKEEP :
+				  DMA_RESV_USAGE_WRITE, true, timeout);
+	if (t < 0 || (!t && !dma_resv_test_signaled(obj->resv, DMA_RESV_USAGE_WRITE))) {
+		drm_gem_object_put(obj);
+		return t < 0 ? t : -EBUSY;
+	}
+	if (obj->funcs == &nv_bo_funcs) {
+		mutex_lock(&ua->lru_lock);
+		list_for_each_entry(v, &to_nv_bo(obj)->vmas, bo_link) {
+			for (j = 0; j < ncli && clis[j] != v->cli; j++)
+				;
+			if (j < ncli)
+				continue;
+			if (ncli == ARRAY_SIZE(clis))
+				all_clients = true;
+			else
+				clis[ncli++] = v->cli;
+		}
+		mutex_unlock(&ua->lru_lock);
+	}
+	spin_lock_irqsave(&ua->lock, flags);
+	list_for_each_entry(u, &ua->chans, all) {
+		for (j = 0; j < ncli && clis[j] != u->cli; j++)
+			;
+		if ((j < ncli || all_clients) && u->last && n < ARRAY_SIZE(f))
+			f[n++] = dma_fence_get(u->last);
+	}
+	spin_unlock_irqrestore(&ua->lock, flags);
+	for (i = 0; i < n; i++) {
+		if (!ret) {
+			t = dma_fence_wait_timeout(f[i], true, timeout);
+			ret = t < 0 ? t : (!t && !dma_fence_is_signaled(f[i])) ? -EBUSY : 0;
+		}
+		dma_fence_put(f[i]);
+	}
+	drm_gem_object_put(obj);
+	return ret;
 }
 
 static int ioctl_gem_cpu_fini(struct drm_device *dev, void *data, struct drm_file *file)
@@ -939,14 +975,14 @@ static int vma_remove(struct nv_cli *cli, u64 addr, u64 range, bool sparse)
 			v->addr = end;
 		} else {
 			list_del(&v->link);
-			if (v->bo) {
+			if (v->bo) {	/* keep the object until the TLB flush (free_dead_vmas) */
 				mutex_lock(&cli->nv->uapi.lru_lock);
 				list_del(&v->bo_link);
 				mutex_unlock(&cli->nv->uapi.lru_lock);
-				drm_gem_object_put(&v->bo->base);
-			} else {
-				cli->nsparse--;
+				list_add(&v->link, &cli->dead);
+				continue;
 			}
+			cli->nsparse--;
 			kfree(v);
 		}
 	}
@@ -964,10 +1000,12 @@ static int vm_bind_op(struct drm_file *file, struct nv_cli *cli, const struct dr
 		return -EINVAL;
 
 	if (op->op == DRM_NOUVEAU_VM_BIND_OP_UNMAP) {
-		/* the GPU may still use the range: no per-object tracking yet, so wait for idle */
-		ret = cli_wait_idle(cli, false, 10 * HZ);
-		if (ret)
-			return ret;
+		/*
+		 * No wait for the GPU: Vulkan requires the app to be done with the memory, and
+		 * once the PTEs are cleared and the TLB flushed the GPU cannot reach it any more
+		 * (a buggy app only faults its own channel). The objects are released after the
+		 * flush (free_dead_vmas), so their memory is never reused before that.
+		 */
 		ret = vma_remove(cli, op->addr, op->range, false);
 		if (!ret && sparse)
 			ret = vma_remove(cli, op->addr, op->range, true);
@@ -1074,18 +1112,100 @@ static void *copy_array(u64 uptr, u32 n, size_t size)
 	return vmemdup_array_user(u64_to_user_ptr(uptr), n, size);
 }
 
+/* Release mappings unmapped since the last TLB flush. */
+static void free_dead_vmas(struct nv_cli *cli)
+{
+	struct nv_vma *v, *tmp;
+
+	list_for_each_entry_safe(v, tmp, &cli->dead, link) {
+		list_del(&v->link);
+		drm_gem_object_put(&v->bo->base);
+		kfree(v);
+	}
+}
+
+/* Run VM_BIND ops (waits already satisfied): PTEs, one TLB flush, then free unmapped objects. */
+static int vm_bind_run(struct drm_file *file, struct nv_cli *cli, const struct drm_nouveau_vm_bind_op *ops, u32 n)
+{
+	struct nvdrv_dev *nv = cli->nv;
+	u32 i;
+	int ret = 0;
+
+	mutex_lock(&cli->lock);
+	down_read(&nv->uapi.evict_sem);	/* object placement stable while PTEs are written */
+	mutex_lock(&nv->gsp_lock);
+	for (i = 0; i < n && !ret; i++) {
+		ret = vm_bind_op(file, cli, &ops[i]);
+		pr_debug("nvdrv: vm_bind %s 0x%llx+0x%llx handle %u off 0x%llx flags 0x%x: %d\n",
+			 ops[i].op ? "unmap" : "map", ops[i].addr, ops[i].range, ops[i].handle, ops[i].bo_offset,
+			 ops[i].flags, ret);
+	}
+	if (n)
+		ret = nv_vmm_flush(nv, &cli->vm) ?: ret;
+	mutex_unlock(&nv->gsp_lock);
+	free_dead_vmas(cli);
+	up_read(&nv->uapi.evict_sem);
+	mutex_unlock(&cli->lock);
+	return ret;
+}
+
+/* ---- asynchronous VM_BIND (DRM_NOUVEAU_VM_BIND_RUN_ASYNC) ------------------------ */
+
+static DEFINE_SPINLOCK(bind_fence_lock);
+
+static const char *bind_fence_timeline(struct dma_fence *f)
+{
+	return "nvdrv-vm-bind";
+}
+
+static const struct dma_fence_ops bind_fence_ops = {
+	.get_driver_name = fence_driver_name,
+	.get_timeline_name = bind_fence_timeline,
+};
+
+struct nv_bind_job {
+	struct work_struct work;
+	struct drm_file *file;		/* outlives the job: postclose drains bind_wq first */
+	struct nv_cli *cli;
+	struct drm_nouveau_vm_bind_op *ops;
+	struct drm_nouveau_sync *waits;
+	u32 nops, nwaits;
+	struct dma_fence *fence;	/* in the signal syncobjs; signalled when the ops ran */
+};
+
+static void bind_job_work(struct work_struct *w)
+{
+	struct nv_bind_job *job = container_of(w, struct nv_bind_job, work);
+	u32 i;
+	int ret = 0;
+
+	for (i = 0; i < job->nwaits && !ret; i++)
+		ret = sync_wait(job->file, &job->waits[i]);
+	if (!ret)
+		ret = vm_bind_run(job->file, job->cli, job->ops, job->nops);
+	if (ret) {
+		pr_warn_ratelimited("nvdrv: asynchronous VM_BIND failed: %d\n", ret);
+		dma_fence_set_error(job->fence, ret);
+	}
+	dma_fence_signal(job->fence);
+	dma_fence_put(job->fence);
+	atomic_dec(&job->cli->binds_queued);
+	kvfree(job->ops);
+	kvfree(job->waits);
+	kfree(job);
+}
+
 static int ioctl_vm_bind(struct drm_device *dev, void *data, struct drm_file *file)
 {
 	struct drm_nouveau_vm_bind *req = data;
 	struct nv_cli *cli = file->driver_priv;
-	struct nvdrv_dev *nv = cli->nv;
 	struct drm_nouveau_vm_bind_op *ops = NULL;
 	struct drm_nouveau_sync *waits = NULL, *sigs = NULL;
-	struct dma_fence *stub;
+	struct dma_fence *fence;
 	u32 i;
 	int ret = 0;
 
-	if (!cli->vm_ready)
+	if (!cli->vm_ready || req->flags & ~DRM_NOUVEAU_VM_BIND_RUN_ASYNC)
 		return -EINVAL;
 	ops = copy_array(req->op_ptr, req->op_count, sizeof(*ops));
 	waits = copy_array(req->wait_ptr, req->wait_count, sizeof(*waits));
@@ -1094,28 +1214,56 @@ static int ioctl_vm_bind(struct drm_device *dev, void *data, struct drm_file *fi
 		ret = -EFAULT;
 		goto out;
 	}
+
+	if (req->flags & DRM_NOUVEAU_VM_BIND_RUN_ASYNC) {
+		/*
+		 * Queue the ops behind earlier asynchronous binds; the caller gets its signal
+		 * syncobjs attached to a fence that the worker signals once its waits are
+		 * satisfied and the PTEs are written (nouveau runs these through drm_sched).
+		 */
+		struct nv_bind_job *job = kzalloc(sizeof(*job), GFP_KERNEL);
+
+		fence = kzalloc(sizeof(*fence), GFP_KERNEL);
+		if (!job || !fence) {
+			kfree(job);
+			kfree(fence);
+			ret = -ENOMEM;
+			goto out;
+		}
+		dma_fence_init(fence, &bind_fence_ops, &bind_fence_lock, dma_fence_context_alloc(1), 1);
+		ret = sync_signal(file, sigs, req->sig_count, fence);
+		if (ret) {
+			dma_fence_signal(fence);
+			dma_fence_put(fence);
+			kfree(job);
+			goto out;
+		}
+		INIT_WORK(&job->work, bind_job_work);
+		job->file = file;
+		job->cli = cli;
+		job->ops = IS_ERR_OR_NULL(ops) ? NULL : ops;
+		job->waits = IS_ERR_OR_NULL(waits) ? NULL : waits;
+		job->nops = req->op_count;
+		job->nwaits = req->wait_count;
+		job->fence = fence;
+		ops = NULL;
+		waits = NULL;
+		atomic_inc(&cli->binds_queued);
+		queue_work(cli->bind_wq, &job->work);
+		goto out;
+	}
+
+	/* synchronous: after any queued asynchronous binds, in order */
+	if (atomic_read(&cli->binds_queued))
+		flush_workqueue(cli->bind_wq);
 	for (i = 0; i < req->wait_count && !ret; i++)
 		ret = sync_wait(file, &waits[i]);
-	if (ret)
-		goto out;
-	mutex_lock(&cli->lock);
-	down_read(&nv->uapi.evict_sem);	/* object placement stable while PTEs are written */
-	mutex_lock(&nv->gsp_lock);
-	for (i = 0; i < req->op_count && !ret; i++) {
-		ret = vm_bind_op(file, cli, &ops[i]);
-		pr_debug("nvdrv: vm_bind %s 0x%llx+0x%llx handle %u off 0x%llx flags 0x%x: %d\n",
-			 ops[i].op ? "unmap" : "map", ops[i].addr, ops[i].range, ops[i].handle, ops[i].bo_offset,
-			 ops[i].flags, ret);
-	}
-	if (req->op_count)
-		ret = nv_vmm_flush(nv, &cli->vm) ?: ret;
-	mutex_unlock(&nv->gsp_lock);
-	up_read(&nv->uapi.evict_sem);
-	mutex_unlock(&cli->lock);
+	if (!ret)
+		ret = vm_bind_run(file, cli, ops, req->op_count);
 	if (!ret) {
-		stub = dma_fence_get_stub();
-		ret = sync_signal(file, sigs, req->sig_count, stub);
-		dma_fence_put(stub);
+		fence = dma_fence_get_stub();
+		ret = sync_signal(file, sigs, req->sig_count, fence);
+		dma_fence_put(fence);
 	}
 out:
 	if (!IS_ERR(ops))
@@ -1231,6 +1379,32 @@ static int ioctl_channel_free(struct drm_device *dev, void *data, struct drm_fil
 }
 
 static void push_dump(struct nv_cli *cli, u32 chid, u64 va, u32 len);
+
+/*
+ * The job may touch any object mapped in the VM. Shared objects (dma-buf exported or
+ * imported) get its fence in their reservation, as nouveau does through drm_gpuvm
+ * (BOOKKEEP usage: explicit-sync users and "busy" queries; WSI sync goes through syncobjs
+ * and DMA_BUF_IOCTL_IMPORT/EXPORT_SYNC_FILE). One reservation locked at a time.
+ */
+static void exec_fence_shared(struct nv_cli *cli, struct dma_fence *fence)
+{
+	static atomic64_t gen = ATOMIC64_INIT(0);
+	u64 g = atomic64_inc_return(&gen);
+	struct nv_vma *v;
+
+	list_for_each_entry(v, &cli->vmas, link) {
+		struct drm_gem_object *obj = v->bo ? &v->bo->base : NULL;
+
+		if (!obj || (!obj->dma_buf && !obj->import_attach) || v->bo->exec_gen == g)
+			continue;
+		v->bo->exec_gen = g;	/* once per object per job */
+		if (dma_resv_lock(obj->resv, NULL))
+			continue;
+		if (!dma_resv_reserve_fences(obj->resv, 1))
+			dma_resv_add_fence(obj->resv, fence, DMA_RESV_USAGE_BOOKKEEP);
+		dma_resv_unlock(obj->resv);
+	}
+}
 static void uapi_boost(struct nvdrv_dev *nv);
 #define HOST_NON_STALL_INTERRUPT	0x20
 #define HOST_MEM_OP_A		0x28
@@ -1324,6 +1498,7 @@ static int ioctl_exec(struct drm_device *dev, void *data, struct drm_file *file)
 	}
 	dma_fence_put(u->last);
 	u->last = dma_fence_get(fence);
+	exec_fence_shared(cli, fence);
 	uapi_boost(nv);
 unlock:
 	up_read(&nv->uapi.evict_sem);
@@ -1752,6 +1927,12 @@ int nv_uapi_open(struct drm_device *dev, struct drm_file *file)
 	INIT_LIST_HEAD(&cli->vmas);
 	INIT_LIST_HEAD(&cli->vm.pts);
 	idr_init(&cli->chans);
+	INIT_LIST_HEAD(&cli->dead);
+	cli->bind_wq = alloc_ordered_workqueue("nvdrv-bind", 0);
+	if (!cli->bind_wq) {
+		kfree(cli);
+		return -ENOMEM;
+	}
 	file->driver_priv = cli;
 	return 0;
 }
@@ -1767,6 +1948,8 @@ void nv_uapi_postclose(struct drm_device *dev, struct drm_file *file)
 	if (!cli)
 		return;
 	nv = cli->nv;
+	destroy_workqueue(cli->bind_wq);	/* runs every queued bind first */
+	free_dead_vmas(cli);
 	idr_for_each_entry(&cli->chans, u, id)
 		uchan_free(cli, u);
 	idr_destroy(&cli->chans);

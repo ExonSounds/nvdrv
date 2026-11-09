@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 #include <xf86drm.h>
 #include <drm/nouveau_drm.h>
@@ -229,6 +230,127 @@ int main(int argc, char **argv)
 		       ((volatile uint32_t *)vram)[i]);
 	struct drm_nouveau_channel_free cf2 = { .channel = ca2.channel };
 	CHECK(drmCommandWrite(fd, DRM_NOUVEAU_CHANNEL_FREE, &cf2, sizeof(cf2)));
+
+	/*
+	 * nvktest sync: (1) a channel stalled on a semaphore the CPU releases later; meanwhile
+	 * (2) an unmap returns at once, (3) CPU_PREP from a second client: busy for an object the
+	 * stalled client maps (dma-buf shared), idle for one only the second client holds,
+	 * (4) an asynchronous VM_BIND waiting on a syncobj returns at once and runs once the GPU
+	 * signals it; the new mapping then works.
+	 */
+	if (argc > 1 && !strcmp(argv[1], "sync")) {
+		uint32_t hshare, hgate, hnew, so_w, so_s, so_job;
+		void *mshare, *mgate, *mnew;
+		struct timespec t0, t1;
+		int fd2, prime, okc = 0;
+
+		CHECK(bo_new(0x10000, NOUVEAU_GEM_DOMAIN_VRAM, &hshare, &mshare));
+		CHECK(bo_new(0x10000, NOUVEAU_GEM_DOMAIN_GART, &hgate, &mgate));
+		CHECK(bo_new(0x10000, NOUVEAU_GEM_DOMAIN_VRAM, &hnew, &mnew));
+		*(volatile uint32_t *)mgate = 0;
+		CHECK(bind(hshare, 0x60000000, 0x10000, DRM_NOUVEAU_VM_BIND_OP_MAP));
+		CHECK(bind(hgate, 0x61000000, 0x10000, DRM_NOUVEAU_VM_BIND_OP_MAP));
+		CHECK(drmSyncobjCreate(fd, 0, &so_job));
+		/* (1) stall: host acquire (>= 1) on the gate word, then a compute write */
+		p = pb;
+		mthd(0, 0x005c, 5, 0x61000000, 0x0, 1, 0, 0x2 /* ACQ_STRICT_GEQ */);
+		mthd(1, 0x0000, 1, 0xc7c0);
+		mthd(1, 0x1b00, 4, 0x0, 0x60000000, 0x51a11ed, 1u << 28);
+		ep.va = 0x10000000;
+		ep.va_len = (uint32_t)((char *)p - (char *)pb);
+		struct drm_nouveau_sync sj = { .flags = DRM_NOUVEAU_SYNC_SYNCOBJ, .handle = so_job };
+		ex.channel = ca.channel;
+		ex.wait_count = 0;
+		ex.sig_count = 1;
+		ex.sig_ptr = (uintptr_t)&sj;
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_EXEC, &ex, sizeof(ex)));
+		usleep(20000);
+		printf("  stalled job: syncobj %s\n", drmSyncobjWait(fd, &so_job, 1, 0, 0, NULL) ? "busy (expected)" : "signalled?!");
+
+		/* (2) unmap something unrelated while the GPU is busy */
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		CHECK(bind(0, 0x20000000, 0x10000, DRM_NOUVEAU_VM_BIND_OP_UNMAP));
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		double ums = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+		printf("  unmap while busy: %.2f ms\n", ums);
+		okc += ums < 100;
+
+		/* (3) second client: CPU_PREP on the shared object vs. its own object */
+		{	/* a second client on the same render node */
+			char lnk[64], path[256] = "";
+
+			snprintf(lnk, sizeof(lnk), "/proc/self/fd/%d", fd);
+			if (readlink(lnk, path, sizeof(path) - 1) < 0)
+				return 1;
+			fd2 = open(path, O_RDWR | O_CLOEXEC);
+			if (fd2 < 0)
+				return 1;
+		}
+		uint32_t himp, hown;
+		CHECK(drmPrimeHandleToFD(fd, hshare, DRM_CLOEXEC, &prime));
+		CHECK(drmPrimeFDToHandle(fd2, prime, &himp));
+		{
+			int save = fd;
+			void *dummy;
+
+			fd = fd2;
+			CHECK(bo_new(0x10000, NOUVEAU_GEM_DOMAIN_VRAM, &hown, &dummy));
+			fd = save;
+		}
+		struct drm_nouveau_gem_cpu_prep cp = { .handle = himp, .flags = NOUVEAU_GEM_CPU_PREP_NOWAIT };
+		int r1 = drmCommandWrite(fd2, DRM_NOUVEAU_GEM_CPU_PREP, &cp, sizeof(cp));
+		cp.handle = hown;
+		int r2 = drmCommandWrite(fd2, DRM_NOUVEAU_GEM_CPU_PREP, &cp, sizeof(cp));
+		printf("  CPU_PREP nowait from client 2: shared object %d (%s), own object %d (%s)\n", r1,
+		       r1 == -EBUSY ? "busy, correct" : "WRONG", r2, r2 == 0 ? "idle, correct" : "WRONG");
+		okc += r1 == -EBUSY && r2 == 0;
+
+		/* (4) asynchronous map of hnew, waiting on so_w (nothing submitted to it yet) */
+		CHECK(drmSyncobjCreate(fd, 0, &so_w));
+		CHECK(drmSyncobjCreate(fd, 0, &so_s));
+		struct drm_nouveau_sync bw = { .flags = DRM_NOUVEAU_SYNC_SYNCOBJ, .handle = so_w };
+		struct drm_nouveau_sync bs = { .flags = DRM_NOUVEAU_SYNC_SYNCOBJ, .handle = so_s };
+		struct drm_nouveau_vm_bind_op bo = { .op = DRM_NOUVEAU_VM_BIND_OP_MAP, .handle = hnew,
+						     .addr = 0x62000000, .range = 0x10000 };
+		struct drm_nouveau_vm_bind vb = { .op_count = 1, .op_ptr = (uintptr_t)&bo,
+						  .flags = DRM_NOUVEAU_VM_BIND_RUN_ASYNC, .wait_count = 1,
+						  .wait_ptr = (uintptr_t)&bw, .sig_count = 1, .sig_ptr = (uintptr_t)&bs };
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_VM_BIND, &vb, sizeof(vb)));
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		ums = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+		int pending = drmSyncobjWait(fd, &so_s, 1, 0, 0, NULL) != 0;
+		printf("  async VM_BIND returned in %.2f ms, its fence %s\n", ums, pending ? "pending (expected)" : "signalled?!");
+		okc += ums < 100 && pending;
+
+		/* release the stalled job: it signals so_job; chain so_w to it via a tiny job */
+		*(volatile uint32_t *)mgate = 1;
+		r = drmSyncobjWait(fd, &so_job, 1, INT64_MAX, 0, NULL);
+		printf("  stalled job done: %d, shared object reads 0x%08x\n", r, *(volatile uint32_t *)mshare);
+		okc += !r && *(volatile uint32_t *)mshare == 0x51a11ed;
+		p = (uint32_t *)((char *)pb + 0x2000);
+		uint32_t *st = p;
+		mthd(1, 0x1b00, 4, 0x0, 0x60000000, 0x0f, 1u << 28);
+		ep.va = 0x10002000;
+		ep.va_len = (uint32_t)((char *)p - (char *)st);
+		ex.sig_ptr = (uintptr_t)&bw;	/* this job signals the bind's wait */
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_EXEC, &ex, sizeof(ex)));
+		r = drmSyncobjWait(fd, &so_s, 1, INT64_MAX, 0, NULL);
+		/* use the new mapping */
+		p = (uint32_t *)((char *)pb + 0x3000);
+		st = p;
+		mthd(1, 0x1b00, 4, 0x0, 0x62000000, 0xa5ac0de, 1u << 28);
+		ep.va = 0x10003000;
+		ep.va_len = (uint32_t)((char *)p - (char *)st);
+		ex.sig_ptr = (uintptr_t)&sj;
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_EXEC, &ex, sizeof(ex)));
+		int r3 = drmSyncobjWait(fd, &so_job, 1, INT64_MAX, 0, NULL);
+		printf("  async bind fence: %d, GPU write through the new mapping: %d, reads 0x%08x\n", r, r3,
+		       *(volatile uint32_t *)mnew);
+		okc += !r && !r3 && *(volatile uint32_t *)mnew == 0xa5ac0de;
+		printf("sync: %d/5 -> %s\n", okc, okc == 5 ? "PASS" : "FAIL");
+		return 0;
+	}
 
 	/*
 	 * nvktest pages: 64 KiB pages and their transitions. A 256 KiB VRAM object (big pages)
