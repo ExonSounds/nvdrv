@@ -270,6 +270,13 @@ static int dp_aux(struct nvdrv_dev *nv, u32 dpy, bool write, u32 addr, u8 *buf, 
 	return le32_to_cpu(a.size) == len ? 0 : -EIO;
 }
 
+/* DPCD access for other units (caller holds gsp_lock). */
+int nv_disp_dpcd(struct nvdrv_dev *nv, u32 dpy, bool write, u32 addr, u8 *buf, u32 len)
+{
+	lockdep_assert_held(&nv->gsp_lock);
+	return dp_aux(nv, dpy, write, addr, buf, len);
+}
+
 /*
  * Bring up the DP link of display dpy: read the sink's capabilities, power it up,
  * get a SOR assigned, and have RM train the link at the highest rate that works.
@@ -294,6 +301,7 @@ static int dp_link_up(struct nvdrv_dev *nv, struct nv_disp_dpy *d)
 	d->max_link_bw = caps[1];
 	d->max_lanes = caps[2] & 0x1f;
 	d->enhanced_framing = !!(caps[2] & 0x80);
+	d->msa_ignore = !!(caps[7] & 0x40);	/* DOWN_STREAM_PORT_COUNT.MSA_TIMING_PAR_IGNORED */
 	/* DP 1.4: the real capabilities (e.g. HBR3) are in the extended receiver caps at 0x2200 */
 	if (caps[0xe] & 0x80) {
 		u8 ext[16];

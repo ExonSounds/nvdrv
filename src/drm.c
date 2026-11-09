@@ -385,6 +385,8 @@ static void nv_crtc_mode_set_nofb(struct drm_crtc *crtc)
 
 	if (drm_mode_equal(dm, &d->mode) || !drm_dev_enter(&d->dev, &idx))
 		return;
+	if (READ_ONCE(d->nv->evo.vrr_active))	/* one-shot mode off for the modeset; flush re-enables */
+		nv_disp_vrr(d->nv, false, 0);
 	drm_mode_to_nv(dm, &m);
 	if (nv_disp_set_mode(d->nv, &m)) {
 		drm_err(&d->dev, "modeset to " DRM_MODE_FMT " failed\n", DRM_MODE_ARG(dm));
@@ -522,6 +524,16 @@ static void nv_crtc_atomic_flush(struct drm_crtc *crtc, struct drm_atomic_commit
 		nv_crtc_color(to_nv_drm(crtc->dev), cs);
 		drm_dev_exit(idx);
 	}
+	if (cs->active && drm_dev_enter(crtc->dev, &idx)) {	/* VRR_ENABLED -> head one-shot mode */
+		struct nv_drm *d = to_nv_drm(crtc->dev);
+		const struct drm_display_info *di = &d->connector.display_info;
+		bool want = cs->vrr_enabled && di->monitor_range.min_vfreq &&
+			    d->connector.state && d->connector.state->crtc == crtc;
+
+		if (want != READ_ONCE(d->nv->evo.vrr_active))
+			nv_disp_vrr(d->nv, want, want ? 1000000 / di->monitor_range.min_vfreq : 0);
+		drm_dev_exit(idx);
+	}
 	if (cs->async_flip && cs->event) {	/* tearing flip: done as soon as the window has it */
 		spin_lock_irq(&crtc->dev->event_lock);
 		drm_crtc_send_vblank_event(crtc, cs->event);
@@ -573,6 +585,9 @@ static int nv_connector_get_modes(struct drm_connector *connector)
 	int n;
 
 	drm_edid_connector_update(connector, d->edid);	/* EDID property + display info */
+	/* Adaptive-Sync: the sink ignores MSA timing and the EDID has a refresh range */
+	drm_connector_set_vrr_capable_property(connector, nv_disp_vrr_capable(d->nv) &&
+					       connector->display_info.monitor_range.min_vfreq);
 	n = drm_edid_connector_add_modes(connector);	/* base, CTA-861 and DisplayID timings */
 	if (n)
 		return n;
@@ -820,6 +835,7 @@ int nv_drm_register(struct nvdrv_dev *nv)
 	ret = drm_connector_attach_encoder(&d->connector, &d->encoder);
 	if (ret)
 		goto err;
+	drm_connector_attach_vrr_capable_property(&d->connector);
 	ret = drm_vblank_init(dev, 1);
 	if (ret)
 		goto err;

@@ -6,6 +6,7 @@
  * buffer in VRAM). Draws moving colour bars for N seconds and reports the flip rate.
  *   cc -O2 -o kmsgl tools/kmsgl.c $(pkg-config --cflags --libs gbm egl glesv2 libdrm)
  *   [KMSGL_HZ=refresh] [KMSGL_BL=1] [KMSGL_ASYNC=1 (tearing flips)] [KMSGL_ALT=1] kmsgl
+ *   KMSGL_VRR=1: VRR_ENABLED on the CRTC; KMSGL_FPS=n: frame limiter; flip spacing is reported
  *   KMSGL_ALT: frames alternate dim red / dim blue: even purple with vsync, bands when tearing [/dev/dri/card0] [seconds]
  */
 #include <EGL/egl.h>
@@ -69,9 +70,41 @@ static void probe_flip(unsigned int vdisplay)
 	probe_us += (b.tv_sec - a.tv_sec) * 1e6 + (b.tv_nsec - a.tv_nsec) / 1e3;
 }
 
+/* flip completion times: spacing statistics (VRR test) */
+static double flip_last, flip_sum, flip_sq, flip_min = 1e9, flip_max;
+static int flip_n;
+
 static void flip_done(int fd, unsigned int seq, unsigned int s, unsigned int us, void *data)
 {
+	double t = s * 1e3 + us / 1e3;
+
+	if (flip_last) {
+		double d = t - flip_last;
+
+		flip_sum += d;
+		flip_sq += d * d;
+		flip_min = d < flip_min ? d : flip_min;
+		flip_max = d > flip_max ? d : flip_max;
+		flip_n++;
+	}
+	flip_last = t;
 	pending = 0;
+}
+
+static void set_crtc_prop(uint32_t crtc, const char *name, uint64_t val)
+{
+	drmModeObjectProperties *p = drmModeObjectGetProperties(fd, crtc, DRM_MODE_OBJECT_CRTC);
+	uint32_t i;
+
+	for (i = 0; p && i < p->count_props; i++) {
+		drmModePropertyRes *r = drmModeGetProperty(fd, p->props[i]);
+
+		if (r && !strcmp(r->name, name) &&
+		    drmModeObjectSetProperty(fd, crtc, DRM_MODE_OBJECT_CRTC, r->prop_id, val))
+			perror(name);
+		drmModeFreeProperty(r);
+	}
+	drmModeFreeObjectProperties(p);
 }
 
 static uint32_t fb_for(struct gbm_bo *bo)
@@ -209,6 +242,12 @@ int main(int argc, char **argv)
 			glClearColor(fabsf(sinf(h * 6.28f)), fabsf(sinf(h * 6.28f + 2.1f)), fabsf(sinf(h * 6.28f + 4.2f)), 1);
 			glClear(GL_COLOR_BUFFER_BIT);
 		}
+		if (getenv("KMSGL_FPS")) {	/* frame limiter: frame n not before t0 + n / fps */
+			double due = frames / atof(getenv("KMSGL_FPS"));
+
+			while (now() - t0 < due)
+				usleep(200);
+		}
 		eglSwapBuffers(dpy, surf);
 		bo = gbm_surface_lock_front_buffer(gs);
 		if (!prev) {
@@ -216,6 +255,7 @@ int main(int argc, char **argv)
 				perror("SetCrtc");
 				return 1;
 			}
+			set_crtc_prop(crtc, "VRR_ENABLED", !!getenv("KMSGL_VRR"));
 		} else {
 			pending = 1;
 			if (drmModePageFlip(fd, crtc, fb_for(bo), DRM_MODE_PAGE_FLIP_EVENT |
@@ -244,6 +284,14 @@ int main(int argc, char **argv)
 		}
 	}
 	printf("%d frames in %.1f s: %.1f fps\n", frames, t, frames / t);
+	if (flip_n) {
+		double mean = flip_sum / flip_n;
+
+		printf("flip spacing: mean %.3f ms, stddev %.3f, min %.3f, max %.3f\n", mean,
+		       sqrt(flip_sq / flip_n - mean * mean), flip_min, flip_max);
+	}
+	if (getenv("KMSGL_VRR"))
+		set_crtc_prop(crtc, "VRR_ENABLED", 0);
 	if (probe_fd >= 0 && probe_n)
 		printf("probe: %d flips seen, %d not seen; %.0f %% took effect during active scanout, %.1f us after the ioctl\n",
 		       probe_n, probe_miss, 100.0 * probe_active / probe_n, probe_us / probe_n);

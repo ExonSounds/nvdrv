@@ -100,6 +100,17 @@
 #define OLUT_SLOT				0x4000
 
 #define C67D_HEAD_SET_OCSC0CONTROL		0x2240
+#define C67D_HEAD_SET_STALL_LOCK		0x2034
+#define   STALL_LOCK_ENABLE			BIT(0)
+#define   STALL_LOCK_ONE_SHOT			BIT(2)
+#define   STALL_LOCK_UNSTALL_LINE_LOCK		BIT(12)
+#define C67D_HEAD_SET_DISPLAY_RATE		0x21a8
+#define   DISPLAY_RATE_ONE_SHOT			BIT(0)
+#define   DISPLAY_RATE_MIN_REFRESH		BIT(2)
+
+#define NV0073_CTRL_CMD_SYSTEM_VRR_DISPLAY_INFO		0x73012c
+#define NV0073_CTRL_CMD_SYSTEM_CLEAR_ELV_BLOCK		0x73012e
+#define NV0073_CTRL_CMD_SYSTEM_ARM_LIGHTWEIGHT_SUPERVISOR	0x73012f
 #define C67D_HEAD_SET_OCSC0COEFFICIENT_C00	0x2244
 #define C67D_HEAD_SET_OLUT_CONTROL		0x2280
 #define   OLUT_INTERPOLATE			BIT(0)
@@ -851,7 +862,8 @@ void nv_disp_cursor_move(struct nvdrv_dev *nv, int x, int y)
 	if (e->curs_ready && !readl_poll_timeout(e->curs_user + C67A_FREE, free, (free & 0x3f) >= 2,
 						 1, 20000)) {
 		iowrite32((u16)x | (u32)(u16)y << 16, e->curs_user + C67A_SET_CURSOR_HOT_SPOT_POINT_OUT);
-		iowrite32(0, e->curs_user + C67A_UPDATE);
+		/* under VRR, RELEASE_ELV starts a frame so the move shows at once (nvkms ReleaseElvC3) */
+		iowrite32(READ_ONCE(e->vrr_active) ? 1 : 0, e->curs_user + C67A_UPDATE);
 	}
 	mutex_unlock(&e->curs_lock);
 }
@@ -892,6 +904,116 @@ int nv_disp_color(struct nvdrv_dev *nv, const u16 *lut, const u32 *ocsc)
 	dev_dbg(&nv->pdev->dev, "color: lut %s, ctm %s, slot 0x%x: %d, core except 0x%08x err 0x%08x\n",
 		lut ? "custom" : "identity", ocsc ? "custom" : "identity", off, ret,
 		nv_rd32(nv, 0x611020), nv_rd32(nv, 0x611028));
+out:
+	mutex_unlock(&e->win_lock);
+	mutex_unlock(&nv->gsp_lock);
+	return ret;
+}
+
+/* ---- variable refresh (Adaptive-Sync), nvkms nvEnableVrr + SetVrrActive ---- */
+
+static struct nv_disp_dpy *active_dpy(struct nvdrv_dev *nv)
+{
+	struct nv_disp_dpy *d = NULL;
+	u32 i;
+
+	for (i = 0; i < nv->disp.ndpy; i++)
+		if (nv->disp.dpy[i].connected && nv->disp.dpy[i].mode.valid && nv->disp.dpy[i].link_lanes)
+			d = &nv->disp.dpy[i];
+	return d;
+}
+
+bool nv_disp_vrr_capable(struct nvdrv_dev *nv)
+{
+	struct nv_disp_dpy *d;
+	bool ret;
+
+	mutex_lock(&nv->gsp_lock);
+	d = active_dpy(nv);
+	ret = d && d->msa_ignore && (d->protocol == 0x8 || d->protocol == 0x9);	/* DP_A/DP_B */
+	mutex_unlock(&nv->gsp_lock);
+	return ret;
+}
+
+/* NV0073_CTRL_SYSTEM_ARM_LIGHTWEIGHT_SUPERVISOR_PARAMS */
+static void vrr_lwsv(struct nvdrv_dev *nv, struct nv_disp_dpy *d, bool vrr, bool arm)
+{
+	struct { __le32 sub_device, display_id; u8 arm, vrr, pad[2]; __le32 v_active, vfp; } p = {};
+	const struct nv_mode *m = &d->mode;
+
+	p.display_id = cpu_to_le32(d->id);
+	p.arm = arm;
+	p.vrr = vrr;
+	p.v_active = cpu_to_le32(m->vdisplay);
+	p.vfp = cpu_to_le32(m->vsync_start - m->vdisplay + 1);	/* rasterSize.y - rasterBlankStart.y */
+	if (nv_rm_control(nv, nv->rm.h_client, nv->disp.h_common, NV0073_CTRL_CMD_SYSTEM_ARM_LIGHTWEIGHT_SUPERVISOR,
+			  &p, sizeof(p)))
+		dev_warn(&nv->pdev->dev, "vrr: ARM_LIGHTWEIGHT_SUPERVISOR failed\n");
+}
+
+/*
+ * Adaptive-Sync on the active head. Enable: the sink ignores MSA timing (DPCD 0x107 bit 7,
+ * DPLib setIgnoreMSAEnable), RM is told the head drives a VRR display, then one core update
+ * (with a lightweight supervisor armed around it) puts the head in one-shot mode: it stalls
+ * after each frame until the next UPDATE with RELEASE_ELV, or refreshes on its own after
+ * @timeout_us (the panel's minimum rate). Disable: continuous mode, ELV block cleared.
+ */
+int nv_disp_vrr(struct nvdrv_dev *nv, bool enable, u32 timeout_us)
+{
+	struct nv_evo *e = &nv->evo;
+	struct nv_evo_chan *core = &e->core;
+	struct nv_disp_dpy *d;
+	struct { __le32 sub_device, display_id; u8 add, pad[3]; } info = {};
+	struct { __le32 sub_device, display_id; } elv = {};
+	u8 v;
+	int ret;
+
+	mutex_lock(&nv->gsp_lock);
+	mutex_lock(&e->win_lock);
+	d = active_dpy(nv);
+	ret = -ENODEV;
+	if (!d || !e->active || (enable && !d->msa_ignore))
+		goto out;
+	ret = 0;
+	if (enable == e->vrr_active)
+		goto out;
+	if (enable && !e->vrr_msa) {
+		ret = nv_disp_dpcd(nv, d->id, false, 0x107, &v, 1);
+		if (!ret) {
+			v |= 0x80;	/* DOWNSPREAD_CTRL.MSA_TIMING_PAR_IGNORE_EN */
+			ret = nv_disp_dpcd(nv, d->id, true, 0x107, &v, 1);
+		}
+		if (ret)
+			goto out;
+		e->vrr_msa = true;
+		info.display_id = cpu_to_le32(d->id);
+		info.add = 1;
+		nv_rm_control(nv, nv->rm.h_client, nv->disp.h_common, NV0073_CTRL_CMD_SYSTEM_VRR_DISPLAY_INFO,
+			      &info, sizeof(info));
+	}
+	ret = nv_evo_begin(nv, core, 6 * 8);
+	if (ret)
+		goto out;
+	vrr_lwsv(nv, d, enable, true);
+	if (!enable) {
+		elv.display_id = cpu_to_le32(d->id);
+		nv_rm_control(nv, nv->rm.h_client, nv->disp.h_common, NV0073_CTRL_CMD_SYSTEM_CLEAR_ELV_BLOCK,
+			      &elv, sizeof(elv));
+	}
+	timeout_us = min_t(u32, timeout_us, 0x3fffff);	/* MIN_REFRESH_INTERVAL 25:4 */
+	m1(core, C67D_HEAD(e->head, C67D_HEAD_SET_STALL_LOCK), STALL_LOCK_UNSTALL_LINE_LOCK |
+	   (enable ? STALL_LOCK_ENABLE | STALL_LOCK_ONE_SHOT : 0));
+	m1(core, C67D_HEAD(e->head, C67D_HEAD_SET_DISPLAY_RATE), enable ?
+	   DISPLAY_RATE_ONE_SHOT | timeout_us << 4 | (timeout_us ? DISPLAY_RATE_MIN_REFRESH : 0) : 0);
+	m1(core, C67D_SET_INTERLOCK_FLAGS, 0);
+	m1(core, C67D_SET_WINDOW_INTERLOCK_FLAGS, 0);
+	m1(core, C67D_UPDATE, 1);	/* RELEASE_ELV */
+	ret = nv_evo_kick(nv, core);
+	vrr_lwsv(nv, d, enable, false);
+	if (!ret)
+		e->vrr_active = enable;
+	dev_info(&nv->pdev->dev, "vrr: %s (min refresh interval %u us): %d, core except 0x%08x err 0x%08x\n",
+		 enable ? "on" : "off", timeout_us, ret, nv_rd32(nv, 0x611020), nv_rd32(nv, 0x611028));
 out:
 	mutex_unlock(&e->win_lock);
 	mutex_unlock(&nv->gsp_lock);

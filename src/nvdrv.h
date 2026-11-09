@@ -301,6 +301,7 @@ struct nv_disp_dpy {
 	/* DisplayPort sink and link */
 	u8 dpcd_rev, max_link_bw, max_lanes;
 	bool enhanced_framing;
+	bool msa_ignore;	/* DPCD 0x007 bit 6: can ignore MSA timing (Adaptive-Sync) */
 	u32 sor;		/* assigned SOR, ~0 = none */
 	u32 link_lanes, link_bw;
 };
@@ -354,6 +355,8 @@ struct nv_evo {
 	void __iomem *lut_cpu;
 	bool lut_ready;
 	bool composed;				/* window in composition (OLUT/OCSC0 on), not bypass */
+	bool vrr_active;			/* head in one-shot (VRR) mode */
+	bool vrr_msa;				/* sink told to ignore MSA timing */
 	u32 olut_off;				/* OLUT slot in use (offset in the LUT buffer) */
 	u32 ocsc[12];				/* OCSC0 matrix in use (S5.16; DRM CTM) */
 };
@@ -738,6 +741,9 @@ int nv_disp_set_mode(struct nvdrv_dev *nv, const struct nv_mode *m);
 int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch, int block_h, bool immediate);
 int nv_disp_cursor_init(struct nvdrv_dev *nv);
 int nv_disp_color(struct nvdrv_dev *nv, const u16 *lut, const u32 *ocsc);
+int nv_disp_vrr(struct nvdrv_dev *nv, bool enable, u32 timeout_us);
+bool nv_disp_vrr_capable(struct nvdrv_dev *nv);
+int nv_disp_dpcd(struct nvdrv_dev *nv, u32 dpy, bool write, u32 addr, u8 *buf, u32 len);
 #define NV_OLUT_ENTRIES		1025	/* 1024 + the last repeated (interpolation) */
 int nv_disp_cursor_image(struct nvdrv_dev *nv, u64 vram, const void *src, u32 src_pitch, u32 size);
 int nv_disp_cursor_off(struct nvdrv_dev *nv);

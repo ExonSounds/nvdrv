@@ -543,7 +543,15 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
         damage clips re-upload the image; moves are one PIO write.
       - The old "bypass + CSC/LUT disables → window error 0x2" was TMO_CONTROL = 0 (invalid argument); not sent.
 - [ ] **Overlay planes** (direct scanout of fullscreen apps).
-- [ ] **Adaptive sync (VRR / FreeSync)**.
+- [x] **Adaptive sync (VRR / FreeSync)** (2026-11-09), nvkms nvEnableVrr + SetVrrActive for DP Adaptive-Sync:
+      connector `vrr_capable` = DPCD 0x007 bit 6 (MSA_TIMING_PAR_IGNORED) + an EDID range (AOC Q27G42XE:
+      48–180 Hz); CRTC VRR_ENABLED → DPCD 0x107 bit 7 (MSA_TIMING_PAR_IGNORE_EN, once), VRR_DISPLAY_INFO
+      (0x73012c), then a core update with HEAD_SET_STALL_LOCK (enable, ONE_SHOT, line-lock unstall) and
+      HEAD_SET_DISPLAY_RATE (ONE_SHOT, MIN_REFRESH_INTERVAL = 1/min refresh) with ARM_LIGHTWEIGHT_SUPERVISOR
+      (0x73012f) armed around it; off: CONTINUOUS + CLEAR_ELV_BLOCK (0x73012e). Flips release the stall with
+      UPDATE RELEASE_ELV; cursor moves too while VRR is on. VRR is switched off around modesets.
+      `KMSGL_VRR=1 KMSGL_FPS=n tools/kmsgl`: 100 fps → flips 9.99 ms apart (stddev 0.14; 2.2 without VRR,
+      5.56/11.1 ms alternating), 72 fps → 13.9 ms; the monitor OSD shows 72 Hz.
 - [x] **Real vblank interrupts and timestamps** (2026-11-09): GSP-RM's kernel interrupt table gives the CPU the
       DISP stall vector (engine 2, vector 154 on GA104); head timing as kdispServiceLowLatencyIntrs_KERNEL /
       nouveau tu102_disp_intr: DISPATCH 0x611ec0 bit h → RM_INTR_STAT 0x611c00+4h bit 1 (LAST_DATA) → ack
