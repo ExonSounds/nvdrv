@@ -207,6 +207,15 @@ int nv_gsp_handle_event(struct nvdrv_dev *nv, u32 fn, struct nv_rpc_header *h, v
 	switch (fn) {
 	case NV_RPC_EVENT_RUN_CPU_SEQUENCER:
 		return gsp_run_sequencer(nv, payload, len);
+	case 0x1003:	/* POST_EVENT: rpc_post_event_v17_00, event data at 29 */
+		if (len >= 29) {
+			const u8 *p = payload;
+			u32 size = get_unaligned_le32(p + 24);
+
+			if (29 + size <= len)
+				nv_disp_event(nv, get_unaligned_le32(p + 4), p + 29, size);
+		}
+		break;
 	case 0x1020:	/* GSP_POST_NOCAT_RECORD: NV2080CtrlNocatJournalInsertRecord */
 		if (len >= 180) {
 			static const char *const types[] = { "unknown", "bugcheck", "engine", "tdr", "rc",

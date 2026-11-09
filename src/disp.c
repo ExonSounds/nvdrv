@@ -12,6 +12,8 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 
+#include <linux/unaligned.h>
+
 #include "nvdrv.h"
 
 #define NV04_DISPLAY_COMMON	0x0073
@@ -23,6 +25,14 @@
 #define NV0073_CTRL_CMD_SPECIFIC_GET_TYPE		0x730240
 #define NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2		0x730245
 #define NV0073_CTRL_CMD_SPECIFIC_OR_GET_INFO		0x73028b
+
+/* GSP-RM event notifications (nouveau r535_gsp_device_event_ctor) */
+#define NV01_EVENT_KERNEL_CALLBACK_EX			0x7e
+#define NV01_EVENT_CLIENT_RM				0x04000000
+#define NV2080_NOTIFIERS_HOTPLUG			1
+#define NV2080_NOTIFIERS_DP_IRQ				7
+#define NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION		0x20800301
+#define NVDRV_H_EVENT(n)				(0xd0007e00 + (n))
 
 struct nv0073_num_heads {
 	__le32 sub_device_instance, flags, num_heads;
@@ -117,6 +127,30 @@ static int disp_probe_locked(struct nvdrv_dev *nv)
 		if (ret)
 			return ret;
 		dp->h_common = h;
+	}
+
+	if (!dp->events) {	/* hotplug and DP IRQ (short pulse) notifications, repeating */
+		static const u32 ids[] = { NV2080_NOTIFIERS_HOTPLUG, NV2080_NOTIFIERS_DP_IRQ };
+		u32 i;
+
+		for (i = 0; i < ARRAY_SIZE(ids); i++) {
+			struct { __le32 h_parent_client, h_src, h_class, notify_index; __le64 data; } ev = {};
+			struct { __le32 event, action; u8 notify_state, pad[3]; __le32 info32; __le16 info16, pad2; } sn = {};
+
+			ev.h_parent_client = cpu_to_le32(rm->h_client);
+			ev.h_class = cpu_to_le32(NV01_EVENT_KERNEL_CALLBACK_EX);
+			ev.notify_index = cpu_to_le32(NV01_EVENT_CLIENT_RM | ids[i]);
+			sn.event = cpu_to_le32(ids[i]);
+			sn.action = cpu_to_le32(2);	/* REPEAT */
+			ret = nv_rm_alloc(nv, rm->h_client, rm->h_subdevice, NVDRV_H_EVENT(ids[i]),
+					  NV01_EVENT_KERNEL_CALLBACK_EX, &ev, sizeof(ev));
+			if (!ret)
+				ret = nv_rm_control(nv, rm->h_client, rm->h_subdevice,
+						    NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION, &sn, sizeof(sn));
+			if (ret)
+				dev_warn(dev, "disp: event %u subscription failed: %d\n", ids[i], ret);
+		}
+		dp->events = true;
 	}
 
 	ret = nv_rm_control(nv, rm->h_client, h, NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS, &nh, sizeof(nh));
@@ -548,10 +582,16 @@ bool nv_disp_mode_fits(struct nvdrv_dev *nv, const struct nv_mode *m)
 	struct nv_disp_dpy *d = first_dp(nv);
 	u32 tu, wm, hbs, vbs;
 
-	if (!d || !d->link_lanes || !m->clock_khz || !m->htotal || !m->vtotal)
+	if (!d || !m->clock_khz || !m->htotal || !m->vtotal)
 		return false;
 	if ((u64)ALIGN(m->hdisplay * 4, 256) * m->vdisplay > NV_FB_MAX)
 		return false;
+	if (!d->link_lanes) {	/* replugged, link not trained yet: judge by the sink's maximum */
+		if (!d->max_lanes || !d->max_link_bw)
+			return true;
+		return !dp_watermark(m, d->max_lanes, d->max_link_bw, d->enhanced_framing, true,
+				     &tu, &wm, &hbs, &vbs);
+	}
 	return !dp_watermark(m, d->link_lanes, d->link_bw, d->enhanced_framing, true, &tu, &wm, &hbs, &vbs);
 }
 
@@ -655,9 +695,108 @@ int nv_disp_power(struct nvdrv_dev *nv, bool on, const struct nv_mode *m)
 	mutex_unlock(&nv->gsp_lock);
 	if (!d)
 		return -ENODEV;
-	ret = nv_disp_set_mode(nv, m ? m : &d->mode);
+	if (!d->link_lanes) {	/* replugged: no trained link yet, the whole bring-up */
+		ret = nv_disp_bringup(nv);
+		if (!ret && m && memcmp(m, &d->mode, sizeof(*m)))
+			ret = nv_disp_set_mode(nv, m);
+	} else {
+		ret = nv_disp_set_mode(nv, m ? m : &d->mode);
+	}
 	dev_info(dev, "disp: display on: %d\n", ret);
 	return ret;
+}
+
+/* From the GSP message path (gsp_lock held): note the event, act on it in process context. */
+void nv_disp_event(struct nvdrv_dev *nv, u32 h_event, const u8 *data, u32 size)
+{
+	struct nv_disp *dp = &nv->disp;
+
+	if (h_event == NVDRV_H_EVENT(NV2080_NOTIFIERS_HOTPLUG) && size >= 8) {
+		atomic_or(get_unaligned_le32(data), &dp->hpd_plug);	/* Nv2080HotplugNotification */
+		atomic_or(get_unaligned_le32(data + 4), &dp->hpd_unplug);
+	} else if (h_event == NVDRV_H_EVENT(NV2080_NOTIFIERS_DP_IRQ) && size >= 4) {
+		atomic_or(get_unaligned_le32(data), &dp->hpd_irq);	/* Nv2080DpIrqNotification */
+	} else {
+		return;
+	}
+	schedule_work(&dp->hpd_work);
+}
+
+/*
+ * Connection changes without the full probe (which would forget the trained link): update
+ * the connected flags, read the EDID of newly connected displays, drop the link of
+ * disconnected ones. Caller holds gsp_lock.
+ */
+static void disp_refresh_locked(struct nvdrv_dev *nv)
+{
+	struct nv_disp *dp = &nv->disp;
+	struct nv0073_connect_state cs = {};
+	struct nv0073_edid_v2 *edid;
+	u32 i;
+
+	cs.display_mask = cpu_to_le32(dp->supported);
+	if (nv_rm_control(nv, nv->rm.h_client, dp->h_common, NV0073_CTRL_CMD_SYSTEM_GET_CONNECT_STATE,
+			  &cs, sizeof(cs)))
+		return;
+	dp->connected = le32_to_cpu(cs.display_mask);
+	edid = kzalloc(sizeof(*edid), GFP_KERNEL);
+	for (i = 0; i < dp->ndpy; i++) {
+		struct nv_disp_dpy *d = &dp->dpy[i];
+		bool now = dp->connected & d->id;
+
+		if (!now) {
+			d->connected = false;
+			d->link_lanes = 0;
+			continue;
+		}
+		if (d->connected || !edid)
+			continue;
+		d->connected = true;
+		d->edid_size = 0;
+		memset(edid, 0, sizeof(*edid));
+		edid->display_id = cpu_to_le32(d->id);
+		edid->buffer_size = cpu_to_le32(NV_EDID_MAX);
+		if (!nv_rm_control(nv, nv->rm.h_client, dp->h_common, NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2,
+				   edid, sizeof(*edid))) {
+			d->edid_size = min_t(u32, le32_to_cpu(edid->buffer_size), NV_EDID_MAX);
+			memcpy(d->edid, edid->edid, d->edid_size);
+			edid_preferred_mode(d);
+		}
+	}
+	kfree(edid);
+}
+
+void nv_disp_hpd_work(struct work_struct *w)
+{
+	struct nvdrv_dev *nv = container_of(w, struct nvdrv_dev, disp.hpd_work);
+	struct nv_disp *dp = &nv->disp;
+	u32 plug = atomic_xchg(&dp->hpd_plug, 0), unplug = atomic_xchg(&dp->hpd_unplug, 0);
+	u32 irq = atomic_xchg(&dp->hpd_irq, 0);
+	struct nv_disp_dpy *d;
+	bool relink = false;
+	u8 st[4] = {};
+
+	dev_info(&nv->pdev->dev, "disp: hotplug: plug 0x%x unplug 0x%x, DP IRQ 0x%x\n", plug, unplug, irq);
+	mutex_lock(&nv->gsp_lock);
+	if (!nv->gsp_running) {
+		mutex_unlock(&nv->gsp_lock);
+		return;
+	}
+	if (plug | unplug)
+		disp_refresh_locked(nv);
+	d = first_dp(nv);
+	/* short pulse on the driven display: the sink reports a link problem */
+	if (irq && d && (irq & d->id) && nv->evo.active && d->link_lanes && !dp_link_ok(nv, d, st)) {
+		dev_warn(&nv->pdev->dev, "disp: DP IRQ: link lost (%*ph), retraining\n", 4, st);
+		relink = true;
+	}
+	mutex_unlock(&nv->gsp_lock);
+	if (relink) {
+		nv_disp_power(nv, false, NULL);
+		nv_disp_power(nv, true, NULL);
+	}
+	if (plug | unplug)
+		nv_drm_hotplug(nv);
 }
 
 void nv_disp_dp_status_show(struct nvdrv_dev *nv, struct seq_file *m)

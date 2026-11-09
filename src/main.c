@@ -1001,6 +1001,7 @@ static int nvdrv_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	mutex_init(&nv->mem.lock);
 	mutex_init(&nv->evo.win_lock);
 	mutex_init(&nv->evo.curs_lock);
+	INIT_WORK(&nv->disp.hpd_work, nv_disp_hpd_work);
 	nv_uapi_init(nv);
 	ret = devm_add_action_or_reset(&pdev->dev, nv_put_action, nv);
 	if (ret)
@@ -1039,6 +1040,7 @@ static void nvdrv_remove(struct pci_dev *pdev)
 	struct nvdrv_dev *nv = pci_get_drvdata(pdev);
 
 	debugfs_remove_recursive(nv->dbg);
+	cancel_work_sync(&nv->disp.hpd_work);
 	nv_drm_unregister(nv);	/* before nv_gsp_fini: no BAR1 access after the unload/FLR */
 	nv_gsp_fini(nv);	/* GSP-RM unload (or FLR) first: it DMAs into what follows */
 	nv_rpc_fini(nv);

@@ -308,6 +308,9 @@ struct nv_disp_dpy {
 
 struct nv_disp {
 	u32 h_common;		/* NV04_DISPLAY_COMMON, 0 = not allocated */
+	bool events;		/* HOTPLUG / DP_IRQ notifications subscribed */
+	struct work_struct hpd_work;
+	atomic_t hpd_plug, hpd_unplug, hpd_irq;	/* display masks from GSP-RM events */
 	u32 num_heads, supported, connected;
 	u32 ndpy;
 	struct nv_disp_dpy dpy[NV_DISP_MAX_DPY];
@@ -743,6 +746,10 @@ int nv_disp_cursor_init(struct nvdrv_dev *nv);
 int nv_disp_color(struct nvdrv_dev *nv, const u16 *lut, const u32 *ocsc);
 int nv_disp_vrr(struct nvdrv_dev *nv, bool enable, u32 timeout_us);
 int nv_disp_power(struct nvdrv_dev *nv, bool on, const struct nv_mode *m);
+void nv_disp_event(struct nvdrv_dev *nv, u32 h_event, const u8 *data, u32 size);
+void nv_disp_hpd_work(struct work_struct *w);
+void nv_drm_hotplug(struct nvdrv_dev *nv);
+bool nv_drm_connector_state(struct nvdrv_dev *nv, u8 *edid, u32 *edid_size);
 bool nv_disp_vrr_capable(struct nvdrv_dev *nv);
 int nv_disp_dpcd(struct nvdrv_dev *nv, u32 dpy, bool write, u32 addr, u8 *buf, u32 len);
 #define NV_OLUT_ENTRIES		1025	/* 1024 + the last repeated (interpolation) */

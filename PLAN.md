@@ -383,7 +383,7 @@ contexts, nouveau uAPI subset for Mesa NVK (`nvk=1`), Zink GL, zero-copy scanout
 
 **Status (2026-11-09):** every to-do item that needs no display checking is done (per-object fences and async
 VM_BIND, 2 MiB pages, GPU recovery, sparse binding, preemption buffers, clean unload), and on the display side
-hardware vblank, hardware cursor, gamma/CTM, block-linear scanout, tearing flips, VRR and DPMS. Left: hotplug,
+hardware vblank, hardware cursor, gamma/CTM, block-linear scanout, tearing flips, VRR, DPMS and hotplug. Left:
 in-place GPU reset, multi-monitor, suspend/resume, NVDEC/NVENC (items marked ▶ first). Switching between nvdrv
 and NVIDIA's driver: "Switching drivers" under Hardware workflow.
 
@@ -536,7 +536,15 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       (EVO channels, modeset from the saved DRM atomic state) needs display verification.
 
 ### Display
-- [ ] **Multiple monitors**: the other heads/SORs, HDMI (TMDS/FRL), hotplug detection (HPD), EDID reprobe.
+- [x] **Hotplug (HPD) and DP IRQ** (2026-11-09): subscribed like nouveau r535_gsp_device_event_ctor:
+      NV01_EVENT_KERNEL_CALLBACK_EX (0x7e) objects under the subdevice with notifyIndex CLIENT_RM | HOTPLUG (1) /
+      DP_IRQ (7), NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION REPEAT; GSP-RM sends POST_EVENT (0x1003, data at 29:
+      plug/unplug display masks, or the displayId). A work item refreshes connect state and EDID without the full
+      probe, retrains on a DP IRQ whose link status is bad, and raises a DRM hotplug event; the connector has a
+      real `detect`. After a replug the link is untrained: modes are judged by the sink's maximum link, and
+      power-on does the full bring-up. Verified with the monitor's power button: off → display off, on → back at
+      2560x1440@180 in ~2.2 s (the AOC reports DP-B + TMDS-B unplugged, DP-B plugged).
+- [ ] **Multiple monitors**: the other heads/SORs, HDMI (TMDS/FRL).
 - [ ] **Robust mode changes** with the AOC monitor (identity switching), DP_CONFIG_STREAM, core exceptions.
 - [x] **Hardware cursor plane** (2026-11-09): DRM cursor plane (ARGB8888 premultiplied, 32..256 square), image
       through the core channel (HEAD_SET_CONTROL_CURSOR/COMPOSITION/CONTEXT_DMA/OFFSET_CURSOR; VRAM pool objects

@@ -604,6 +604,38 @@ static const struct drm_encoder_funcs nv_encoder_funcs = {
 	.destroy = drm_encoder_cleanup,
 };
 
+/* Hotplug from GSP-RM (disp.c): userspace and the fbdev client re-probe. */
+void nv_drm_hotplug(struct nvdrv_dev *nv)
+{
+	struct nv_drm *d = READ_ONCE(nv->drm);
+
+	if (d)
+		drm_kms_helper_hotplug_event(&d->dev);
+}
+
+/* The DP display nvdrv drives: connected, and its EDID if it changed. */
+static enum drm_connector_status nv_connector_detect(struct drm_connector *connector, bool force)
+{
+	struct nv_drm *d = to_nv_drm(connector->dev);
+	struct nvdrv_dev *nv = d->nv;
+	struct nv_disp_dpy *dpy = NULL;
+	bool connected;
+	u32 i;
+
+	mutex_lock(&nv->gsp_lock);
+	for (i = 0; i < nv->disp.ndpy; i++)
+		if (nv->disp.dpy[i].connected && (nv->disp.dpy[i].protocol == 0x8 || nv->disp.dpy[i].protocol == 0x9))
+			dpy = &nv->disp.dpy[i];
+	connected = dpy && dpy->edid_size;
+	if (connected && (!d->edid || drm_edid_raw(d->edid)->extensions + 1 != dpy->edid_size / EDID_LENGTH ||
+			  memcmp(drm_edid_raw(d->edid), dpy->edid, dpy->edid_size))) {
+		drm_edid_free(d->edid);
+		d->edid = drm_edid_alloc(dpy->edid, dpy->edid_size);
+	}
+	mutex_unlock(&nv->gsp_lock);
+	return connected ? connector_status_connected : connector_status_disconnected;
+}
+
 static int nv_connector_get_modes(struct drm_connector *connector)
 {
 	struct nv_drm *d = to_nv_drm(connector->dev);
@@ -637,6 +669,7 @@ static const struct drm_connector_helper_funcs nv_connector_helper_funcs = {
 };
 
 static const struct drm_connector_funcs nv_connector_funcs = {
+	.detect = nv_connector_detect,
 	.fill_modes = drm_helper_probe_single_connector_modes,
 	.destroy = drm_connector_cleanup,
 	.reset = drm_atomic_helper_connector_reset,
