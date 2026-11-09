@@ -623,6 +623,43 @@ out:
 }
 
 /* DPCD view of the link from the sink side (debugfs dp_status). */
+/*
+ * Display power (DPMS / CRTC inactive). Off: VRR off, head detached, sink to D3 (DPCD
+ * SET_POWER = 2) so the monitor goes to standby. On: sink to D0, link retrained, then the
+ * normal mode set (which retries with a full bring-up if the link does not hold).
+ */
+int nv_disp_power(struct nvdrv_dev *nv, bool on, const struct nv_mode *m)
+{
+	struct device *dev = &nv->pdev->dev;
+	struct nv_disp_dpy *d;
+	u8 d3 = 2;
+	int ret = 0;
+
+	if (!on) {
+		if (READ_ONCE(nv->evo.vrr_active))
+			nv_disp_vrr(nv, false, 0);	/* the stall lock is sticky core state */
+		mutex_lock(&nv->gsp_lock);
+		d = first_dp(nv);
+		if (nv->evo.active)
+			ret = nv_disp_detach_locked(nv);
+		if (d && dp_aux(nv, d->id, true, 0x600, &d3, 1))
+			dev_warn(dev, "disp: could not set sink power state D3\n");
+		mutex_unlock(&nv->gsp_lock);
+		dev_info(dev, "disp: display off: %d\n", ret);
+		return ret;
+	}
+	mutex_lock(&nv->gsp_lock);
+	d = first_dp(nv);
+	if (d && !nv->evo.active && d->link_lanes)
+		dp_retrain(nv, d);	/* sets D0 */
+	mutex_unlock(&nv->gsp_lock);
+	if (!d)
+		return -ENODEV;
+	ret = nv_disp_set_mode(nv, m ? m : &d->mode);
+	dev_info(dev, "disp: display on: %d\n", ret);
+	return ret;
+}
+
 void nv_disp_dp_status_show(struct nvdrv_dev *nv, struct seq_file *m)
 {
 	struct nv_disp *dp = &nv->disp;

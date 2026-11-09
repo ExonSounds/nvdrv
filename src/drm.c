@@ -398,9 +398,35 @@ static void nv_crtc_mode_set_nofb(struct drm_crtc *crtc)
 	drm_dev_exit(idx);
 }
 
+/* Display power: CRTC active again (DPMS on) brings the head and the sink back. */
 static void nv_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
 {
-	drm_crtc_vblank_on(crtc);	/* the head itself stays configured by nvdrv */
+	struct nv_drm *d = to_nv_drm(crtc->dev);
+	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
+	struct nv_mode m;
+	int idx;
+
+	if (!d->nv->evo.active && drm_dev_enter(crtc->dev, &idx)) {
+		drm_mode_to_nv(&cs->mode, &m);
+		if (nv_disp_power(d->nv, true, &m))
+			drm_err(crtc->dev, "display power on failed\n");
+		drm_dev_exit(idx);
+	}
+	drm_crtc_vblank_on(crtc);
+}
+
+/* CRTC inactive (DPMS off, not a mode change): head off, monitor to standby. */
+static void nv_crtc_atomic_disable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
+{
+	struct nv_drm *d = to_nv_drm(crtc->dev);
+	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
+	int idx;
+
+	drm_crtc_vblank_atomic_disable(crtc, state);
+	if (!cs->active && drm_dev_enter(crtc->dev, &idx)) {
+		nv_disp_power(d->nv, false, NULL);
+		drm_dev_exit(idx);
+	}
 }
 
 /* ---- hardware vblank ---------------------------------------------------- */
@@ -548,7 +574,7 @@ static const struct drm_crtc_helper_funcs nv_crtc_helper_funcs = {
 	.mode_set_nofb = nv_crtc_mode_set_nofb,
 	.atomic_flush = nv_crtc_atomic_flush,
 	.atomic_enable = nv_crtc_atomic_enable,
-	.atomic_disable = drm_crtc_vblank_atomic_disable,
+	.atomic_disable = nv_crtc_atomic_disable,
 	.get_scanout_position = nv_crtc_get_scanout_position,
 };
 

@@ -578,6 +578,11 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       with the KIND bit (bit 20, nouveau gv100_dmaobj_new) and SET_STORAGE = log2 block height; the pitch stays
       in 64-byte units. `KMSGL_BL=1 tools/kmsgl`: GBM picks 32-GOB blocks, picture correct on screen.
 - [ ] **Audio** over DisplayPort / HDMI.
+- [x] **Display power (DPMS)** (2026-11-09): CRTC ACTIVE=0 (not a mode change) turns VRR off, detaches the head
+      and puts the sink in D3 (DPCD 0x600 = 2): the monitor shows "no signal" and goes to standby. ACTIVE=1: D0,
+      link retrain, mode set with the usual retries. `tools/dpmstest`: off in ~10 ms; on in 0.26 s right away,
+      ~3.5 s after the AOC entered real standby (retrain fails until the 4th attempt's full bring-up re-probes the
+      sink). Could be shortened by waiting for the sink's DPCD to answer before retraining.
 - [ ] fbdev restore after the last DRM master closes; mode changes through a real per-commit modeset path.
 
 ### Power, thermals, stability

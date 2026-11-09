@@ -742,6 +742,7 @@ int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch, int block_h, bool
 int nv_disp_cursor_init(struct nvdrv_dev *nv);
 int nv_disp_color(struct nvdrv_dev *nv, const u16 *lut, const u32 *ocsc);
 int nv_disp_vrr(struct nvdrv_dev *nv, bool enable, u32 timeout_us);
+int nv_disp_power(struct nvdrv_dev *nv, bool on, const struct nv_mode *m);
 bool nv_disp_vrr_capable(struct nvdrv_dev *nv);
 int nv_disp_dpcd(struct nvdrv_dev *nv, u32 dpy, bool write, u32 addr, u8 *buf, u32 len);
 #define NV_OLUT_ENTRIES		1025	/* 1024 + the last repeated (interpolation) */
