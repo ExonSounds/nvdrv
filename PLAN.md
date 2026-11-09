@@ -582,7 +582,8 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       and puts the sink in D3 (DPCD 0x600 = 2): the monitor shows "no signal" and goes to standby. ACTIVE=1: D0,
       link retrain, mode set with the usual retries. `tools/dpmstest`: off in ~10 ms; on in 0.26 s right away,
       ~3.5 s after the AOC entered real standby (retrain fails until the 4th attempt's full bring-up re-probes the
-      sink). Could be shortened by waiting for the sink's DPCD to answer before retraining.
+      sink). Not the driver: AUX answers at once and the first retrain succeeds, then the AOC drops off AUX
+      during the first modeset while it re-identifies (as after mode changes); waiting for AUX first did not help.
 - [ ] fbdev restore after the last DRM master closes; mode changes through a real per-commit modeset path.
 
 ### Power, thermals, stability
