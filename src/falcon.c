@@ -402,18 +402,24 @@ int nv_gsp_core_wait_halt(struct nvdrv_dev *nv)
 
 /* ---- FWSEC-FRTS -------------------------------------------------------- */
 
-int nv_fwsec_run_frts(struct nvdrv_dev *nv)
+static struct nv_hs_ucode fwsec_ucode(struct nvdrv_dev *nv, u8 *image)
 {
-	struct device *dev = &nv->pdev->dev;
 	struct nv_fwsec *fw = &nv->fwsec;
-	struct nv_hs_ucode u = {
-		.image = nv->fwsec_frts, .image_size = fw->image_size,
+
+	return (struct nv_hs_ucode) {
+		.image = image, .image_size = fw->image_size,
 		.code_offset = 0, .imem_size = fw->imem_size,
 		.imem_pa = fw->imem_pa, .imem_va = fw->imem_va,
 		.dmem_offset = fw->dmem_offset, .dmem_size = fw->dmem_size, .dmem_pa = fw->dmem_pa,
 		.pkc_data_offset = fw->pkc_data_offset,
 		.engine_id_mask = fw->engine_id_mask, .ucode_id = fw->ucode_id,
 	};
+}
+
+int nv_fwsec_run_frts(struct nvdrv_dev *nv)
+{
+	struct device *dev = &nv->pdev->dev;
+	struct nv_hs_ucode u = fwsec_ucode(nv, nv->fwsec_frts);
 	u32 mbox0 = 0, mbox1 = 0, err;
 	int ret;
 
@@ -450,6 +456,51 @@ int nv_fwsec_run_frts(struct nvdrv_dev *nv)
 		return -EIO;
 	}
 	dev_info(dev, "fwsec-frts: SUCCESS, WPR2 0x%llx-0x%llx\n", nv_wpr2_lo(nv), nv_wpr2_hi(nv));
+	return 0;
+}
+
+/* ---- clean unload (kgspUnloadRm_IMPL, kgspTeardown_TU102) ----------- */
+
+/* kgspWaitForProcessorSuspend_TU102: LibOS reports PROCESSOR_SUSPENDED in MAILBOX0. */
+int nv_gsp_wait_suspended(struct nvdrv_dev *nv, unsigned int timeout_ms)
+{
+	return flcn_poll(nv, &nv_gsp_falcon, FLCN_MAILBOX0, ~0u, 0x80000000, timeout_ms * 1000,
+			 "processor suspend");
+}
+
+/*
+ * FWSEC-SB on the GSP falcon (reset first, as kgspTeardown_TU102 does), then the
+ * kgspExecuteFwsec_TU102 checks for the SB command.
+ */
+int nv_fwsec_run_sb(struct nvdrv_dev *nv)
+{
+	struct device *dev = &nv->pdev->dev;
+	struct nv_hs_ucode u = fwsec_ucode(nv, nv->fwsec_sb);
+	u32 mbox0 = 0, mbox1 = 0, err;
+	int ret;
+
+	if (!allow_hw_writes)
+		return -EPERM;
+	if (!nv->fwsec_sb)
+		return -ENODATA;
+	ret = nv_falcon_hs_exec(nv, NV_FALCON_GSP, &u, &mbox0, &mbox1);
+	if (ret)
+		return ret;
+	if (!(nv_rd32(nv, NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK) & BIT(0))) {
+		dev_err(dev, "fwsec-sb: GFW PLM not lowered\n");
+		return -EIO;
+	}
+	if (FIELD_GET(NV_PGC6_GFW_BOOT_PROGRESS, nv_rd32(nv, NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT)) !=
+	    NV_PGC6_GFW_BOOT_PROGRESS_COMPLETED) {
+		dev_err(dev, "fwsec-sb: GFW progress not completed\n");
+		return -EIO;
+	}
+	err = FIELD_GET(NV_VBIOS_FWSECLIC_SB_ERR_CODE,
+			nv_rd32(nv, NV_PBUS_VBIOS_SCRATCH(NV_VBIOS_FWSECLIC_SCRATCH_INDEX_15)));
+	if (err) {
+		dev_err(dev, "fwsec-sb: SB error code 0x%x\n", err);
+		return -EIO;
+	}
 	return 0;
 }
 

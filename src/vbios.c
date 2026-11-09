@@ -5,7 +5,7 @@
  * Follows the procedure in open-gpu-kernel-modules 570.144:
  *   kernel_gsp_vbios_tu102.c  - ROM image chain / expansion ROM offset
  *   kernel_gsp_fwsec.c        - BIT -> falcon ucode table -> desc v3
- *   kernel_gsp_frts_tu102.c   - DMEM mapper patching for the FRTS command
+ *   kernel_gsp_frts_tu102.c   - DMEM mapper patching for the FRTS and SB commands
  *
  * Everything here reads registers and builds buffers in system memory only.
  */
@@ -59,6 +59,7 @@
 #define DMAP_CMD_IN_SIZE	0x0c
 #define DMAP_INIT_CMD		0x2c
 #define DMAP_CMD_FRTS		0x15
+#define DMAP_CMD_SB		0x19	/* put back the pre-OS apps at driver unload */
 
 #define FRTS_SIZE_4K		0x100		/* 1 MiB */
 #define FRTS_MEDIA_FB		2
@@ -427,18 +428,17 @@ int nv_fwsec_extract(struct nvdrv_dev *nv)
 }
 
 /*
- * Build a copy of the FWSEC image patched to run the FRTS command
+ * Build a copy of the FWSEC image patched to run DMEM-mapper command @cmd_id
  * (s_prepareForFwsec_TU102()): signature for this chip's fuse version into
- * DMEM at pkc_data_offset, init_cmd = FRTS, FRTS_CMD into cmd_in_buffer.
+ * DMEM at pkc_data_offset, init_cmd = @cmd_id, @cmd into cmd_in_buffer.
  */
-int nv_fwsec_prepare_frts(struct nvdrv_dev *nv, u64 frts_offset, u8 **out)
+static int fwsec_prepare(struct nvdrv_dev *nv, u32 cmd_id, const void *cmd, size_t cmd_len, u8 **out)
 {
 	struct nv_fwsec *fw = &nv->fwsec;
-	struct fwseclic_frts_cmd cmd = {};
 	u32 fuse_ver, ver_bit, sig_idx, sig_off, cmd_in, cmd_in_size;
 	u8 *img, *dmem, *dmap;
 
-	if (!fw->image || !frts_offset)
+	if (!fw->image)
 		return -EINVAL;
 
 	fuse_ver = nv_fuse_ucode_version(nv, fw->ucode_id);
@@ -461,34 +461,58 @@ int nv_fwsec_prepare_frts(struct nvdrv_dev *nv, u64 frts_offset, u8 **out)
 	dmem = img + fw->dmem_offset;
 	dmap = dmem + fw->dmem_mapper;
 
-	cmd.read_vbios.version = cpu_to_le32(1);
-	cmd.read_vbios.size = cpu_to_le32(sizeof(cmd.read_vbios));
-	cmd.read_vbios.flags = cpu_to_le32(READ_VBIOS_FLAGS);
+	cmd_in = get_unaligned_le32(dmap + DMAP_CMD_IN_OFFSET);
+	cmd_in_size = get_unaligned_le32(dmap + DMAP_CMD_IN_SIZE);
+	if (cmd_in_size < cmd_len || !in_img(fw->dmem_size, cmd_in, cmd_len)) {
+		kvfree(img);
+		return -ERANGE;
+	}
+
+	put_unaligned_le32(cmd_id, dmap + DMAP_INIT_CMD);
+	memcpy(dmem + cmd_in, cmd, cmd_len);
+	memcpy(dmem + fw->pkc_data_offset, fw->sigs + sig_off, NV_FWSEC_SIG_SIZE);
+
+	dev_info(&nv->pdev->dev, "fwsec: command 0x%x image prepared (fuse ver %u -> sig %u)\n",
+		 cmd_id, fuse_ver, sig_idx);
+	*out = img;
+	return 0;
+}
+
+static void read_vbios_desc(struct fwseclic_read_vbios_desc *d)
+{
+	d->version = cpu_to_le32(1);
+	d->size = cpu_to_le32(sizeof(*d));
+	d->flags = cpu_to_le32(READ_VBIOS_FLAGS);
+}
+
+/* FRTS: carve WPR2 for the GSP boot (FWSECLIC_FRTS_CMD). */
+int nv_fwsec_prepare_frts(struct nvdrv_dev *nv, u64 frts_offset, u8 **out)
+{
+	struct fwseclic_frts_cmd cmd = {};
+
+	if (!frts_offset)
+		return -EINVAL;
+	read_vbios_desc(&cmd.read_vbios);
 	cmd.frts_region.version = cpu_to_le32(1);
 	cmd.frts_region.size = cpu_to_le32(sizeof(cmd.frts_region));
 	cmd.frts_region.frts_region_offset_4k = cpu_to_le32(frts_offset >> 12);
 	cmd.frts_region.frts_region_size = cpu_to_le32(FRTS_SIZE_4K);
 	cmd.frts_region.frts_region_media_type = cpu_to_le32(FRTS_MEDIA_FB);
+	return fwsec_prepare(nv, DMAP_CMD_FRTS, &cmd, sizeof(cmd), out);
+}
 
-	cmd_in = get_unaligned_le32(dmap + DMAP_CMD_IN_OFFSET);
-	cmd_in_size = get_unaligned_le32(dmap + DMAP_CMD_IN_SIZE);
-	if (cmd_in_size < sizeof(cmd) || !in_img(fw->dmem_size, cmd_in, sizeof(cmd))) {
-		kvfree(img);
-		return -ERANGE;
-	}
+/* SB: run at unload after GSP-RM stopped (kgspTeardown_TU102); takes only a READ_VBIOS_DESC. */
+int nv_fwsec_prepare_sb(struct nvdrv_dev *nv, u8 **out)
+{
+	struct fwseclic_read_vbios_desc cmd = {};
 
-	put_unaligned_le32(DMAP_CMD_FRTS, dmap + DMAP_INIT_CMD);
-	memcpy(dmem + cmd_in, &cmd, sizeof(cmd));
-	memcpy(dmem + fw->pkc_data_offset, fw->sigs + sig_off, NV_FWSEC_SIG_SIZE);
-
-	dev_info(&nv->pdev->dev, "fwsec: FRTS image prepared (fuse ver %u -> sig %u, FRTS @0x%llx)\n",
-		 fuse_ver, sig_idx, frts_offset);
-	*out = img;
-	return 0;
+	read_vbios_desc(&cmd);
+	return fwsec_prepare(nv, DMAP_CMD_SB, &cmd, sizeof(cmd), out);
 }
 
 void nv_vbios_fini(struct nvdrv_dev *nv)
 {
+	kvfree(nv->fwsec_sb);
 	kvfree(nv->fwsec_frts);
 	kvfree(nv->fwsec.image);
 	kfree(nv->fwsec.sigs);

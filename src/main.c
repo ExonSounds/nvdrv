@@ -169,6 +169,7 @@ static int info_show(struct seq_file *m, void *unused)
 
 	seq_printf(m, "gsp:             %s\n", nv->gsp_running ? "RUNNING (INIT_DONE received)" :
 		   nv->gsp_touched ? "boot attempted" : "not booted");
+	seq_printf(m, "gsp nocat:       %u diagnostic records\n", nv->gsp_nocat);
 
 	seq_puts(m, "\n[libos / rpc queues]\n");
 	if (nv->libos.shm.cpu) {
@@ -885,6 +886,9 @@ static void nv_init_readonly(struct nvdrv_dev *nv)
 		ret = nv_fwsec_prepare_frts(nv, nv->fb.frts_offset, &nv->fwsec_frts);
 		if (ret)
 			dev_err(dev, "fwsec FRTS preparation failed: %d\n", ret);
+		ret = nv_fwsec_prepare_sb(nv, &nv->fwsec_sb);
+		if (ret)	/* not fatal: unload then falls back to an FLR */
+			dev_err(dev, "fwsec SB preparation failed: %d\n", ret);
 	}
 
 	ret = nv_fw_load(nv);
@@ -1034,8 +1038,8 @@ static void nvdrv_remove(struct pci_dev *pdev)
 	struct nvdrv_dev *nv = pci_get_drvdata(pdev);
 
 	debugfs_remove_recursive(nv->dbg);
-	nv_drm_unregister(nv);	/* before the FLR in nv_gsp_fini: no BAR1 access after it */
-	nv_gsp_fini(nv);	/* FLR first if GSP ever ran: it DMAs into what follows */
+	nv_drm_unregister(nv);	/* before nv_gsp_fini: no BAR1 access after the unload/FLR */
+	nv_gsp_fini(nv);	/* GSP-RM unload (or FLR) first: it DMAs into what follows */
 	nv_rpc_fini(nv);
 	nv_libos_fini(nv);
 	nv_wpr_meta_fini(nv);

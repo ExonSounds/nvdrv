@@ -212,6 +212,7 @@ struct nv_rpc_header {
 
 /* inc/kernel/vgpu/rpc_global_enums.h */
 #define NV_RPC_FREE				10
+#define NV_RPC_UNLOADING_GUEST_DRIVER		47
 #define NV_RPC_GET_GSP_STATIC_INFO		65
 #define NV_RPC_GSP_RM_CONTROL			76
 #define NV_RPC_GSP_RM_ALLOC			103
@@ -484,9 +485,11 @@ struct nvdrv_dev {
 	struct nv_intr intr;
 	bool gsp_touched;	/* Booter/FWSEC ran: GSP may DMA into our memory */
 	bool gsp_running;	/* GSP_INIT_DONE received */
+	unsigned int gsp_nocat;	/* GSP_POST_NOCAT_RECORD events (diagnostic journal) */
 
 	/* FWSEC image patched for FRTS, kept for inspection (fwsec_frts.bin). */
 	u8 *fwsec_frts;
+	u8 *fwsec_sb;		/* FWSEC image patched for SB (clean unload) */
 	struct debugfs_blob_wrapper vbios_blob, gsp_info_blob, fwsec_frts_blob, booter_load_blob, wpr_meta_blob, cmdq_blob;
 	struct debugfs_blob_wrapper libos_blobs[4 + NV_LIBOS_NUM_LOGS];	/* args, rmargs, PTE page, cmdq hdr, log page 0s */
 
@@ -520,11 +523,14 @@ void nv_gsp_core_start(struct nvdrv_dev *nv);
 void nv_falcon_start(struct nvdrv_dev *nv, enum nv_falcon_id id);
 int nv_gsp_core_wait_halt(struct nvdrv_dev *nv);
 int nv_fwsec_run_frts(struct nvdrv_dev *nv);
+int nv_fwsec_run_sb(struct nvdrv_dev *nv);
+int nv_gsp_wait_suspended(struct nvdrv_dev *nv, unsigned int timeout_ms);
 void nv_falcon_dump(struct nvdrv_dev *nv, struct seq_file *m);
 
 /* vbios.c */
 int nv_vbios_load(struct nvdrv_dev *nv);
 int nv_fwsec_extract(struct nvdrv_dev *nv);
+int nv_fwsec_prepare_sb(struct nvdrv_dev *nv, u8 **out);
 int nv_fwsec_prepare_frts(struct nvdrv_dev *nv, u64 frts_offset, u8 **out);
 void nv_vbios_fini(struct nvdrv_dev *nv);
 u32 nv_fuse_ucode_version(struct nvdrv_dev *nv, u8 ucode_id);

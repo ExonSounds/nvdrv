@@ -21,6 +21,7 @@ Kernel: Arch 7.2.x, out-of-tree C module (Kbuild), GPL-2.0.
 - **Develop over SSH.** This GPU also drives the console (simpledrm on BAR1).
   From Phase 3 on, expect the local display to go dark. Recovery is
   `scripts/unbind.sh` then `echo 1 > /sys/bus/pci/devices/0000:01:00.0/reset` (FLR), or a reboot.
+  Since 2026-11-09 unbind shuts GSP-RM down cleanly (no FLR needed); the FLR stays as the fallback.
 - Never auto-bind: no `MODULE_DEVICE_TABLE`. The driver binds only via `driver_override`.
 
 ## Architecture (where we are going)
@@ -48,7 +49,7 @@ Most of the work is the boot chain and the RPC layer.
 | 3 | **Falcon / RISC-V engine core** | Reset, IMEM/DMEM upload via DMA, BROM setup, start, halt wait, mailboxes (`src/falcon.c`). ✅ GSP falcon runs signed HS ucode (FWSEC) via DMA through the IOMMU. SEC2 pending. |
 | 4 | **Framebuffer layout** | Compute the VRAM carve-out layout (FRTS, WPR2, GSP heap, non-WPR) the way GSP firmware expects it (`GspFwWprMeta`). ✅ `src/fb.c` + `src/wpr.c` (`tests/phase5_meta.sh`: every field matches an independent recomputation) |
 | 5 | **Secure boot chain** ✅ | Run FWSEC-FRTS (carves WPR2) ✅, load firmware files (`booter_load`, `bootloader`, `gsp` ELF) ✅, build the radix-3 page table for the GSP image ✅ (`tests/phase5_fw.sh`), WPR meta ✅, run Booter-Load on SEC2 → GSP-RM starts. **✅ GSP_INIT_DONE on hardware (2026-11-08), `tests/phase6_boot.sh`** |
-| 6 | **GSP RPC layer** | Shared-memory message/status queues ✅, send/receive + checksums ✅, CPU sequencer incl. CORE_RESUME ✅, pre-boot RPCs ✅ (`tests/phase6_rpc.sh`), doorbell + synchronous calls + event draining ✅, **GET_GSP_STATIC_INFO ✅ (`tests/phase6_static.sh`)**; clean `booter_unload` shutdown, interrupts. |
+| 6 | **GSP RPC layer** | Shared-memory message/status queues ✅, send/receive + checksums ✅, CPU sequencer incl. CORE_RESUME ✅, pre-boot RPCs ✅ (`tests/phase6_rpc.sh`), doorbell + synchronous calls + event draining ✅, **GET_GSP_STATIC_INFO ✅ (`tests/phase6_static.sh`)**; clean `booter_unload` shutdown ✅ (2026-11-09, FLR as fallback), interrupts ✅. |
 | 7 | **RM object model** | GSP_RM_ALLOC / GSP_RM_CONTROL / FREE ✅; root client → device → subdevice ✅; routed control on our subdevice and internal control on GSP's internal subdevice ✅; error paths verified ✅ (`tests/phase7_rm.sh`). |
 | 8 | **Memory management** | VRAM carve-out allocator ✅, GPU VA space with host-written GP100 page tables + RM's server-reserved PDEs ✅, VRAM/sysmem mappings ✅. Next: free/unmap, 64K pages. |
 | 9 | **Channels + Copy Engine** | GPFIFO channel (host-provided inst/USERD/method buffer, BIND, SCHEDULE), doorbell, push buffer ✅; **CE memcpy sysmem → VRAM with semaphore release: first real GPU work (2026-11-08)** ✅ (debugfs `ce_test`). |
@@ -379,10 +380,10 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
 Done so far: GSP-RM boot, RM objects, DisplayPort display + KMS/fbdev, GPU VA spaces, channels, copy engine, GR
 contexts, nouveau uAPI subset for Mesa NVK (`nvk=1`), Zink GL, zero-copy scanout; Hyprland runs smoothly on the GPU.
 
-**Status (2026-11-09, paused):** every to-do item that needs no display checking is done (latest: per-object
-fences and async VM_BIND, 2 MiB pages, GPU recovery, sparse binding, preemption buffers; commit c30b586). Left:
-in-place GPU reset, multi-monitor, hardware cursor, VRR, suspend/resume, NVDEC/NVENC (items marked ▶ first).
-The machine was switched back to NVIDIA's driver at this point; see "Switching drivers" under Hardware workflow.
+**Status (2026-11-09):** every to-do item that needs no display checking is done (per-object fences and async
+VM_BIND, 2 MiB pages, GPU recovery, sparse binding, preemption buffers, clean unload). Left: in-place GPU reset,
+multi-monitor, hardware cursor, VRR, suspend/resume, NVDEC/NVENC (items marked ▶ first). Switching between nvdrv
+and NVIDIA's driver: "Switching drivers" under Hardware workflow.
 
 To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
 
@@ -571,7 +572,22 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       VRAM objects to system memory and back (needs eviction), display and channel restore. Until then nvdrv
       *refuses* system suspend while GSP-RM runs (-EBUSY, logged) instead of resuming into a dead GPU.
 - [ ] Runtime power-down when idle (GC6 / D3cold): not available on a desktop board with an active display.
-- [ ] **Clean unload** instead of FLR: UNLOADING_GUEST_DRIVER RPC, wait for halt, Booter-Unload on SEC2.
+- [x] **Clean unload** instead of FLR (2026-11-09, `gsp_unload_locked` in `src/gsp.c`, as kgspUnloadRm_IMPL +
+      kgspTeardown_TU102): after our RM client is freed, `UNLOADING_GUEST_DRIVER` (RPC 47, {bInPMTransition 0,
+      bGc6Entering 0, newLevel 0}, GSP replies) → GSP MAILBOX0 = 0x80000000 (LibOS PROCESSOR_SUSPENDED) →
+      FWSEC-SB on the GSP falcon (DMEM-mapper command 0x19 with only a READ_VBIOS_DESC; checks: GFW PLM lowered,
+      GFW progress 0xff, scratch 0x15 bits 15:0 = 0) → Booter-Unload on SEC2 (mailboxes 0xff/0xff in, 0 out)
+      → WPR2 must be down. ~215 ms. Any failure (or `clean_unload=0`, or GSP dead) falls back to the FLR;
+      bus mastering is cleared either way before the shared memory is freed.
+      - Verified: 8 unload/boot cycles without FLR; nvdrv → NVIDIA 615.78 (its own, newer GSP firmware) →
+        nvdrv, both hand-offs without FLR or reboot; FLR fallback with `clean_unload=0`; regression all PASS
+        (nvktest modes, gltest, kmsgl 57 fps, vkmark 32.2k).
+      - GSP-RM posts one NOCAT record per boot (engine, "Display Subsystem"/"Display Engine", error 0x27) and
+        one at unload (error 0x28), with or without FLR. NOCAT records are now decoded into one log line and
+        counted in debugfs `info`.
+      - Seen once in 8 no-FLR boots, not reproduced: ~60 NOCAT ASSERT records ("NV_PGC6_AON_SECURE_SCRATCH_
+        GROUP_05_0_GFW_BOOT_PROGRESS...", every 40 ms for 2.4 s) inside GSP-RM's closed display code; the boot
+        still finished and passed. GFW_BOOT reads 0x3ff and the PLM 0x8b8f after both FLR and clean unload.
 - [ ] Fan control / power limits (read-only first; writing them is an explicit user decision).
 
 ### Hardware blocks not used yet
@@ -608,11 +624,15 @@ NVIDIA's driver (nvidia-open/nvidia-utils 615.x) stays installed. While nvdrv is
 `/etc/modprobe.d/blacklist-nvidia.conf` (blacklist + `install ... /bin/false` for nvidia, nvidia_drm,
 nvidia_modeset, nvidia_uvm), and the initramfs is rebuilt with `mkinitcpio -P`.
 
+- **Quick test without touching the blacklist** (no reboot, no FLR, both directions verified): stop Hyprland,
+  `sudo ./scripts/unbind.sh`, `sudo modprobe -C /usr/lib/modprobe.d nvidia_drm` (reads only the packaged
+  config, so the blacklist's `install ... /bin/false` is skipped); back with
+  `sudo rmmod nvidia_drm nvidia_modeset nvidia` (plus `nvidia_uvm` if loaded) and the nvdrv bind.
 - **Back to NVIDIA:** stop Hyprland, `sudo ./scripts/unbind.sh`, move the blacklist to
   `/etc/modprobe.d/blacklist-nvidia.conf.disabled` (modprobe reads only `*.conf`), `sudo mkinitcpio -P`,
   `sudo modprobe nvidia_drm` (pulls in nvidia, nvidia_modeset). If it fails to initialise the GPU, reboot.
-- **Back to nvdrv:** move the file back to `blacklist-nvidia.conf`, `sudo mkinitcpio -P`, reboot (the nvidia
-  modules cannot always be unloaded under a session), then `sudo NVDRV_PARAMS="nvk=1" KEEP=1 DRM=1
+- **Back to nvdrv:** move the file back to `blacklist-nvidia.conf`, `sudo mkinitcpio -P`, stop Hyprland (apps
+  holding the GPU close with it), `sudo rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia` (or reboot), then `sudo NVDRV_PARAMS="nvk=1" KEEP=1 DRM=1
   ./tests/phase12_display.sh` and start Hyprland.
 - The Hyprland config only sets `VK_DRIVER_FILES` to NVK when `/sys/module/nvdrv/parameters/nvk` is `Y`, so it
   needs no change for either driver (pre-nvdrv backup: `~/.config/hypr/hyprland.lua.bak-nvdrv`).

@@ -14,17 +14,29 @@
  *   9. allocate nvdrv's root client -> device -> subdevice (rm.c)
  *
  * Writes GPU registers; reached only from a debugfs trigger with allow_hw_writes=1.
+ *
+ * Unload (kgspUnloadRm_IMPL + kgspTeardown_TU102, normal mode):
+ *   1. UNLOADING_GUEST_DRIVER RPC, then MAILBOX0 = PROCESSOR_SUSPENDED
+ *   2. FWSEC-SB on the GSP falcon (puts back the pre-OS apps)
+ *   3. Booter-Unload on SEC2 (mailboxes 0xff), WPR2 must be gone afterwards
+ * Any failure falls back to an FLR.
  */
 #include <linux/delay.h>
 #include <linux/iopoll.h>
 #include <linux/jiffies.h>
 #include <linux/pci.h>
+#include <linux/unaligned.h>
 
 #include "nvdrv.h"
 #include "nv_regs.h"
 
 #define STATQ_LINK_TIMEOUT_MS	4000	/* GspStatusQueueInit */
 #define INIT_DONE_TIMEOUT_MS	10000
+#define SUSPEND_TIMEOUT_MS	5000
+
+static bool clean_unload = true;
+module_param(clean_unload, bool, 0644);
+MODULE_PARM_DESC(clean_unload, "Shut GSP-RM down as NVIDIA's driver does at unbind (default on); off: FLR");
 
 /* GSP_SEQ_BUF_OPCODE (arch/nvalloc/common/inc/rmgspseq.h) */
 enum {
@@ -195,9 +207,19 @@ int nv_gsp_handle_event(struct nvdrv_dev *nv, u32 fn, struct nv_rpc_header *h, v
 	switch (fn) {
 	case NV_RPC_EVENT_RUN_CPU_SEQUENCER:
 		return gsp_run_sequencer(nv, payload, len);
-	case 0x1020:	/* GSP_POST_NOCAT_RECORD */
-		print_hex_dump(KERN_INFO, "gsp nocat: ", DUMP_PREFIX_OFFSET, 16, 4,
-			       payload, min(len, 128u), true);
+	case 0x1020:	/* GSP_POST_NOCAT_RECORD: NV2080CtrlNocatJournalInsertRecord */
+		if (len >= 180) {
+			static const char *const types[] = { "unknown", "bugcheck", "engine", "tdr", "rc",
+							     "assert" };
+			const u8 *r = payload;
+			u8 type = r[16];
+
+			nv->gsp_nocat++;
+			dev_info_ratelimited(dev, "gsp nocat: %s, source \"%.*s\", engine \"%.*s\", error 0x%llx, bugcheck 0x%x\n",
+					     type < ARRAY_SIZE(types) ? types[type] : "?",
+					     (int)strnlen(r + 24, 65), r + 24, (int)strnlen(r + 104, 65), r + 104,
+					     get_unaligned_le64(r + 96), get_unaligned_le32(r + 20));
+		}
 		break;
 	case 0x1004:	/* RC_TRIGGERED: rpc_rc_triggered_v17_02 */
 		if (len >= 48) {
@@ -356,24 +378,97 @@ int nv_gsp_boot(struct nvdrv_dev *nv)
 	return ret;
 }
 
+/* rpc_unloading_guest_driver_v1F_07 */
+struct nv_rpc_unloading_guest_driver {
+	u8 in_pm_transition;
+	u8 gc6_entering;
+	u8 pad[2];
+	__le32 new_level;	/* NV2080_CTRL_GPU_SET_POWER_STATE_GPU_LEVEL_0 */
+};
+static_assert(sizeof(struct nv_rpc_unloading_guest_driver) == 8);
+
+/*
+ * Normal unload. Returns 0 only if GSP-RM stopped, FWSEC-SB ran and Booter-Unload
+ * took WPR2 down; then nothing on the GPU references our memory any more.
+ */
+static int gsp_unload_locked(struct nvdrv_dev *nv)
+{
+	struct device *dev = &nv->pdev->dev;
+	struct nv_rpc_unloading_guest_driver req = {};
+	u32 m0 = 0xff, m1 = 0xff;
+	ktime_t t0 = ktime_get();
+	int ret;
+
+	if (!nv->gsp_running || nv->intr.gsp_dead || !nv_gsp_riscv_active(nv))
+		return -ENODEV;
+	if (!nv->fwsec_sb || !nv->gsp_fw.booter_unload.image)
+		return -ENODATA;
+
+	ret = nv_rpc_call(nv, NV_RPC_UNLOADING_GUEST_DRIVER, &req, sizeof(req), &req, 0);
+	nv->gsp_running = false;	/* no RPC from here on, whatever happens */
+	if (ret) {
+		dev_err(dev, "gsp: UNLOADING_GUEST_DRIVER failed: %d\n", ret);
+		return ret;
+	}
+	ret = nv_gsp_wait_suspended(nv, SUSPEND_TIMEOUT_MS);
+	if (ret)
+		return ret;
+
+	ret = nv_fwsec_run_sb(nv);
+	if (ret) {
+		dev_err(dev, "gsp: FWSEC-SB failed: %d\n", ret);
+		return ret;
+	}
+
+	if (!nv_wpr2_hi(nv)) {	/* kgspExecuteBooterUnloadIfNeeded: nothing to tear down */
+		dev_warn(dev, "gsp: WPR2 already down before Booter-Unload\n");
+		return 0;
+	}
+	ret = nv_falcon_hs_exec(nv, NV_FALCON_SEC2, &nv->gsp_fw.booter_unload, &m0, &m1);
+	if (ret)
+		return ret;
+	if (m0) {
+		dev_err(dev, "gsp: Booter-Unload failed, mailbox0 0x%x\n", m0);
+		return -EIO;
+	}
+	if (nv_wpr2_hi(nv)) {
+		dev_err(dev, "gsp: WPR2 still up after Booter-Unload (0x%llx-0x%llx)\n",
+			nv_wpr2_lo(nv), nv_wpr2_hi(nv));
+		return -EIO;
+	}
+	dev_info(dev, "gsp: GSP-RM unloaded, WPR2 down (%lld ms)\n",
+		 ktime_ms_delta(ktime_get(), t0));
+	return 0;
+}
+
 /*
  * Called from .remove (device lock held): once Booter has run, GSP may keep
- * DMAing into our queues and logs, so stop it with an FLR before that memory
- * is freed and its bus addresses can be reused.
+ * DMAing into our queues and logs. Shut GSP-RM down properly (the GPU then
+ * goes back to its post-VBIOS state, ready for any driver); if that is off or
+ * fails, stop it with an FLR before that memory is freed.
  */
 void nv_gsp_fini(struct nvdrv_dev *nv)
 {
+	int ret = -EPERM;
+
 	if (!nv->gsp_touched)
 		return;
-	nv_intr_fini(nv);		/* interrupt handler off before the reset */
+	nv_intr_fini(nv);		/* interrupt handler and health check off first */
 	mutex_lock(&nv->gsp_lock);
-	nv_rm_fini_objects(nv);		/* exercises FREE; the FLR below would drop them anyway */
+	nv_rm_fini_objects(nv);		/* frees our client: channels and display objects go with it */
+	if (clean_unload && nv_hw_writes_allowed())
+		ret = gsp_unload_locked(nv);
+	nv->gsp_running = false;
 	mutex_unlock(&nv->gsp_lock);
-	dev_info(&nv->pdev->dev, "gsp: resetting GPU (FLR) before freeing GSP-shared memory\n");
-	if (pci_reset_function_locked(nv->pdev))
-		dev_err(&nv->pdev->dev, "gsp: FLR failed; GSP may still access freed memory\n");
-	nv_evo_fini(nv);	/* push buffers: only after the FLR stopped the display engine */
-	nv_fifo_fini(nv);	/* GPFIFO/push buffers: likewise only after the FLR */
+	if (ret) {
+		dev_info(&nv->pdev->dev, "gsp: resetting GPU (FLR) before freeing GSP-shared memory (%s %d)\n",
+			 clean_unload ? "clean unload failed:" : "clean_unload=0", ret);
+		if (pci_reset_function_locked(nv->pdev))
+			dev_err(&nv->pdev->dev, "gsp: FLR failed; GSP may still access freed memory\n");
+	}
+	pci_clear_master(nv->pdev);	/* belt and braces: no DMA into what is freed below */
+	nv_evo_fini(nv);	/* push buffers: only after the unload/FLR stopped the display engine */
+	nv_fifo_fini(nv);	/* GPFIFO/push buffers: likewise */
 	nv_uapi_fini(nv);
 	nv_mem_fini(nv);
 	nv->gsp_touched = nv->gsp_running = false;
