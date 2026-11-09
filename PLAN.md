@@ -382,9 +382,24 @@ Done so far: GSP-RM boot, RM objects, DisplayPort display + KMS/fbdev, GPU VA sp
 contexts, nouveau uAPI subset for Mesa NVK (`nvk=1`), Zink GL, zero-copy scanout; Hyprland runs smoothly on the GPU.
 
 **Status (2026-11-09):** every to-do item that needs no display checking is done (per-object fences and async
-VM_BIND, 2 MiB pages, GPU recovery, sparse binding, preemption buffers, clean unload). Left: in-place GPU reset,
-multi-monitor, hardware cursor, VRR, suspend/resume, NVDEC/NVENC (items marked ▶ first). Switching between nvdrv
+VM_BIND, 2 MiB pages, GPU recovery, sparse binding, preemption buffers, clean unload), and on the display side
+hardware vblank, hardware cursor, gamma/CTM, block-linear scanout, tearing flips, VRR and DPMS. Left: hotplug,
+in-place GPU reset, multi-monitor, suspend/resume, NVDEC/NVENC (items marked ▶ first). Switching between nvdrv
 and NVIDIA's driver: "Switching drivers" under Hardware workflow.
+
+**Long-term goal (user, 2026-11-09): make the whole driver independent of nouveau.** Today nvdrv leans on it in
+two ways, both meant as stepping stones:
+- *Interface:* with `nvk=1` the DRM device calls itself "nouveau" and implements a subset of nouveau's uAPI, only
+  so that Mesa's NVK binds to it unchanged. That collides with a real nouveau (see Platform) and ties nvdrv to
+  nouveau's ioctl design and versioning.
+- *Code and knowledge:* parts are ported from or modelled on nouveau (r535 GSP paths, BAR1, display/cursor/LUT
+  sequences, the uAPI semantics), with nouveau's MIT headers kept.
+The end state is nvdrv under its own name with its own uAPI and its own Mesa winsys/backend, and every
+nouveau-derived piece either rewritten from primary sources (NVIDIA's open-gpu-kernel-modules / open-gpu-doc and
+the firmware's RPC interface) or justified on its own. Steps, when the time comes: design the nvdrv uAPI (GEM, VM
+bind, exec, syncobjs, channel/engine queries) from what NVK actually needs; add an nvdrv backend to NVK
+(nvkmd) next to nouveau's; keep the nouveau-compatible uAPI as an optional mode during the transition; then retire
+it and audit the remaining nouveau-derived code.
 
 To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
 
@@ -652,7 +667,8 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
 
 ### Platform
 - [ ] Firmware versions other than 570.144 (the RPC ABI changes per release).
-- [ ] Coexistence with nouveau (the uAPI device is named "nouveau" with `nvk=1`).
+- [ ] Coexistence with nouveau (the uAPI device is named "nouveau" with `nvk=1`); solved for good by the
+      long-term independence goal under Next steps.
 - [ ] The Hyprland session needs `VK_DRIVER_FILES` pointing at NVK while the proprietary `nvidia-utils` ICD is
       installed (it deadlocks Xwayland otherwise).
 - [ ] LibOS log decoding (`.fwlogging_*` format strings are not shipped in linux-firmware); raw logs in debugfs.
