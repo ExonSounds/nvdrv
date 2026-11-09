@@ -203,8 +203,9 @@ static u32 evo_hash(u32 h_client, u32 h_ctxdma, u32 chn)
  * for a pitch-linear VRAM range and enter (handle -> object) into the hash table for
  * one channel. Returns the handle the channel methods refer to.
  */
-int nv_evo_ctxdma(struct nvdrv_dev *nv, u32 handle, u64 base, u64 size, u32 chn, bool sysmem)
+int nv_evo_ctxdma(struct nvdrv_dev *nv, u32 handle, u64 base, u64 size, u32 chn, u32 flags)
 {
+	bool sysmem = flags & NV_CTXDMA_SYSMEM;
 	struct nv_evo *e = &nv->evo;
 	u32 h_client = nv->rm.h_client, inst, entry, i, n = NV_UDISP_HASH_SIZE / 8;
 	u64 obj, limit = base + size - 1;
@@ -215,7 +216,9 @@ int nv_evo_ctxdma(struct nvdrv_dev *nv, u32 handle, u64 base, u64 size, u32 chn,
 	e->inst_next += 2;
 	obj = e->instmem + (inst << 4);
 	/* TARGET_NODE: 1 = PHYSICAL_NVM (VRAM), 3 = PHYSICAL_PCI_COHERENT (sysmem bus address) */
-	nv_vram_wr32(nv, obj + 0, (sysmem ? 0x3 : 0x1) | BIT(2) /* READ_AND_WRITE */);
+	/* KIND (bit 20, nouveau gv100_dmaobj_new): the surface is block linear */
+	nv_vram_wr32(nv, obj + 0, (sysmem ? 0x3 : 0x1) | BIT(2) /* READ_AND_WRITE */ |
+		     ((flags & NV_CTXDMA_BLOCK_LINEAR) ? BIT(20) : 0));
 	nv_vram_wr32(nv, obj + 4, lower_32_bits(base >> 8));
 	nv_vram_wr32(nv, obj + 8, upper_32_bits(base >> 8) & 0x7f);
 	nv_vram_wr32(nv, obj + 12, lower_32_bits(limit >> 8));

@@ -90,6 +90,7 @@
 #define NVDRV_H_FB_CTXDMA			0xd000f100
 #define NVDRV_H_SYSFB_CTXDMA			0xd000f101
 #define NVDRV_H_POOL_CTXDMA			0xd000f102
+#define NVDRV_H_POOL_BL_CTXDMA			0xd000f107	/* VRAM pool, block linear, window */
 #define NVDRV_H_CURS_CTXDMA			0xd000f103	/* cursor slots, core channel */
 #define NVDRV_H_POOL_CORE_CTXDMA		0xd000f104	/* VRAM pool, core channel */
 #define NVDRV_H_CURS				0xd000c67a
@@ -294,9 +295,9 @@ static int lut_init(struct nvdrv_dev *nv)
 		e->ocsc[i] = (i % 5 == 0) ? 0x10000 : 0;
 	wmb();
 	(void)ioread32(e->lut_cpu);
-	ret = nv_evo_ctxdma(nv, NVDRV_H_LUT_CTXDMA, e->lut_vram, NV_LUT_SIZE, e->win[0].chn, false);
+	ret = nv_evo_ctxdma(nv, NVDRV_H_LUT_CTXDMA, e->lut_vram, NV_LUT_SIZE, e->win[0].chn, 0);
 	if (!ret)
-		ret = nv_evo_ctxdma(nv, NVDRV_H_LUT_CORE_CTXDMA, e->lut_vram, NV_LUT_SIZE, e->core.chn, false);
+		ret = nv_evo_ctxdma(nv, NVDRV_H_LUT_CORE_CTXDMA, e->lut_vram, NV_LUT_SIZE, e->core.chn, 0);
 	if (ret)
 		return ret;
 	e->lut_ready = true;
@@ -418,6 +419,7 @@ static int modeset_win_locked(struct nvdrv_dev *nv, u32 flags)
 	fb_size = ALIGN((u64)pitch * h, SZ_64K);
 	e->fb_pitch = pitch;
 	e->scanout_cur = 0;	/* the modeset points window 0 at the own framebuffer */
+	e->scanout_bh = -1;
 
 	/*
 	 * 1. one fixed framebuffer big enough for any mode we drive, mapped through BAR1
@@ -456,7 +458,7 @@ static int modeset_win_locked(struct nvdrv_dev *nv, u32 flags)
 	if (ret)
 		return ret;
 	if (!e->fb_bound) {
-		ret = nv_evo_ctxdma(nv, NVDRV_H_FB_CTXDMA, e->fb, e->fb_size, win->chn, false);
+		ret = nv_evo_ctxdma(nv, NVDRV_H_FB_CTXDMA, e->fb, e->fb_size, win->chn, 0);
 		if (ret)
 			return ret;
 		e->fb_bound = true;
@@ -619,7 +621,7 @@ static int sysfb_prepare(struct nvdrv_dev *nv, u32 w, u32 h)
 			px[x] = ((x + y) / 64) & 1 ? 0xff2060ff : 0xffffa000;	/* blue / orange */
 	}
 	wmb();
-	ret = nv_evo_ctxdma(nv, NVDRV_H_SYSFB_CTXDMA, b->dma, b->size, e->win[0].chn, true);
+	ret = nv_evo_ctxdma(nv, NVDRV_H_SYSFB_CTXDMA, b->dma, b->size, e->win[0].chn, NV_CTXDMA_SYSMEM);
 	if (ret) {
 		dma_free_coherent(&nv->pdev->dev, b->size, b->cpu, b->dma);
 		b->cpu = NULL;
@@ -633,7 +635,13 @@ static int sysfb_prepare(struct nvdrv_dev *nv, u32 w, u32 h)
  * linear XRGB surface in the VRAM pool (a GPU-rendered DRM framebuffer, shown without
  * a copy), vram == 0 nvdrv's own framebuffer. Takes effect at the next vblank.
  */
-int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch)
+/*
+ * Point window 0 at a VRAM pool surface (zero-copy flip) or back at nvdrv's own framebuffer
+ * (vram == 0). @block_h: log2 block height in GOBs of a block-linear surface, -1 for pitch
+ * linear; block linear is selected by the ctxdma KIND, the block height by SET_STORAGE, and
+ * the pitch is in 64-byte units for both (nouveau wndwc67e_image_set).
+ */
+int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch, int block_h)
 {
 	struct nv_evo *e = &nv->evo;
 	struct nv_evo_chan *win = &e->win[0];
@@ -642,13 +650,18 @@ int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch)
 	int ret = 0;
 
 	if (vram && (!nv->mem.ready || vram < nv->mem.base || vram >= nv->mem.base + nv->mem.size ||
-		     (vram & 255) || (pitch & 63)))
+		     (vram & 255) || (pitch & 63) || block_h > 5))
 		return -EINVAL;
+	if (!vram)
+		block_h = -1;
 	if (vram && !READ_ONCE(e->pool_ctxdma)) {	/* once: instmem + RM, needs gsp_lock */
 		mutex_lock(&nv->gsp_lock);
 		mutex_lock(&e->win_lock);
 		if (!e->pool_ctxdma && win->handle)
-			ret = nv_evo_ctxdma(nv, NVDRV_H_POOL_CTXDMA, nv->mem.base, nv->mem.size, win->chn, false);
+			ret = nv_evo_ctxdma(nv, NVDRV_H_POOL_CTXDMA, nv->mem.base, nv->mem.size, win->chn, 0);
+		if (!ret && !e->pool_ctxdma && win->handle)
+			ret = nv_evo_ctxdma(nv, NVDRV_H_POOL_BL_CTXDMA, nv->mem.base, nv->mem.size, win->chn,
+					    NV_CTXDMA_BLOCK_LINEAR);
 		if (!ret && win->handle)
 			e->pool_ctxdma = true;
 		mutex_unlock(&e->win_lock);
@@ -661,27 +674,30 @@ int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch)
 		ret = -ENODEV;
 		goto out;
 	}
-	if (vram == e->scanout_cur)
+	if (vram == e->scanout_cur && block_h == e->scanout_bh)
 		goto out;
 	if (vram) {
-		ctxdma = NVDRV_H_POOL_CTXDMA;
+		ctxdma = block_h >= 0 ? NVDRV_H_POOL_BL_CTXDMA : NVDRV_H_POOL_CTXDMA;
 		offset = vram - nv->mem.base;
 	} else {
 		pitch = e->fb_pitch;
 	}
-	ret = nv_evo_begin(nv, win, 6 * 8);	/* bytes: six single-word methods */
+	ret = nv_evo_begin(nv, win, 7 * 8);	/* bytes: seven single-word methods */
 	if (ret)
 		goto out;
 	m1(win, C67E_SET_CONTEXT_DMA_ISO(0), ctxdma);
 	m1(win, C67E_SET_OFFSET(0), offset >> 8);
+	m1(win, C67E_SET_STORAGE, block_h >= 0 ? block_h : 0);
 	m1(win, C67E_SET_PLANAR_STORAGE(0), pitch >> 6);
 	/* standalone window update: the modeset left it interlocked with the core channel */
 	m1(win, C67E_SET_INTERLOCK_FLAGS, 0);
 	m1(win, C67E_SET_WINDOW_INTERLOCK_FLAGS, 0);
 	m1(win, C67E_UPDATE, 1);
 	ret = nv_evo_kick(nv, win);
-	if (!ret)
+	if (!ret) {
 		e->scanout_cur = vram;
+		e->scanout_bh = block_h;
+	}
 out:
 	mutex_unlock(&e->win_lock);
 	return ret;
@@ -710,7 +726,7 @@ int nv_disp_cursor_init(struct nvdrv_dev *nv)
 	e->curs_cpu = nv_bar1_map(nv, NV_BAR1_CURS_VA, e->curs_vram, 2 * NV_CURS_SLOT);
 	if (!e->curs_cpu)
 		return -EIO;
-	ret = nv_evo_ctxdma(nv, NVDRV_H_CURS_CTXDMA, e->curs_vram, 2 * NV_CURS_SLOT, e->core.chn, false);
+	ret = nv_evo_ctxdma(nv, NVDRV_H_CURS_CTXDMA, e->curs_vram, 2 * NV_CURS_SLOT, e->core.chn, 0);
 	if (ret)
 		return ret;
 	ret = nv_evo_pio_alloc(nv, NVC67A_CURSOR_IMM_CHANNEL_PIO, NVDRV_H_CURS, e->head);
@@ -786,7 +802,7 @@ int nv_disp_cursor_image(struct nvdrv_dev *nv, u64 vram, const void *src, u32 sr
 		}
 		if (!e->curs_pool_ctxdma) {
 			ret = nv_evo_ctxdma(nv, NVDRV_H_POOL_CORE_CTXDMA, nv->mem.base, nv->mem.size,
-					    e->core.chn, false);
+					    e->core.chn, 0);
 			if (ret)
 				goto out;
 			e->curs_pool_ctxdma = true;

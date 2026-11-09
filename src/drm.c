@@ -109,7 +109,29 @@ static bool nv_drm_mode_ok(struct nv_drm *d, const struct drm_display_mode *dm)
 /* ---- plane ------------------------------------------------------------- */
 
 static const u32 nv_formats[] = { DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888 };	/* alpha ignored */
-static const u64 nv_modifiers[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID };
+/*
+ * GPU-rendered framebuffers may also be block linear (scanned out directly; copied ones must
+ * be linear). Turing+ layout as nouveau wndwc57e_modifiers / NVK: page kind 0x06, kind
+ * generation 2, sector layout 1, no compression, block height 32..1 GOBs.
+ */
+#define NV_MOD_BL(h)	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 0x06, h)
+static const u64 nv_modifiers[] = {
+	NV_MOD_BL(5), NV_MOD_BL(4), NV_MOD_BL(3), NV_MOD_BL(2), NV_MOD_BL(1), NV_MOD_BL(0),
+	DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID
+};
+
+/* log2 block height of a supported block-linear modifier, -1 for linear, -2 otherwise */
+static int nv_mod_block_h(u64 mod)
+{
+	int h;
+
+	if (mod == DRM_FORMAT_MOD_LINEAR)
+		return -1;
+	for (h = 0; h <= 5; h++)
+		if (mod == NV_MOD_BL(h))
+			return h;
+	return -2;
+}
 
 static int nv_plane_atomic_check(struct drm_plane *plane, struct drm_atomic_commit *state)
 {
@@ -123,10 +145,12 @@ static int nv_plane_atomic_check(struct drm_plane *plane, struct drm_atomic_comm
 		cs = drm_atomic_get_new_crtc_state(state, ps->crtc);
 	ret = drm_atomic_helper_check_plane_state(ps, cs, DRM_PLANE_NO_SCALING,
 						  DRM_PLANE_NO_SCALING, false, false);
-	if (ret || !ps->fb || !nv_uapi_bo_vram(ps->fb->obj[0], &vram))
+	if (ret || !ps->fb)
 		return ret;
+	if (!nv_uapi_bo_vram(ps->fb->obj[0], &vram))	/* copied: linear only */
+		return ps->fb->modifier == DRM_FORMAT_MOD_LINEAR ? 0 : -EINVAL;
 	/* GPU-rendered VRAM framebuffer: scanned out directly, so it must fit the window */
-	if (ps->fb->modifier != DRM_FORMAT_MOD_LINEAR || (ps->fb->pitches[0] & 63) ||
+	if (nv_mod_block_h(ps->fb->modifier) < -1 || (ps->fb->pitches[0] & 63) ||
 	    ((vram + ps->fb->offsets[0]) & 255) || (ps->src.x1 >> 16) || (ps->src.y1 >> 16))
 		return -EINVAL;
 	return 0;
@@ -168,13 +192,13 @@ static void nv_plane_atomic_update(struct drm_plane *plane, struct drm_atomic_co
 	if (!fb || !drm_dev_enter(&d->dev, &idx))
 		return;
 	if (nv_uapi_bo_vram(fb->obj[0], &vram)) {	/* zero copy: flip the window to it */
-		nv_disp_scanout(d->nv, vram + fb->offsets[0], fb->pitches[0]);
+		nv_disp_scanout(d->nv, vram + fb->offsets[0], fb->pitches[0], nv_mod_block_h(fb->modifier));
 		atomic64_inc(&d->updates);
 		drm_dev_exit(idx);
 		return;
 	}
 	if (d->nv->evo.scanout_cur) {	/* back from a direct framebuffer: copy all of this one */
-		nv_disp_scanout(d->nv, 0, 0);
+		nv_disp_scanout(d->nv, 0, 0, -1);
 		ps->ignore_damage_clips = true;
 	}
 	drm_atomic_helper_damage_iter_init(&iter, old, ps);

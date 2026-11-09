@@ -558,7 +558,11 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       → S5.16 as nvCscCoefConvertS514. Both survive modesets (the modeset programs the current state).
       `tools/colortest`: red tint / red-blue swap / warm legacy gamma, verified on screen and in the ARMed state.
 - [ ] **Colour**: 10-bit formats, HDR metadata; DSC.
-- [ ] **Block-linear scanout modifiers** (NVK renders scanout buffers linear today).
+- [x] **Block-linear scanout modifiers** (2026-11-09): the primary plane offers
+      DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 0x06, 0..5) (nouveau wndwc57e_modifiers, what NVK negotiates)
+      besides LINEAR, for VRAM framebuffers (copied ones stay linear). Scanout through a second VRAM-pool ctxdma
+      with the KIND bit (bit 20, nouveau gv100_dmaobj_new) and SET_STORAGE = log2 block height; the pitch stays
+      in 64-byte units. `KMSGL_BL=1 tools/kmsgl`: GBM picks 32-GOB blocks, picture correct on screen.
 - [ ] **Audio** over DisplayPort / HDMI.
 - [ ] fbdev restore after the last DRM master closes; mode changes through a real per-commit modeset path.
 

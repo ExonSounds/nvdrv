@@ -5,7 +5,7 @@
  * front buffer, page flips. With nvdrv the flips are zero-copy (window points at the
  * buffer in VRAM). Draws moving colour bars for N seconds and reports the flip rate.
  *   cc -O2 -o kmsgl tools/kmsgl.c $(pkg-config --cflags --libs gbm egl glesv2 libdrm)
- *   [KMSGL_HZ=refresh] kmsgl [/dev/dri/card0] [seconds]
+ *   [KMSGL_HZ=refresh] [KMSGL_BL=1] kmsgl [/dev/dri/card0] [seconds]
  */
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -36,6 +36,11 @@ static uint32_t fb_for(struct gbm_bo *bo)
 	uint32_t *id = gbm_bo_get_user_data(bo);
 	uint32_t handles[4] = { gbm_bo_get_handle(bo).u32 }, pitches[4] = { gbm_bo_get_stride(bo) }, offs[4] = {};
 	uint64_t mods[4] = { gbm_bo_get_modifier(bo) };
+	static int shown;
+
+	if (!shown++)
+		printf("scanout buffer: modifier 0x%016llx, pitch %u\n", (unsigned long long)mods[0],
+		       gbm_bo_get_stride(bo));
 
 	if (id)
 		return *id;
@@ -99,9 +104,15 @@ int main(int argc, char **argv)
 	printf("%s: %ux%u@%u\n", path, mode.hdisplay, mode.vdisplay, mode.vrefresh);
 
 	struct gbm_device *gbm = gbm_create_device(fd);
-	uint64_t mod = DRM_FORMAT_MOD_LINEAR;
+	/* KMSGL_BL=1: let the driver pick a block-linear layout (what compositors negotiate) */
+	uint64_t mods[7] = { DRM_FORMAT_MOD_LINEAR };
+	unsigned int nmods = 1;
+
+	if (getenv("KMSGL_BL"))
+		for (nmods = 0; nmods < 6; nmods++)
+			mods[nmods] = DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 0x06, 5 - nmods);
 	struct gbm_surface *gs = gbm_surface_create_with_modifiers2(gbm, mode.hdisplay, mode.vdisplay,
-								    GBM_FORMAT_XRGB8888, &mod, 1,
+								    GBM_FORMAT_XRGB8888, mods, nmods,
 								    GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
 	if (!gs) {
 		fprintf(stderr, "gbm surface failed\n");

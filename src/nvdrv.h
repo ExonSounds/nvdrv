@@ -339,6 +339,7 @@ struct nv_evo {
 	bool fb_bound, win_mapped, active;
 	bool pool_ctxdma;			/* window ctxdma over the VRAM pool exists */
 	u64 scanout_cur;			/* surface window 0 shows (0 = own framebuffer) */
+	int scanout_bh;				/* its log2 block height, -1 = pitch linear */
 	u32 fb_pitch;				/* own framebuffer pitch for the current mode */
 	u32 sor, head;				/* of the active modeset */
 	/* hardware cursor (modeset.c): PIO channel for the position, image via the core channel */
@@ -593,7 +594,9 @@ void nv_vram_wr32(struct nvdrv_dev *nv, u64 off, u32 val);
 u32 nv_vram_rd32(struct nvdrv_dev *nv, u64 off);
 void nv_vram_fill(struct nvdrv_dev *nv, u64 off, u64 len, u32 val,
 		  u32 (*fn)(void *ctx, u64 i), void *ctx);
-int nv_evo_ctxdma(struct nvdrv_dev *nv, u32 handle, u64 base, u64 size, u32 chn, bool sysmem);
+#define NV_CTXDMA_SYSMEM		BIT(0)
+#define NV_CTXDMA_BLOCK_LINEAR		BIT(1)
+int nv_evo_ctxdma(struct nvdrv_dev *nv, u32 handle, u64 base, u64 size, u32 chn, u32 flags);
 void nv_evo_mthd(struct nv_evo_chan *c, u32 mthd, const u32 *data, u32 n);
 int nv_evo_kick(struct nvdrv_dev *nv, struct nv_evo_chan *c);
 int nv_evo_kick_nowait(struct nvdrv_dev *nv, struct nv_evo_chan *c);
@@ -732,7 +735,7 @@ int nv_disp_set_mode(struct nvdrv_dev *nv, const struct nv_mode *m);
 #define NV_FLIP_CSC			BIT(4)	/* send CSC/ILUT/TMO disables (err 0x2 with bypass) */
 #define NV_FLIP_SYSMEM			BIT(5)	/* scan out a test surface from coherent sysmem */
 #define NV_FLIP_ILUT			BIT(6)	/* with COMPOSE: identity input LUT (modeset.c lut_init) */
-int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch);
+int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch, int block_h);
 int nv_disp_cursor_init(struct nvdrv_dev *nv);
 int nv_disp_color(struct nvdrv_dev *nv, const u16 *lut, const u32 *ocsc);
 #define NV_OLUT_ENTRIES		1025	/* 1024 + the last repeated (interpolation) */
