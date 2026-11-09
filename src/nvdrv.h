@@ -431,6 +431,7 @@ struct nv_uapi {
 	atomic64_t evicted_bytes, evictions;
 	atomic64_t big_ptes, small_ptes;		/* client PTEs written: 64 KiB / 4 KiB */
 	atomic64_t huge_ptes;			/* 2 MiB PTEs (PD0 entries) */
+	atomic64_t sparse_pdes;			/* sparse 2 MiB PD0 entries */
 	atomic64_t compressed_maps;		/* VM_BIND maps with a compressible kind */
 	bool zcull_valid;			/* zcull[] holds drm_nouveau_get_zcull_info */
 	u32 zcull[12];

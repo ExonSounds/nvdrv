@@ -467,7 +467,19 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       - `nvktest sync`: stalled channel (host semaphore acquire released by the CPU), instant unmap, CPU_PREP
         busy/idle across two clients with a dma-buf, async bind returning at once and taking effect after the GPU
         signals its wait.
-- [ ] Full sparse-binding semantics (unmap inside a sparse region, residency queries).
+- [x] **Sparse-binding semantics** (2026-11-09), as nouveau's uvmm:
+      - Sparse regions (VM_BIND MAP with SPARSE, no object): holes read 0 and drop writes (PTE VALID_FALSE + VOL);
+        object mappings inside work; a plain unmap inside reverts the range to sparse; a sparse unmap removes the
+        region and every mapping in it.
+      - Rules: regions never overlap (-ENOSPC); an object mapping is entirely inside one region or outside all of
+        them (-ENOSPC); a sparse unmap names exactly one region (-ENOENT).
+      - A region created over existing mappings keeps them (it was overwriting their PTEs before).
+      - Fully sparse 2 MiB blocks are one PD0 entry (VALID_FALSE + VOL_BIG, nouveau gp100_vmm_pd0_sparse), no page
+        tables: a 16 GiB region takes 79 ms and no VRAM (was ~4 M PTE writes and 2 tables per 2 MiB). Such an entry
+        splits into tables when an object is mapped into it, and becomes invalid when nothing covers it any more.
+      - Residency is the MMU's job (sparse PTEs); NVK exposes sparseBinding and sparseResidency*.
+      - `nvktest sparse` (17 checks): CE reads/writes of sparse pages, map/unmap inside, the rules, region over an
+        existing mapping, 16 GiB create/remove, fault after removal.
 - [ ] **Preemption buffers** (GFXP pool/control block, spill, beta CB; CILP) so long compute work can be preempted.
 - [x] **GPU recovery** (2026-11-09):
       - Faults: RM recovers (RCs) the faulting channel itself; its fences fail with -EIO and EXEC returns -ENODEV

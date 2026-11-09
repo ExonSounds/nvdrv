@@ -1047,12 +1047,21 @@ static struct nv_vma *huge_vma(struct nv_cli *cli, struct nv_vma *hint, u64 r)
 	return pa & (SZ_2M - 1) ? NULL : v;
 }
 
-/* Make region r one 2 MiB PTE: PTE qword first (the entry becomes a PTE), then [1] = 0. */
-static int region_set_huge(struct nv_cli *cli, u64 ent, u64 r, struct nv_vma *v)
+/*
+ * A PD0 entry that is a leaf rather than a pointer to tables: a 2 MiB PTE (VALID) or a
+ * sparse 2 MiB region (nouveau gp100_vmm_pd0_sparse: VALID_FALSE + VOL_BIG, bit 3).
+ * Table pointers always carry an aperture (bits 2:1).
+ */
+#define PD0_SPARSE	BIT_ULL(3)
+static bool pd0_leaf(u64 e0)
+{
+	return (e0 & BIT_ULL(0)) || (!(e0 & (3ULL << 1)) && (e0 & PD0_SPARSE));
+}
+
+/* Make region r a leaf: e0 first (the entry stops pointing at tables), then [1] = 0. */
+static int region_set_leaf(struct nv_cli *cli, u64 ent, u64 r, u64 pte)
 {
 	struct nvdrv_dev *nv = cli->nv;
-	u64 pa = v->bo->node.start + v->bo_offset + (r - v->addr);
-	u64 pte = (pa >> 4) | BIT_ULL(0) | (u64)v->kind << NV_PTE_KIND_SHIFT;
 	u64 e0 = nv_vmm_rd64(nv, ent), e1 = nv_vmm_rd64(nv, ent + 8);
 
 	if (e0 == pte && !e1)
@@ -1077,8 +1086,35 @@ static int region_set_huge(struct nv_cli *cli, u64 ent, u64 r, struct nv_vma *v)
 	nv_vmm_wr64(nv, ent, pte);
 	nv_vmm_wr64(nv, ent + 8, 0);
 	vm_cache_reset(&cli->vm);
-	atomic64_inc(&nv->uapi.huge_ptes);
+	if (pte & BIT_ULL(0))
+		atomic64_inc(&nv->uapi.huge_ptes);
+	else if (pte)
+		atomic64_inc(&nv->uapi.sparse_pdes);
 	return 0;
+}
+
+static int region_set_huge(struct nv_cli *cli, u64 ent, u64 r, struct nv_vma *v)
+{
+	u64 pa = v->bo->node.start + v->bo_offset + (r - v->addr);
+
+	return region_set_leaf(cli, ent, r, (pa >> 4) | BIT_ULL(0) | (u64)v->kind << NV_PTE_KIND_SHIFT);
+}
+
+/* What covers 2 MiB region r: 1 = only a sparse region (no object mapping), 0 = nothing, -1 = other. */
+static int region_class(struct nv_cli *cli, u64 r)
+{
+	bool sparse = false, any = false;
+	struct nv_vma *v;
+
+	list_for_each_entry(v, &cli->vmas, link) {
+		if (v->addr >= r + SZ_2M || v->addr + v->range <= r)
+			continue;
+		if (v->bo)
+			return -1;
+		any = true;
+		sparse |= v->addr <= r && v->addr + v->range >= r + SZ_2M;
+	}
+	return sparse ? 1 : any ? -1 : 0;
 }
 
 /*
@@ -1130,9 +1166,16 @@ static int write_ptes(struct nv_cli *cli, struct nv_vma *v, u64 addr, u64 range)
 	u64 end = addr + range, r, c, ent;
 	int ret = 0;
 
+	/*
+	 * A sparse region is never the reference for page contents: object mappings inside it
+	 * keep their PTEs (nouveau: regions and mappings are separate), holes become sparse.
+	 */
+	if (v && !v->bo)
+		v = NULL;
 	for (r = ALIGN_DOWN(addr, SZ_2M); r < end && !ret; r += SZ_2M) {
 		u64 rs = max(addr, r), re = min(end, r + SZ_2M);
 		struct nv_vma *hv = huge_vma(cli, v, r);
+		int cls = hv ? -1 : region_class(cli, r);
 
 		ret = nv_vmm_pd0_entry(nv, &cli->vm, r, &ent);
 		if (ret)
@@ -1141,7 +1184,15 @@ static int write_ptes(struct nv_cli *cli, struct nv_vma *v, u64 addr, u64 range)
 			ret = region_set_huge(cli, ent, r, hv);
 			continue;
 		}
-		if (nv_vmm_rd64(nv, ent) & BIT_ULL(0)) {	/* huge, but no longer one mapping */
+		if (cls == 1) {			/* all sparse: one sparse PD0 entry, no tables */
+			ret = region_set_leaf(cli, ent, r, PD0_SPARSE);
+			continue;
+		}
+		if (cls == 0 && pd0_leaf(nv_vmm_rd64(nv, ent))) {	/* was a leaf, now nothing: invalid */
+			ret = region_set_leaf(cli, ent, r, 0);
+			continue;
+		}
+		if (pd0_leaf(nv_vmm_rd64(nv, ent))) {	/* leaf, but no longer one mapping / all sparse */
 			ret = region_split(cli, ent, r, v);
 			rs = r;			/* every chunk can go back to 64 KiB pages */
 			re = r + SZ_2M;
@@ -1203,6 +1254,36 @@ static int vma_remove(struct nv_cli *cli, u64 addr, u64 range, bool sparse)
 	return 0;
 }
 
+/* The first sparse region overlapping [addr, addr + range), if any. */
+static struct nv_vma *sparse_region_at(struct nv_cli *cli, u64 addr, u64 range)
+{
+	struct nv_vma *v;
+
+	if (!cli->nsparse)
+		return NULL;
+	list_for_each_entry(v, &cli->vmas, link)
+		if (!v->bo && v->addr < addr + range && v->addr + v->range > addr)
+			return v;
+	return NULL;
+}
+
+/*
+ * Region rules, as nouveau (nouveau_uvmm.c bind_validate_map_common, OP_UNMAP_SPARSE):
+ * sparse regions never overlap (-ENOSPC); an object mapping lies entirely inside one region
+ * or outside all of them (-ENOSPC); a sparse unmap names exactly one region (-ENOENT) and
+ * takes every mapping inside it along.
+ */
+static int vm_bind_validate(struct nv_cli *cli, const struct drm_nouveau_vm_bind_op *op, bool sparse)
+{
+	struct nv_vma *reg = sparse_region_at(cli, op->addr, op->range);
+
+	if (op->op == DRM_NOUVEAU_VM_BIND_OP_UNMAP)
+		return !sparse || (reg && reg->addr == op->addr && reg->range == op->range) ? 0 : -ENOENT;
+	if (sparse)
+		return reg ? -ENOSPC : 0;
+	return !reg || (reg->addr <= op->addr && reg->addr + reg->range >= op->addr + op->range) ? 0 : -ENOSPC;
+}
+
 static int vm_bind_op(struct drm_file *file, struct nv_cli *cli, const struct drm_nouveau_vm_bind_op *op)
 {
 	bool sparse = op->flags & DRM_NOUVEAU_VM_BIND_SPARSE;
@@ -1212,6 +1293,11 @@ static int vm_bind_op(struct drm_file *file, struct nv_cli *cli, const struct dr
 	if (!op->range || (op->addr | op->range | op->bo_offset) & (SZ_4K - 1) ||
 	    op->addr + op->range > cli->kernel_va || in_kernel_range(cli, op->addr, op->range))
 		return -EINVAL;
+	if (op->op <= DRM_NOUVEAU_VM_BIND_OP_UNMAP) {
+		ret = vm_bind_validate(cli, op, sparse);
+		if (ret)
+			return ret;
+	}
 
 	if (op->op == DRM_NOUVEAU_VM_BIND_OP_UNMAP) {
 		/*
@@ -2260,6 +2346,7 @@ void nv_uapi_mem_show(struct nvdrv_dev *nv, struct seq_file *m)
 		   job_timeout_ms);
 	seq_printf(m, "evictions: %lld (%lld MiB moved to system memory)\n", atomic64_read(&ua->evictions),
 		   atomic64_read(&ua->evicted_bytes) >> 20);
+	seq_printf(m, "sparse 2 MiB PD0 entries written: %lld\n", atomic64_read(&ua->sparse_pdes));
 	seq_printf(m, "client PTEs written: %lld huge (2 MiB), %lld big (64 KiB), %lld small (4 KiB); compressed mappings %lld\n",
 		   atomic64_read(&ua->huge_ptes), atomic64_read(&ua->big_ptes), atomic64_read(&ua->small_ptes),
 		   atomic64_read(&ua->compressed_maps));

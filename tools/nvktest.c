@@ -65,6 +65,14 @@ static int bind(uint32_t handle, uint64_t va, uint64_t size, uint32_t op)
 	return drmCommandWriteRead(fd, DRM_NOUVEAU_VM_BIND, &b, sizeof(b));
 }
 
+static int bind_sparse(uint64_t va, uint64_t size, uint32_t op)
+{
+	struct drm_nouveau_vm_bind_op o = { .op = op, .flags = DRM_NOUVEAU_VM_BIND_SPARSE, .addr = va, .range = size };
+	struct drm_nouveau_vm_bind b = { .op_count = 1, .op_ptr = (uintptr_t)&o };
+
+	return drmCommandWriteRead(fd, DRM_NOUVEAU_VM_BIND, &b, sizeof(b));
+}
+
 static uint32_t *p;
 static void mthd(int subc, uint32_t m, int n, ...)
 {
@@ -235,6 +243,122 @@ int main(int argc, char **argv)
 		       ((volatile uint32_t *)vram)[i]);
 	struct drm_nouveau_channel_free cf2 = { .channel = ca2.channel };
 	CHECK(drmCommandWrite(fd, DRM_NOUVEAU_CHANNEL_FREE, &cf2, sizeof(cf2)));
+
+	/*
+	 * nvktest sparse: sparse regions as NVK uses them for sparse resources. The copy engine
+	 * reads sparse pages (must be 0, no fault) and writes them (dropped, no fault); an object
+	 * mapped inside a region works and reverts to sparse when unmapped; nouveau's region rules
+	 * (-ENOSPC / -ENOENT); a region created over an existing mapping keeps it; a 16 GiB region
+	 * is cheap (sparse PD0 entries); after the region is removed, access faults.
+	 */
+	if (argc > 1 && !strcmp(argv[1], "sparse")) {
+		const uint64_t S = 0x1000000000ull, T = 0x2000003000ull, U = 0x3000000000ull, BIG = 0x4000000000ull;
+		struct drm_nouveau_channel_alloc cc = { .fb_ctxdma_handle = ~0u, .tt_ctxdma_handle = NOUVEAU_FIFO_ENGINE_CE };
+		volatile uint32_t *g = gart;
+		uint32_t hb, sc, njob = 0, k;
+		void *mb;
+		struct timespec t0, t1;
+		int okc = 0, total = 0;
+
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_CHANNEL_ALLOC, &cc, sizeof(cc)));
+		{
+			struct { struct nvif_hdr h; struct nvif_new n; } on = {
+				.h = { .type = 2, .route = 0xff, .token = cc.channel }, .n = { .oclass = 0xc7b5 } };
+			CHECK(drmCommandWrite(fd, DRM_NOUVEAU_NVIF, &on, sizeof(on)));
+		}
+		CHECK(drmSyncobjCreate(fd, 0, &sc));
+		struct drm_nouveau_sync ss = { .flags = DRM_NOUVEAU_SYNC_SYNCOBJ, .handle = sc };
+		/* copy len bytes src -> dst on the copy channel; returns the EXEC result (-ENODEV once RC'd) */
+#define CE_COPY(src, dst, len) ({							\
+		uint32_t off = 0xc000 + (njob++ % 16) * 0x100;				\
+		p = (uint32_t *)((char *)pb + off);					\
+		uint32_t *st_ = p;							\
+		mthd(4, 0x0000, 1, 0xc7b5);						\
+		mthd(4, 0x0400, 4, (uint32_t)((src) >> 32), (uint32_t)(src), (uint32_t)((dst) >> 32), (uint32_t)(dst)); \
+		mthd(4, 0x0418, 1, (len));						\
+		mthd(4, 0x0300, 1, 0x186);						\
+		ep.va = 0x10000000 + off;						\
+		ep.va_len = (uint32_t)((char *)p - (char *)st_);			\
+		ex.channel = cc.channel;						\
+		ex.wait_count = 0;							\
+		ex.sig_ptr = (uintptr_t)&ss;						\
+		int r_ = drmCommandWriteRead(fd, DRM_NOUVEAU_EXEC, &ex, sizeof(ex));	\
+		if (!r_)								\
+			drmSyncobjWait(fd, &sc, 1, INT64_MAX, 0, NULL);			\
+		r_; })
+#define CHECKV(cond, ...) do { int c_ = (cond); total++; okc += c_; printf("  %-4s ", c_ ? "ok" : "FAIL"); printf(__VA_ARGS__); printf("\n"); } while (0)
+		/* GART at 0x30000000: results at +0x8000.., a 0x5a pattern at +0xf000 */
+		for (k = 0; k < 0x1000 / 4; k++)
+			g[0xf000 / 4 + k] = 0x5a5a5a5a;
+
+		CHECKV(!bind_sparse(S, 64 << 20, DRM_NOUVEAU_VM_BIND_OP_MAP), "sparse region 64 MiB (2 MiB aligned)");
+		CHECKV(!bind_sparse(T, 5 << 20, DRM_NOUVEAU_VM_BIND_OP_MAP), "sparse region 5 MiB at an unaligned VA");
+		for (k = 0; k < 0x3000 / 4; k++)
+			g[0x8000 / 4 + k] = 0xffffffff;
+		r = CE_COPY(S + 0x123000, 0x30008000ull, 0x1000);
+		r |= CE_COPY(T + 0x1000, 0x30009000ull, 0x1000);
+		r |= CE_COPY(T + (5 << 20) - 0x1000, 0x3000a000ull, 0x1000);
+		for (k = 0, i = 0; k < 0x3000 / 4; k++)
+			i |= g[0x8000 / 4 + k];
+		CHECKV(!r && !i, "GPU reads of sparse pages (2 MiB entry, table edges) return 0 (%d, or 0x%x)", r, i);
+		r = CE_COPY(0x3000f000ull, S + 0x200000, 0x1000);
+		r |= CE_COPY(0x3000f000ull, T + 0x2000, 0x1000);
+		r |= CE_COPY(S + 0x200000, 0x30008000ull, 0x1000);
+		CHECKV(!r && !g[0x8000 / 4], "GPU writes to sparse pages are dropped without a fault (%d, reads 0x%x)", r,
+		       g[0x8000 / 4]);
+
+		CHECK(bo_new(0x10000, NOUVEAU_GEM_DOMAIN_VRAM, &hb, &mb));
+		for (k = 0; k < 0x10000 / 4; k++)
+			((volatile uint32_t *)mb)[k] = 0xb0b00000 + k;
+		CHECKV(!bind(hb, S + 0x401000, 0x10000, DRM_NOUVEAU_VM_BIND_OP_MAP), "object mapped inside the region");
+		g[0x8000 / 4] = g[0x9000 / 4] = 0xffffffff;
+		r = CE_COPY(S + 0x401000 + 0x40, 0x30008000ull, 0x1000);
+		r |= CE_COPY(S + 0x400000, 0x30009000ull, 0x1000);
+		CHECKV(!r && g[0x8000 / 4] == 0xb0b00010 && !g[0x9000 / 4],
+		       "  its data reads back (0x%08x), the hole next to it still reads 0 (0x%x)", g[0x8000 / 4], g[0x9000 / 4]);
+		CHECKV(!bind(0, S + 0x401000, 0x10000, DRM_NOUVEAU_VM_BIND_OP_UNMAP), "object unmapped (not sparse)");
+		g[0x8000 / 4] = 0xffffffff;
+		r = CE_COPY(S + 0x401000, 0x30008000ull, 0x1000);
+		CHECKV(!r && !g[0x8000 / 4], "  the range is sparse again: reads 0, no fault (%d, 0x%x)", r, g[0x8000 / 4]);
+
+		r = bind_sparse(S + (32 << 20), 64 << 20, DRM_NOUVEAU_VM_BIND_OP_MAP);
+		CHECKV(r == -ENOSPC, "overlapping sparse region refused: %d", r);
+		r = bind(hb, S + (64 << 20) - 0x1000, 0x10000, DRM_NOUVEAU_VM_BIND_OP_MAP);
+		CHECKV(r == -ENOSPC, "mapping across a region boundary refused: %d", r);
+		r = bind_sparse(S, 32 << 20, DRM_NOUVEAU_VM_BIND_OP_UNMAP);
+		CHECKV(r == -ENOENT, "sparse unmap of a partial region refused: %d", r);
+
+		CHECK(bind(hb, U + 0x10000, 0x10000, DRM_NOUVEAU_VM_BIND_OP_MAP));
+		CHECKV(!bind_sparse(U - (2 << 20), 6 << 20, DRM_NOUVEAU_VM_BIND_OP_MAP), "sparse region over an existing mapping");
+		g[0x8000 / 4] = g[0x9000 / 4] = 0xffffffff;
+		r = CE_COPY(U + 0x10000 + 0x80, 0x30008000ull, 0x1000);
+		r |= CE_COPY(U + 0x30000, 0x30009000ull, 0x1000);
+		CHECKV(!r && g[0x8000 / 4] == 0xb0b00020 && !g[0x9000 / 4], "  the mapping is kept (0x%08x), holes read 0 (0x%x)",
+		       g[0x8000 / 4], g[0x9000 / 4]);
+
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		r = bind_sparse(BIG, 16ull << 30, DRM_NOUVEAU_VM_BIND_OP_MAP);
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+		g[0x8000 / 4] = 0xffffffff;
+		int r2 = CE_COPY(BIG + (12ull << 30) + 0x5000, 0x30008000ull, 0x1000);
+		CHECKV(!r && !r2 && !g[0x8000 / 4], "16 GiB sparse region in %.1f ms, reads 0 deep inside it", ms);
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		r = bind_sparse(BIG, 16ull << 30, DRM_NOUVEAU_VM_BIND_OP_UNMAP);
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+		CHECKV(!r, "  removed in %.1f ms", ms);
+
+		CHECKV(!bind_sparse(T, 5 << 20, DRM_NOUVEAU_VM_BIND_OP_UNMAP) && !bind_sparse(U - (2 << 20), 6 << 20,
+		       DRM_NOUVEAU_VM_BIND_OP_UNMAP) && !bind_sparse(S, 64 << 20, DRM_NOUVEAU_VM_BIND_OP_UNMAP),
+		       "regions removed (exact ranges)");
+		r = CE_COPY(S + 0x123000, 0x30008000ull, 0x1000);
+		usleep(100000);
+		r = CE_COPY(0x30008000ull, 0x30009000ull, 0x1000);
+		CHECKV(r == -ENODEV, "access after removal faults the channel (next EXEC: %d)", r);
+		printf("sparse: %d/%d -> %s\n", okc, total, okc == total ? "PASS" : "FAIL");
+		return 0;
+	}
 
 	/*
 	 * nvktest lost: device-lost handling (GSP death simulated through debugfs gpu_lost; the
