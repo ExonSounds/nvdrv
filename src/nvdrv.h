@@ -353,6 +353,8 @@ struct nv_evo {
 	void __iomem *lut_cpu;
 	bool lut_ready;
 	bool composed;				/* window in composition (OLUT/OCSC0 on), not bypass */
+	u32 olut_off;				/* OLUT slot in use (offset in the LUT buffer) */
+	u32 ocsc[12];				/* OCSC0 matrix in use (S5.16; DRM CTM) */
 };
 
 /* BAR1 page tables under GSP-RM's root (src/bar1.c). */
@@ -732,6 +734,8 @@ int nv_disp_set_mode(struct nvdrv_dev *nv, const struct nv_mode *m);
 #define NV_FLIP_ILUT			BIT(6)	/* with COMPOSE: identity input LUT (modeset.c lut_init) */
 int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch);
 int nv_disp_cursor_init(struct nvdrv_dev *nv);
+int nv_disp_color(struct nvdrv_dev *nv, const u16 *lut, const u32 *ocsc);
+#define NV_OLUT_ENTRIES		1025	/* 1024 + the last repeated (interpolation) */
 int nv_disp_cursor_image(struct nvdrv_dev *nv, u64 vram, const void *src, u32 src_pitch, u32 size);
 int nv_disp_cursor_off(struct nvdrv_dev *nv);
 void nv_disp_cursor_move(struct nvdrv_dev *nv, int x, int y);

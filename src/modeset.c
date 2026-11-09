@@ -95,7 +95,8 @@
 #define NVDRV_H_CURS				0xd000c67a
 #define NVDRV_H_LUT_CTXDMA			0xd000f105	/* LUTs, window channel */
 #define NVDRV_H_LUT_CORE_CTXDMA			0xd000f106	/* LUTs, core channel */
-#define OLUT_OFFSET				0x4000		/* in the LUT buffer, after the ILUT */
+#define OLUT_OFFSET				0x4000		/* two OLUT slots in the LUT buffer, after the ILUT */
+#define OLUT_SLOT				0x4000
 
 #define C67D_HEAD_SET_OCSC0CONTROL		0x2240
 #define C67D_HEAD_SET_OCSC0COEFFICIENT_C00	0x2244
@@ -235,6 +236,26 @@ static u16 u0_16_to_fp16(u16 fixed)
 }
 
 /*
+ * Output LUT into the slot at @off (nouveau headc57d_olut_load): VSS header, then 1025
+ * entries of unsigned 16-bit R, G, B; @lut has NV_OLUT_ENTRIES * 3 values, NULL = identity.
+ */
+static void olut_write(struct nv_evo *e, u32 off, const u16 *lut)
+{
+	u32 i;
+
+	memset_io(e->lut_cpu + off, 0, 0x20);
+	for (i = 0; i < NV_OLUT_ENTRIES; i++) {
+		void __iomem *p = e->lut_cpu + off + 0x20 + i * 8;
+		u16 v = min(i, 1023u) * 0xffff / 1023;
+
+		writew(lut ? lut[i * 3 + 0] : v, p);
+		writew(lut ? lut[i * 3 + 1] : v, p + 2);
+		writew(lut ? lut[i * 3 + 2] : v, p + 4);
+		writew(0, p + 6);
+	}
+}
+
+/*
  * Identity input LUT in VRAM (nouveau wndwc57e_ilut with ilut_identity): 32-byte VSS header,
  * 1024 DIRECT10 entries of FP16 R, G, B (8 bytes each), the last one repeated.
  * Caller holds gsp_lock; BAR1 is set up (the framebuffer is mapped first).
@@ -267,17 +288,10 @@ static int lut_init(struct nvdrv_dev *nv)
 		writew(v, p + 4);
 		writew(0, p + 6);
 	}
-	/* identity output LUT (nouveau headc57d_olut_load): unsigned 16-bit entries */
-	memset_io(e->lut_cpu + OLUT_OFFSET, 0, 0x20);
-	for (i = 0; i <= 1024; i++) {
-		u16 v = min(i, 1023u) * 0xffff / 1023;
-		void __iomem *p = e->lut_cpu + OLUT_OFFSET + 0x20 + i * 8;
-
-		writew(v, p);
-		writew(v, p + 2);
-		writew(v, p + 4);
-		writew(0, p + 6);
-	}
+	olut_write(e, OLUT_OFFSET, NULL);
+	e->olut_off = OLUT_OFFSET;
+	for (i = 0; i < 12; i++)
+		e->ocsc[i] = (i % 5 == 0) ? 0x10000 : 0;
 	wmb();
 	(void)ioread32(e->lut_cpu);
 	ret = nv_evo_ctxdma(nv, NVDRV_H_LUT_CTXDMA, e->lut_vram, NV_LUT_SIZE, e->win[0].chn, false);
@@ -295,8 +309,9 @@ static int lut_init(struct nvdrv_dev *nv)
  * first, the OLUT, then OCSC0 enabled ("only enable OCSC0 after enabling the OLUT": the
  * specification requires the two together).
  */
-static void olut_methods(struct nv_evo_chan *core, u32 head, bool on)
+static void olut_methods(struct nv_evo *e, u32 head, bool on)
 {
+	struct nv_evo_chan *core = &e->core;
 	u32 i;
 
 	if (!on) {	/* composition bypass: no OLUT, OCSC0 off (nvSetupOutputLUT5) */
@@ -305,11 +320,11 @@ static void olut_methods(struct nv_evo_chan *core, u32 head, bool on)
 		m1(core, C67D_HEAD(head, C67D_HEAD_SET_CONTEXT_DMA_OLUT), 0);
 		return;
 	}
-	for (i = 0; i < 12; i++)	/* identity, S5.16 in 20:0 (nvCscCoefConvertS514) */
-		m1(core, C67D_HEAD(head, C67D_HEAD_SET_OCSC0COEFFICIENT_C00) + 4 * i, (i % 5 == 0) ? 0x10000 : 0);
+	for (i = 0; i < 12; i++)	/* S5.16 in 20:0 (nvCscCoefConvertS514); identity or the CTM */
+		m1(core, C67D_HEAD(head, C67D_HEAD_SET_OCSC0COEFFICIENT_C00) + 4 * i, e->ocsc[i]);
 	m1(core, C67D_HEAD(head, C67D_HEAD_SET_OLUT_CONTROL), OLUT_INTERPOLATE | OLUT_DIRECT10 | ILUT_ENTRIES << 8);
 	m1(core, C67D_HEAD(head, C67D_HEAD_SET_CONTEXT_DMA_OLUT), NVDRV_H_LUT_CORE_CTXDMA);
-	m1(core, C67D_HEAD(head, C67D_HEAD_SET_OFFSET_OLUT), OLUT_OFFSET >> 8);
+	m1(core, C67D_HEAD(head, C67D_HEAD_SET_OFFSET_OLUT), e->olut_off >> 8);
 	m1(core, C67D_HEAD(head, C67D_HEAD_SET_OLUT_FP_NORM_SCALE), 0xffffffff);
 	m1(core, C67D_HEAD(head, C67D_HEAD_SET_OCSC0CONTROL), 1);	/* ENABLE */
 }
@@ -536,7 +551,7 @@ static int modeset_win_locked(struct nvdrv_dev *nv, u32 flags)
 	m1(core, C67D_HEAD(head, HEAD_SET_MAX_OUTPUT_SCALE_FACTOR), SCALE_1X | SCALE_1X << 16);
 	m1(core, C67D_HEAD(head, HEAD_SET_HEAD_USAGE_BOUNDS), 4 | BIT(4) | 1 << 12);
 	/* composition needs the head's OLUT + OCSC0 in the same (window-interlocked) update */
-	olut_methods(core, head, flags & NV_FLIP_COMPOSE);
+	olut_methods(e, head, flags & NV_FLIP_COMPOSE);
 	m1(core, C67D_SET_INTERLOCK_FLAGS, 0);
 	m1(core, C67D_SET_WINDOW_INTERLOCK_FLAGS, BIT(0));
 	m1(core, C67D_UPDATE, 1);			/* RELEASE_ELV */
@@ -823,6 +838,48 @@ void nv_disp_cursor_move(struct nvdrv_dev *nv, int x, int y)
 	mutex_unlock(&e->curs_lock);
 }
 
+/*
+ * Gamma (@lut, NV_OLUT_ENTRIES * 3 unsigned 16-bit values, NULL = identity) and colour
+ * matrix (@ocsc, 12 S5.16 coefficients of OCSC0, NULL = identity) of the active head: the
+ * LUT goes into the OLUT slot not on screen, then one core update switches both at vblank.
+ * Needs composition (compose=1).
+ */
+int nv_disp_color(struct nvdrv_dev *nv, const u16 *lut, const u32 *ocsc)
+{
+	struct nv_evo *e = &nv->evo;
+	struct nv_evo_chan *core = &e->core;
+	u32 i, off;
+	int ret;
+
+	mutex_lock(&nv->gsp_lock);
+	mutex_lock(&e->win_lock);
+	ret = -ENODEV;
+	if (!e->active || !e->composed || !e->lut_ready)
+		goto out;
+	off = e->olut_off == OLUT_OFFSET ? OLUT_OFFSET + OLUT_SLOT : OLUT_OFFSET;
+	olut_write(e, off, lut);
+	wmb();
+	(void)ioread32(e->lut_cpu);
+	ret = nv_evo_begin(nv, core, 24 * 8);
+	if (ret)
+		goto out;
+	e->olut_off = off;
+	for (i = 0; i < 12; i++)
+		e->ocsc[i] = ocsc ? ocsc[i] : (i % 5 == 0) ? 0x10000 : 0;
+	olut_methods(e, e->head, true);
+	m1(core, C67D_SET_INTERLOCK_FLAGS, 0);
+	m1(core, C67D_SET_WINDOW_INTERLOCK_FLAGS, 0);
+	m1(core, C67D_UPDATE, 1);
+	ret = nv_evo_kick(nv, core);
+	dev_dbg(&nv->pdev->dev, "color: lut %s, ctm %s, slot 0x%x: %d, core except 0x%08x err 0x%08x\n",
+		lut ? "custom" : "identity", ocsc ? "custom" : "identity", off, ret,
+		nv_rd32(nv, 0x611020), nv_rd32(nv, 0x611028));
+out:
+	mutex_unlock(&e->win_lock);
+	mutex_unlock(&nv->gsp_lock);
+	return ret;
+}
+
 int nv_disp_flip(struct nvdrv_dev *nv, u32 flags)
 {
 	struct nv_evo *e = &nv->evo;
@@ -864,7 +921,7 @@ int nv_disp_flip(struct nvdrv_dev *nv, u32 flags)
 		ret = nv_evo_begin(nv, core, 24 * 8);
 		if (ret)
 			goto out_win;
-		olut_methods(core, e->head, flags & NV_FLIP_COMPOSE);
+		olut_methods(e, e->head, flags & NV_FLIP_COMPOSE);
 		m1(core, C67D_SET_INTERLOCK_FLAGS, 0);
 		m1(core, C67D_SET_WINDOW_INTERLOCK_FLAGS, BIT(0));
 		m1(core, C67D_UPDATE, 1);

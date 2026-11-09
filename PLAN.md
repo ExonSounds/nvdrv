@@ -552,7 +552,12 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       scanoutpos conversion. `tools/vblanktest`: 180.001 Hz, interval jitter ±0.5 µs; kmsgl flips at 179.8 of
       180 Hz. The software timer stays as the fallback without interrupts.
 - [ ] **Async (tearing) page flips**.
-- [ ] **Colour**: gamma LUT / CTM, 10-bit formats, HDR metadata; DSC.
+- [x] **Gamma LUT and CTM** (2026-11-09, needs `compose=1`): DRM GAMMA_LUT (1024, any size resampled; the legacy
+      gamma ioctl goes through it) → the head OLUT, written into the slot not on screen (two slots) and switched
+      with OCSC0 in one core update at vblank; CTM → OCSC0 (before the OLUT, DRM's order), S31.32 sign-magnitude
+      → S5.16 as nvCscCoefConvertS514. Both survive modesets (the modeset programs the current state).
+      `tools/colortest`: red tint / red-blue swap / warm legacy gamma, verified on screen and in the ARMed state.
+- [ ] **Colour**: 10-bit formats, HDR metadata; DSC.
 - [ ] **Block-linear scanout modifiers** (NVK renders scanout buffers linear today).
 - [ ] **Audio** over DisplayPort / HDMI.
 - [ ] fbdev restore after the last DRM master closes; mode changes through a real per-commit modeset path.

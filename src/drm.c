@@ -18,6 +18,7 @@
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_color_mgmt.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
@@ -324,6 +325,12 @@ static int nv_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit 
 
 	if (!cs->enable)
 		return 0;
+	if (cs->color_mgmt_changed && cs->gamma_lut) {
+		u32 n = drm_color_lut_size(cs->gamma_lut);
+
+		if (n < 2 || n > 4096 || drm_color_lut_check(cs->gamma_lut, 0))
+			return -EINVAL;
+	}
 	if (!nv_drm_mode_ok(d, &cs->mode))
 		return -EINVAL;
 	return drm_atomic_helper_check_crtc_primary_plane(cs);
@@ -418,10 +425,71 @@ static bool nv_crtc_get_scanout_position(struct drm_crtc *crtc, bool in_vblank_i
 	return true;
 }
 
+/* ---- colour: GAMMA_LUT -> head OLUT, CTM -> OCSC0 (before the OLUT, as DRM's order) ---- */
+
+/* DRM S31.32 sign-magnitude to OCSC S5.16 in 20:0 (nvCscCoefConvertS514: clamp, round to 4). */
+static u32 ctm_coef(u64 v)
+{
+	s64 x = (s64)((v & ~BIT_ULL(63)) >> 16);
+
+	if (v & BIT_ULL(63))
+		x = -x;
+	x = clamp_t(s64, x + 2, -0x100000, 0xfffff);
+	return (u32)x & 0x1ffffc;
+}
+
+static void nv_crtc_color(struct nv_drm *d, struct drm_crtc_state *cs)
+{
+	u16 *lut = NULL;
+	u32 ocsc[12], i, c;
+	int ret;
+
+	if (cs->gamma_lut) {
+		const struct drm_color_lut *in = cs->gamma_lut->data;
+		u32 n = drm_color_lut_size(cs->gamma_lut);
+
+		lut = kmalloc_array(NV_OLUT_ENTRIES * 3, sizeof(*lut), GFP_KERNEL);
+		if (!lut)
+			return;
+		for (i = 0; i < NV_OLUT_ENTRIES; i++) {	/* resample n entries onto 1024 (+1) */
+			u32 pos = min(i, 1023u) * (n - 1) * 256 / 1023, a = pos >> 8, f = pos & 255;
+			u32 b = min(a + 1, n - 1);
+
+			for (c = 0; c < 3; c++) {
+				const u16 *pa = &in[a].red, *pb = &in[b].red;
+
+				lut[i * 3 + c] = (pa[c] * (256 - f) + pb[c] * f) >> 8;
+			}
+		}
+	}
+	if (cs->ctm) {
+		const struct drm_color_ctm *m = cs->ctm->data;
+
+		for (i = 0; i < 12; i++)	/* 3x4: 3x3 of the CTM, no offsets */
+			ocsc[i] = (i % 4 == 3) ? 0 : ctm_coef(m->matrix[(i / 4) * 3 + i % 4]);
+	}
+	ret = nv_disp_color(d->nv, lut, cs->ctm ? ocsc : NULL);
+	if (ret)
+		drm_err_once(&d->dev, "colour update: %d (needs compose=1)\n", ret);
+	kfree(lut);
+}
+
+static void nv_crtc_atomic_flush(struct drm_crtc *crtc, struct drm_atomic_commit *state)
+{
+	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
+	int idx;
+
+	if (cs->color_mgmt_changed && cs->active && drm_dev_enter(crtc->dev, &idx)) {
+		nv_crtc_color(to_nv_drm(crtc->dev), cs);
+		drm_dev_exit(idx);
+	}
+	drm_crtc_vblank_atomic_flush(crtc, state);
+}
+
 static const struct drm_crtc_helper_funcs nv_crtc_helper_funcs = {
 	.atomic_check = nv_crtc_atomic_check,
 	.mode_set_nofb = nv_crtc_mode_set_nofb,
-	.atomic_flush = drm_crtc_vblank_atomic_flush,
+	.atomic_flush = nv_crtc_atomic_flush,
 	.atomic_enable = nv_crtc_atomic_enable,
 	.atomic_disable = drm_crtc_vblank_atomic_disable,
 	.get_scanout_position = nv_crtc_get_scanout_position,
@@ -657,6 +725,10 @@ int nv_drm_register(struct nvdrv_dev *nv)
 	if (ret)
 		goto err;
 	drm_crtc_helper_add(&d->crtc, &nv_crtc_helper_funcs);
+	if (nv->evo.composed) {	/* gamma/CTM live in the composition pipeline */
+		drm_mode_crtc_set_gamma_size(&d->crtc, 1024);
+		drm_crtc_enable_color_mgmt(&d->crtc, 0, true, 1024);
+	}
 
 	ret = drm_encoder_init(dev, &d->encoder, &nv_encoder_funcs, DRM_MODE_ENCODER_TMDS, NULL);
 	if (ret)
