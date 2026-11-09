@@ -379,7 +379,10 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
 Done so far: GSP-RM boot, RM objects, DisplayPort display + KMS/fbdev, GPU VA spaces, channels, copy engine, GR
 contexts, nouveau uAPI subset for Mesa NVK (`nvk=1`), Zink GL, zero-copy scanout; Hyprland runs smoothly on the GPU.
 
-**In progress:** sensors (hwmon) and power management (items marked ▶).
+**Status (2026-11-09, paused):** every to-do item that needs no display checking is done (latest: per-object
+fences and async VM_BIND, 2 MiB pages, GPU recovery, sparse binding, preemption buffers; commit c30b586). Left:
+in-place GPU reset, multi-monitor, hardware cursor, VRR, suspend/resume, NVDEC/NVENC (items marked ▶ first).
+The machine was switched back to NVIDIA's driver at this point; see "Switching drivers" under Hardware workflow.
 
 To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
 
@@ -598,6 +601,21 @@ sudo KEEP=1 ./tests/phase12_display.sh                                       # b
 sudo KEEP=1 DRM=1 ./tests/phase12_display.sh                                 # ... + DRM device, text console on tty3
 sudo sh -c 'echo 1 > /sys/kernel/debug/nvdrv/0000:01:00.0/rm_selftest'      # RM error paths on a booted GSP
 ```
+
+### Switching drivers
+
+NVIDIA's driver (nvidia-open/nvidia-utils 615.x) stays installed. While nvdrv is in use it is disabled by
+`/etc/modprobe.d/blacklist-nvidia.conf` (blacklist + `install ... /bin/false` for nvidia, nvidia_drm,
+nvidia_modeset, nvidia_uvm), and the initramfs is rebuilt with `mkinitcpio -P`.
+
+- **Back to NVIDIA:** stop Hyprland, `sudo ./scripts/unbind.sh`, move the blacklist to
+  `/etc/modprobe.d/blacklist-nvidia.conf.disabled` (modprobe reads only `*.conf`), `sudo mkinitcpio -P`,
+  `sudo modprobe nvidia_drm` (pulls in nvidia, nvidia_modeset). If it fails to initialise the GPU, reboot.
+- **Back to nvdrv:** move the file back to `blacklist-nvidia.conf`, `sudo mkinitcpio -P`, reboot (the nvidia
+  modules cannot always be unloaded under a session), then `sudo NVDRV_PARAMS="nvk=1" KEEP=1 DRM=1
+  ./tests/phase12_display.sh` and start Hyprland.
+- The Hyprland config only sets `VK_DRIVER_FILES` to NVK when `/sys/module/nvdrv/parameters/nvk` is `Y`, so it
+  needs no change for either driver (pre-nvdrv backup: `~/.config/hypr/hyprland.lua.bak-nvdrv`).
 
 ## Key risks
 
