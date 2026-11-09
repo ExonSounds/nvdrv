@@ -44,6 +44,21 @@ MODULE_PARM_DESC(nvk, "Offer nouveau's uAPI for Mesa NVK (DRM driver named \"nou
 static bool dump_push;
 module_param(dump_push, bool, 0644);
 
+/*
+ * Preemption modes bound to every GR channel (new channels pick up changes). Without the
+ * bind GSP-RM leaves a channel at WFI: one long draw or dispatch holds the engine until it
+ * is done. Compute defaults to CTA: CILP is accepted by RM but behaves the same here (no SM
+ * trap handler from NVK), and CTA does not depend on one.
+ */
+static bool preempt = true;
+module_param(preempt, bool, 0644);
+MODULE_PARM_DESC(preempt, "Bind preemption buffers to GR channels (default on)");
+static uint preempt_gfx = 1, preempt_compute = 1;
+module_param(preempt_gfx, uint, 0644);
+MODULE_PARM_DESC(preempt_gfx, "Graphics preemption: 0 WFI, 1 GFXP (default)");
+module_param(preempt_compute, uint, 0644);
+MODULE_PARM_DESC(preempt_compute, "Compute preemption: 0 WFI, 1 CTA (default), 2 CILP");
+
 static uint job_timeout_ms = 10000;
 module_param(job_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(job_timeout_ms, "Stop a channel whose work makes no progress for this long (ms, 0 = never; default 10000)");
@@ -102,6 +117,7 @@ struct nv_uchan {
 	struct dma_fence *last;		/* most recent fence */
 	bool dead;
 	bool stopping;			/* watchdog is stopping it */
+	bool preempt_done;		/* preemption buffers bound */
 	u32 progress_sem;		/* semaphore value when last seen moving */
 	unsigned long progress_at;	/* jiffies of that (watchdog), under uapi.lock */
 	struct list_head all;		/* uapi.chans, under uapi.lock */
@@ -2138,6 +2154,12 @@ static int nvif_engine_obj(struct nv_cli *cli, struct nv_uchan *u, s32 oclass)
 	if (!ret)
 		ret = nv_rm_alloc(nv, cli->vm.h_client, u->ch.handle, H_UOBJ(u->ch.chid, u->nobj), oclass,
 			  oclass == AMPERE_DMA_COPY_B ? &ce : NULL, oclass == AMPERE_DMA_COPY_B ? sizeof(ce) : 0);
+	if (!ret && u->gr_ctx && !u->preempt_done && preempt) {	/* after the first GR object */
+		int pr = nv_gr_chan_preempt(nv, &u->ch, preempt_gfx, preempt_compute);
+
+		u->preempt_done = true;
+		pr_info_once("nvdrv: preemption bind (graphics %u, compute %u): %d\n", preempt_gfx, preempt_compute, pr);
+	}
 	mutex_unlock(&nv->gsp_lock);
 	if (!ret)
 		u->nobj++;
@@ -2350,6 +2372,61 @@ void nv_uapi_mem_show(struct nvdrv_dev *nv, struct seq_file *m)
 	seq_printf(m, "client PTEs written: %lld huge (2 MiB), %lld big (64 KiB), %lld small (4 KiB); compressed mappings %lld\n",
 		   atomic64_read(&ua->huge_ptes), atomic64_read(&ua->big_ptes), atomic64_read(&ua->small_ptes),
 		   atomic64_read(&ua->compressed_maps));
+}
+
+/*
+ * debugfs preempt: the preemption-related context buffer sizes GSP-RM reports (KGR context
+ * buffers info, NV0080 ENGINE_ID_GRAPHICS_* index) and each GR channel's current modes
+ * (NV2080_CTRL_CMD_GR_GET_CTXSW_MODES).
+ */
+#define NV2080_CTRL_CMD_GR_GET_CTXSW_MODES	0x20801235
+void nv_uapi_preempt_show(struct nvdrv_dev *nv, struct seq_file *m)
+{
+	static const struct { u8 idx; const char *name; } props[] = {
+		{ 0x00, "GRAPHICS (main)" }, { 0x0b, "PREEMPT" }, { 0x0c, "SPILL" }, { 0x0d, "PAGEPOOL" },
+		{ 0x0e, "BETACB" }, { 0x0f, "RTV" }, { 0x15, "GFXP_POOL" }, { 0x16, "GFXP_CTRL_BLK" }, { 0x19, "SETUP" },
+	};
+	static const char * const gfx[] = { "WFI", "GFXP", "GFXP_POOL" }, * const cmp[] = { "WFI", "CTA", "CILP" };
+	struct nv_gsp_static_info *si = &nv->gsp_info;
+	struct nv_uapi *ua = &nv->uapi;
+	struct { u32 h_client, h_subdevice, handle, chid; bool copy; } ch[UAPI_MAX_CHANS];
+	struct nv_uchan *u;
+	unsigned long flags;
+	__le32 *info;
+	int i, n = 0, ret;
+
+	info = kzalloc(8 * 0x1a * 8, GFP_KERNEL);
+	if (!info)
+		return;
+	mutex_lock(&nv->gsp_lock);
+	ret = nv->gsp_running ? nv_rm_control(nv, si->h_internal_client, si->h_internal_subdevice, 0x20800a32, info,
+					      8 * 0x1a * 8) : -ENODEV;
+	seq_printf(m, "context buffers (%d):\n", ret);
+	for (i = 0; !ret && i < ARRAY_SIZE(props); i++)
+		seq_printf(m, "  %-16s %8u bytes, align %u\n", props[i].name, le32_to_cpu(info[props[i].idx * 2]),
+			   le32_to_cpu(info[props[i].idx * 2 + 1]));
+	spin_lock_irqsave(&ua->lock, flags);
+	list_for_each_entry(u, &ua->chans, all)
+		if (n < ARRAY_SIZE(ch)) {
+			ch[n].h_client = u->ch.vm->h_client;
+			ch[n].h_subdevice = u->ch.vm->h_subdevice;
+			ch[n].handle = u->ch.handle;
+			ch[n].chid = u->ch.chid;
+			ch[n++].copy = u->copy;
+		}
+	spin_unlock_irqrestore(&ua->lock, flags);
+	for (i = 0; i < n; i++) {	/* channels can only be freed under gsp_lock: handles stay valid */
+		u32 mo[6] = { ch[i].handle };
+
+		if (ch[i].copy)
+			continue;
+		ret = nv_rm_control(nv, ch[i].h_client, ch[i].h_subdevice, NV2080_CTRL_CMD_GR_GET_CTXSW_MODES, mo,
+				    sizeof(mo));
+		seq_printf(m, "channel %u: %d graphics %s, compute %s\n", ch[i].chid, ret, mo[5] < 3 ? gfx[mo[5]] : "?",
+			   mo[4] < 3 ? cmp[mo[4]] : "?");
+	}
+	mutex_unlock(&nv->gsp_lock);
+	kfree(info);
 }
 
 void nv_uapi_init(struct nvdrv_dev *nv)

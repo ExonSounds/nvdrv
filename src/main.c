@@ -713,6 +713,13 @@ static ssize_t ce_fault_write(struct file *f, const char __user *buf, size_t cou
 	return ret ?: count;
 }
 
+static int preempt_show(struct seq_file *m, void *v)
+{
+	nv_uapi_preempt_show(m->private, m);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(preempt);
+
 /* debugfs gpu_lost: run the device-lost path (as if GSP had died); reload nvdrv afterwards */
 static ssize_t gpu_lost_write(struct file *f, const char __user *buf, size_t count, loff_t *ppos)
 {
@@ -783,6 +790,7 @@ static void nv_debugfs_init(struct nvdrv_dev *nv)
 		debugfs_create_file("gr_test", 0200, nv->dbg, nv, &gr_test_fops);
 		debugfs_create_file("ce_fault", 0200, nv->dbg, nv, &ce_fault_fops);
 		debugfs_create_file("gpu_lost", 0200, nv->dbg, nv, &gpu_lost_fops);
+		debugfs_create_file("preempt", 0400, nv->dbg, nv, &preempt_fops);
 		debugfs_create_file("chan_status", 0400, nv->dbg, nv, &chan_status_fops);
 		debugfs_create_file("chan_kick", 0200, nv->dbg, nv, &chan_kick_fops);
 	}

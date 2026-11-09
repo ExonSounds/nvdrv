@@ -1,0 +1,12 @@
+#version 450
+// Long-running workgroups for tools/preempttest.c: a dependent multiply-add chain.
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint iters; } pc;
+layout(std430, binding = 0) buffer B { float data[]; };
+void main()
+{
+	float x = float(gl_GlobalInvocationID.x) * 1e-6;
+	for (uint i = 0u; i < pc.iters; i++)
+		x = fma(x, 0.9999997, 0.25);
+	data[gl_GlobalInvocationID.x] = x;
+}

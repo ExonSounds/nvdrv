@@ -1,0 +1,5 @@
+#version 450
+// The trivial job tools/preempttest.c times while the spinner runs.
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) buffer B { uint data[]; };
+void main() { data[0] += 1u; }

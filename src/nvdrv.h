@@ -383,7 +383,7 @@ struct nv_mem {
 struct nv_chan {
 	struct nv_vmm *vm;
 	u32 handle, chid, runlist, token, ce, rl_base, engine;
-	struct drm_mm_node ctx[2];		/* client GR channels: MAIN, PATCH from the pool */
+	struct drm_mm_node ctx[7];		/* client GR channels: MAIN, PATCH, then the preemption buffers */
 	u64 inst;				/* VRAM */
 	void __iomem *userd_cpu;		/* this channel's USERD through BAR1 */
 	struct nv_dma_buf gpfifo, pb, mthdbuf, sem, errnotif;
@@ -669,8 +669,10 @@ int nv_fifo_init(struct nvdrv_dev *nv);
 int nv_ce_test(struct nvdrv_dev *nv);
 int nv_gr_test(struct nvdrv_dev *nv);
 int nv_ce_fault_test(struct nvdrv_dev *nv);
+int nv_gr_chan_preempt(struct nvdrv_dev *nv, struct nv_chan *ch, u32 gfxp, u32 cilp);
 int nv_ce_recover(struct nvdrv_dev *nv, const char *why);
 void nv_uapi_device_lost(struct nvdrv_dev *nv, const char *why);
+void nv_uapi_preempt_show(struct nvdrv_dev *nv, struct seq_file *m);
 void nv_fifo_show(struct nvdrv_dev *nv, struct seq_file *m);
 int nv_chan_kick(struct nvdrv_dev *nv, u32 mode);
 void nv_fifo_fini(struct nvdrv_dev *nv);

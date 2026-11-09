@@ -721,8 +721,8 @@ void nv_chan_destroy(struct nvdrv_dev *nv, struct nv_chan *ch)
 	nv_dma_buf_free(nv, &ch->mthdbuf);
 	nv_dma_buf_free(nv, &ch->sem);
 	nv_dma_buf_free(nv, &ch->errnotif);
-	nv_mem_put(nv, &ch->ctx[0]);
-	nv_mem_put(nv, &ch->ctx[1]);
+	for (int k = 0; k < ARRAY_SIZE(ch->ctx); k++)
+		nv_mem_put(nv, &ch->ctx[k]);
 	if (ch->chid)
 		nv_chid_put(nv, ch->chid);
 	memset(ch, 0, sizeof(*ch));
@@ -846,6 +846,7 @@ static const struct { u8 prop, id; bool global, init, ro; } gr_ctxbufs[] = {
 	{ 0x14, 6,			true,  false, false },	/* GRAPHICS_RTV_CB_GLOBAL */
 	{ 0x17, 9,			true,  true,  false },	/* GRAPHICS_FECS_EVENT */
 	{ 0x18, PROMOTE_ID_PRIV_ACCESS_MAP, true, true, true },	/* GRAPHICS_PRIV_ACCESS_MAP */
+	{ 0x16, 8,			true,  true,  false },	/* GRAPHICS_GFXP_CTRL_BLK (CPU-RM promote3d) */
 };
 
 /* Allocate and map one context buffer; nouveau's size, page and alignment rules. */
@@ -1011,6 +1012,77 @@ int nv_gr_chan_ctx(struct nvdrv_dev *nv, struct nv_chan *ch)
 		ret = nv_rm_control(nv, vm->h_client, vm->h_subdevice, NV2080_CTRL_CMD_GPU_PROMOTE_CTX, pc, sizeof(*pc));
 	}
 	kfree(pc);
+	return ret;
+}
+
+/*
+ * Preemption buffers for a client GR channel. NVIDIA's user-mode driver allocates these and
+ * binds them with NV2080_CTRL_CMD_GR_CTXSW_PREEMPTION_BIND (ctrl2080gr.h: buffers MAIN =
+ * the preemption context image, SPILL, PAGEPOOL, BETACB, RTV, ..., SETUP; graphics mode
+ * WFI/GFXP, compute WFI/CTA/CILP); nvdrv does it in its place. Sizes from the KGR context
+ * buffers info (NV0080 ENGINE_ID_GRAPHICS_PREEMPT 0x0b, SPILL 0x0c, PAGEPOOL 0x0d, BETACB
+ * 0x0e, RTV 0x0f, SETUP 0x19). Mapped privileged into the channel's VM like the other
+ * context buffers; freed with the channel.
+ */
+#define NV2080_CTRL_CMD_GR_CTXSW_PREEMPTION_BIND	0x20801211
+struct nv_preempt_bind {
+	__le32 flags, h_client, h_channel, pad;
+	__le64 vmem[9];
+	__le32 gfxp_mode, cilp_mode;
+	__le32 route_flags, pad2;
+	__le64 route;
+};
+static_assert(sizeof(struct nv_preempt_bind) == 112);
+
+int nv_gr_chan_preempt(struct nvdrv_dev *nv, struct nv_chan *ch, u32 gfxp, u32 cilp)
+{
+	static const struct { u8 prop, slot; } bufs[] = {
+		{ 0x0b, 0 }, { 0x0c, 1 }, { 0x0d, 2 }, { 0x0e, 3 }, { 0x0f, 4 }, { 0x19, 8 },
+	};
+	struct nv_gsp_static_info *si = &nv->gsp_info;
+	struct nv_vmm *vm = ch->vm;
+	struct nv_preempt_bind *b;
+	__le32 *info;
+	int i, k = 2, ret;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	info = kzalloc(8 * CTXPROP_COUNT * 8, GFP_KERNEL);
+	b = kzalloc(sizeof(*b), GFP_KERNEL);
+	ret = info && b ? 0 : -ENOMEM;
+	if (!ret)
+		ret = nv_rm_control(nv, si->h_internal_client, si->h_internal_subdevice,
+				    NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO, info, 8 * CTXPROP_COUNT * 8);
+	for (i = 0; !ret && i < ARRAY_SIZE(bufs); i++) {
+		u64 size = le32_to_cpu(info[bufs[i].prop * 2]), align, va;
+
+		if (!size)
+			continue;
+		if (k >= ARRAY_SIZE(ch->ctx)) {
+			ret = -ENOSPC;
+			break;
+		}
+		size = ALIGN(size, SZ_4K);
+		align = size >= SZ_2M ? SZ_2M : size >= SZ_64K ? SZ_64K : SZ_4K;
+		ret = nv_mem_get(nv, &ch->ctx[k], size, align);
+		if (ret)
+			break;
+		vram_zero(nv, ch->ctx[k].start, size);
+		ret = nv_vmm_map_vram_flags(nv, vm, ch->ctx[k].start, size, align, NV_PTE_PRIV, &va);
+		b->vmem[bufs[i].slot] = cpu_to_le64(va);
+		k++;
+	}
+	if (!ret)
+		ret = nv_vmm_flush(nv, vm);
+	if (!ret) {
+		b->flags = cpu_to_le32(BIT(0) | BIT(1));	/* CILP_SET | GFXP_SET */
+		b->h_client = cpu_to_le32(vm->h_client);
+		b->h_channel = cpu_to_le32(ch->handle);
+		b->gfxp_mode = cpu_to_le32(gfxp);
+		b->cilp_mode = cpu_to_le32(cilp);
+		ret = nv_rm_control(nv, vm->h_client, vm->h_subdevice, NV2080_CTRL_CMD_GR_CTXSW_PREEMPTION_BIND, b, sizeof(*b));
+	}
+	kfree(b);
+	kfree(info);
 	return ret;
 }
 

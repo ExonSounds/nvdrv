@@ -480,7 +480,23 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       - Residency is the MMU's job (sparse PTEs); NVK exposes sparseBinding and sparseResidency*.
       - `nvktest sparse` (17 checks): CE reads/writes of sparse pages, map/unmap inside, the rules, region over an
         existing mapping, 16 GiB create/remove, fault after removal.
-- [ ] **Preemption buffers** (GFXP pool/control block, spill, beta CB; CILP) so long compute work can be preempted.
+- [x] **Preemption buffers** (2026-11-09):
+      - Without them GSP-RM leaves every GR channel at WFI: a long dispatch or draw holds the engine and every other
+        app's GPU work waits for all of it (`tools/preempttest.c`, 100 waves of ~15 ms workgroups: a trivial
+        compute job from a second process waited 1496 ms).
+      - nvdrv now does what NVIDIA's user-mode driver does: per GR channel it allocates the PREEMPT (preemption
+        context image, 1.7 MB), SPILL (1.8 MB), PAGEPOOL (128 KB), BETACB (5.1 MB) and RTV (520 KB) buffers (sizes from
+        the KGR context buffers info), maps them privileged into the channel's VM and binds them with
+        `NV2080_CTRL_CMD_GR_CTXSW_PREEMPTION_BIND` (graphics GFXP, compute CTA). The global GFXP_CTRL_BLK is promoted
+        with the golden context (CPU-RM promote3d). debugfs `preempt` shows the sizes and each channel's modes.
+      - Compute result: the same test gives the probe a 7.5 ms median / 15 ms max wait. Workgroups that themselves run
+        for a long time are not interrupted: CILP is accepted by RM but behaves like CTA (no SM trap handler from
+        NVK), so CTA is the default.
+      - Module parameters `preempt` (bind on/off), `preempt_gfx` (0 WFI, 1 GFXP), `preempt_compute` (0 WFI, 1 CTA, 2 CILP).
+      - Graphics result (`preempttest <ms> <dir> gfx`: one 2048x2048 draw with a long fragment shader through Zink):
+        under WFI the probe gets in once, after the draw (119 ms); with GFXP it gets in 5 times during one 330 ms draw
+        (median 51 ms, max 78 ms). The remaining latency is the scheduler's timeslice, not the draw.
+      - Cost: ~9.3 MB of VRAM per GR channel (freed with it); vkmark unchanged (33.6k).
 - [x] **GPU recovery** (2026-11-09):
       - Faults: RM recovers (RCs) the faulting channel itself; its fences fail with -EIO and EXEC returns -ENODEV
         (NVK: VK_ERROR_DEVICE_LOST). Other channels and apps keep running.
