@@ -279,6 +279,7 @@ int nv_rpc_wait(struct nvdrv_dev *nv, u32 fn, unsigned int timeout_ms,
 		if (ret == -EAGAIN) {
 			if (!nv_gsp_riscv_active(nv)) {	/* kgspHealthCheck */
 				nv_gsp_dump_state(nv, "GSP RISC-V stopped");
+				nv_uapi_device_lost(nv, "GSP RISC-V stopped during an RPC");
 				return -EIO;
 			}
 			if (timed_out) {

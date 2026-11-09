@@ -402,6 +402,7 @@ struct nv_fifo {
 	bool gr_ready;
 	unsigned long chids[2];			/* chids in use (0 = reserved by RM) */
 	u32 gr_ce;				/* a copy engine on the GR runlist (GRCE) */
+	u32 ce_recoveries;			/* kernel CE channel rebuilt after an RC or timeout */
 };
 
 /* Interrupts (src/intr.c): GR/CE nonstall (fences) and the GSP message-queue vector */
@@ -434,6 +435,9 @@ struct nv_uapi {
 	bool zcull_valid;			/* zcull[] holds drm_nouveau_get_zcull_info */
 	u32 zcull[12];
 	struct work_struct boost_work;		/* GPU work submitted: keep clocks up */
+	struct delayed_work watchdog;		/* hung channel detection */
+	bool lost;				/* GPU lost: every uAPI call fails with -ENODEV */
+	atomic_t hangs;
 	unsigned long boost_next;		/* jiffies: earliest next boost request */
 	struct mutex bar1_lock;
 	struct drm_mm bar1_mm;			/* BAR1 VA for CPU-mapped VRAM objects */
@@ -663,6 +667,9 @@ bool nv_uapi_bo_vram(struct drm_gem_object *obj, u64 *vram);
 int nv_fifo_init(struct nvdrv_dev *nv);
 int nv_ce_test(struct nvdrv_dev *nv);
 int nv_gr_test(struct nvdrv_dev *nv);
+int nv_ce_fault_test(struct nvdrv_dev *nv);
+int nv_ce_recover(struct nvdrv_dev *nv, const char *why);
+void nv_uapi_device_lost(struct nvdrv_dev *nv, const char *why);
 void nv_fifo_show(struct nvdrv_dev *nv, struct seq_file *m);
 int nv_chan_kick(struct nvdrv_dev *nv, u32 mode);
 void nv_fifo_fini(struct nvdrv_dev *nv);

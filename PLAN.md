@@ -469,7 +469,23 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
         signals its wait.
 - [ ] Full sparse-binding semantics (unmap inside a sparse region, residency queries).
 - [ ] **Preemption buffers** (GFXP pool/control block, spill, beta CB; CILP) so long compute work can be preempted.
-- [ ] **GPU recovery**: channel/engine reset after faults, device-lost reporting, GPU reset without reload.
+- [x] **GPU recovery** (2026-11-09):
+      - Faults: RM recovers (RCs) the faulting channel itself; its fences fail with -EIO and EXEC returns -ENODEV
+        (NVK: VK_ERROR_DEVICE_LOST). Other channels and apps keep running.
+      - Hangs: watchdog (`job_timeout_ms`, default 10000 like nouveau's drm_sched timeout, 0 = off). A channel whose
+        fence semaphore has not moved for that long while work is pending is stopped through RM
+        (`NVA06F_CTRL_CMD_STOP_CHANNEL`, bImmediate; the params are exactly 1 byte, 4 gave INVALID_ARGUMENT) before
+        its fences fail with -ETIMEDOUT, so the GPU never writes memory the app frees on device lost.
+      - nvdrv's own copy channel: an RC or a timeout in a clear/eviction rebuilds it in place (old VAs unmapped,
+        RM free, re-created on the same chid); that one operation fails, later ones work.
+      - GSP death (RPC wait or the 5 s health check sees the RISC-V stopped): device lost for everyone at once;
+        every pending fence fails with -ENODEV, and EXEC, CHANNEL_ALLOC, GEM_NEW and VM_BIND return -ENODEV.
+        Recovery is a module reload.
+      - Tests: `nvktest hang` (job_timeout_ms=2000: another channel runs meanwhile, the hung one is stopped after
+        2.2 s, its write never lands, EXEC -ENODEV, a new channel works), debugfs `ce_fault` (faulting kernel copy,
+        rebuild, clear works), `nvktest lost` with debugfs `gpu_lost` (fence fails at once, 4 ioctls -ENODEV).
+- [ ] **In-place GPU reset** (no reload after GSP death): FLR + GSP reboot + RM objects, and rebuilding the display
+      (EVO channels, modeset from the saved DRM atomic state) needs display verification.
 
 ### Display
 - [ ] **Multiple monitors**: the other heads/SORs, HDMI (TMDS/FRL), hotplug detection (HPD), EDID reprobe.

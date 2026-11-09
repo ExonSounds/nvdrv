@@ -77,7 +77,8 @@ static void msg_work(struct work_struct *w)
 
 /*
  * kgspHealthCheck while idle: RPC waits notice a dead GSP themselves, but with interrupts
- * nothing else would. Report once; recovery needs a reload (no GPU reset path yet).
+ * nothing else would. Report once and fail every channel (device lost); recovery needs a
+ * reload (an in-place reset would also have to rebuild the display state).
  */
 #define GSP_HEALTH_PERIOD	(5 * HZ)
 static void health_work(struct work_struct *w)
@@ -92,6 +93,7 @@ static void health_work(struct work_struct *w)
 		mutex_lock(&nv->gsp_lock);
 		nv_gsp_dump_state(nv, "GSP RISC-V stopped while running (health check)");
 		mutex_unlock(&nv->gsp_lock);
+		nv_uapi_device_lost(nv, "GSP RISC-V stopped (health check)");
 	}
 	schedule_delayed_work(&in->health_work, GSP_HEALTH_PERIOD);
 }

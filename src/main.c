@@ -706,6 +706,32 @@ static ssize_t gr_test_write(struct file *f, const char __user *buf, size_t coun
 	return ret ? ret : count;
 }
 
+static ssize_t ce_fault_write(struct file *f, const char __user *buf, size_t count, loff_t *ppos)
+{
+	int ret = nv_ce_fault_test(f->private_data);
+
+	return ret ?: count;
+}
+
+/* debugfs gpu_lost: run the device-lost path (as if GSP had died); reload nvdrv afterwards */
+static ssize_t gpu_lost_write(struct file *f, const char __user *buf, size_t count, loff_t *ppos)
+{
+	nv_uapi_device_lost(f->private_data, "simulated through debugfs");
+	return count;
+}
+
+static const struct file_operations gpu_lost_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = gpu_lost_write,
+};
+
+static const struct file_operations ce_fault_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = ce_fault_write,
+};
+
 static const struct file_operations gr_test_fops = {
 	.owner = THIS_MODULE,
 	.open = simple_open,
@@ -755,6 +781,8 @@ static void nv_debugfs_init(struct nvdrv_dev *nv)
 		debugfs_create_file("drm_stats", 0400, nv->dbg, nv, &drm_stats_fops);
 		debugfs_create_file("ce_test", 0200, nv->dbg, nv, &ce_test_fops);
 		debugfs_create_file("gr_test", 0200, nv->dbg, nv, &gr_test_fops);
+		debugfs_create_file("ce_fault", 0200, nv->dbg, nv, &ce_fault_fops);
+		debugfs_create_file("gpu_lost", 0200, nv->dbg, nv, &gpu_lost_fops);
 		debugfs_create_file("chan_status", 0400, nv->dbg, nv, &chan_status_fops);
 		debugfs_create_file("chan_kick", 0200, nv->dbg, nv, &chan_kick_fops);
 	}

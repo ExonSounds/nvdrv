@@ -43,6 +43,11 @@ MODULE_PARM_DESC(nvk, "Offer nouveau's uAPI for Mesa NVK (DRM driver named \"nou
 
 static bool dump_push;
 module_param(dump_push, bool, 0644);
+
+static uint job_timeout_ms = 10000;
+module_param(job_timeout_ms, uint, 0644);
+MODULE_PARM_DESC(job_timeout_ms, "Stop a channel whose work makes no progress for this long (ms, 0 = never; default 10000)");
+#define UAPI_WATCHDOG_PERIOD	msecs_to_jiffies(250)
 MODULE_PARM_DESC(dump_push, "Debug: print the dwords of every EXEC push buffer (GART objects only)");
 
 #define UAPI_GPFIFO_ENTRIES	512		/* must match fifo.c */
@@ -78,6 +83,8 @@ struct nv_cli {
 	struct list_head dead;		/* unmapped nv_vma, freed after the TLB flush */
 	struct workqueue_struct *bind_wq;	/* asynchronous VM_BIND, in order */
 	atomic_t binds_queued;
+	char comm[TASK_COMM_LEN];	/* opener, for hang reports */
+	pid_t pid;
 };
 
 struct nv_uchan {
@@ -94,6 +101,9 @@ struct nv_uchan {
 	struct list_head active;	/* in nv->uapi.active while pending is not empty */
 	struct dma_fence *last;		/* most recent fence */
 	bool dead;
+	bool stopping;			/* watchdog is stopping it */
+	u32 progress_sem;		/* semaphore value when last seen moving */
+	unsigned long progress_at;	/* jiffies of that (watchdog), under uapi.lock */
 	struct list_head all;		/* uapi.chans, under uapi.lock */
 };
 
@@ -161,6 +171,10 @@ static bool uchan_poll_locked(struct nv_uchan *u)
 	struct nv_fence *f, *tmp;
 	bool dead = n && (n[3] >> 16);
 
+	if (sem != u->progress_sem) {
+		u->progress_sem = sem;
+		u->progress_at = jiffies;
+	}
 	if (dead && !u->dead) {
 		u->dead = true;
 		pr_warn("nvdrv: channel %u recovered by RM: error %u (info16 0x%x), semaphore %u/%u, GP_GET %u/%u\n",
@@ -234,6 +248,10 @@ static struct dma_fence *uchan_fence(struct nvdrv_dev *nv, struct nv_uchan *u, u
 	dma_fence_init(&f->base, &nv_fence_ops, &ua->lock, u->fence_ctx, seqno);
 	spin_lock_irqsave(&ua->lock, flags);
 	dma_fence_get(&f->base);	/* the pending list's reference */
+	if (list_empty(&u->pending)) {	/* idle -> busy: the watchdog clock starts now */
+		u->progress_sem = READ_ONCE(*(u32 *)u->ch.sem.cpu);
+		u->progress_at = jiffies;
+	}
 	list_add_tail(&f->link, &u->pending);
 	if (list_empty(&u->active))
 		list_add_tail(&u->active, &ua->active);
@@ -245,7 +263,77 @@ static struct dma_fence *uchan_fence(struct nvdrv_dev *nv, struct nv_uchan *u, u
 			      HRTIMER_MODE_REL);
 	}
 	spin_unlock_irqrestore(&ua->lock, flags);
+	if (job_timeout_ms && !delayed_work_pending(&ua->watchdog))
+		schedule_delayed_work(&ua->watchdog, UAPI_WATCHDOG_PERIOD);
 	return &f->base;
+}
+
+/*
+ * Hang watchdog (nouveau: drm_sched job timeout, 10 s, then the channel is killed). A channel
+ * whose fence semaphore has not moved for job_timeout_ms while work is pending is stopped
+ * through RM (NVA06F_CTRL_CMD_STOP_CHANNEL, bImmediate: preempted off the runlist, RC'd if
+ * that fails) before its fences fail, so nothing the app frees on "device lost" is still
+ * being written by the GPU. Later EXECs on it return -ENODEV (NVK: VK_ERROR_DEVICE_LOST);
+ * the app's other channels and other apps keep running.
+ */
+#define NVA06F_CTRL_CMD_STOP_CHANNEL	0xa06f0112
+static void uapi_watchdog(struct work_struct *w)
+{
+	struct nv_uapi *ua = container_of(to_delayed_work(w), struct nv_uapi, watchdog);
+	struct nvdrv_dev *nv = container_of(ua, struct nvdrv_dev, uapi);
+	unsigned long timeout = msecs_to_jiffies(job_timeout_ms), flags;
+	struct nv_uchan *hung[8], *u;
+	bool busy = false;
+	int n = 0, i;
+
+	if (!job_timeout_ms)
+		return;
+	/*
+	 * gsp_lock first: a channel can only be freed (nv_chan_destroy, then kfree) under it,
+	 * so the uchans collected below stay valid until it is dropped.
+	 */
+	mutex_lock(&nv->gsp_lock);
+	spin_lock_irqsave(&ua->lock, flags);
+	uapi_signal_locked(ua);
+	list_for_each_entry(u, &ua->active, active) {
+		busy = true;
+		if (!u->dead && !u->stopping && time_after(jiffies, u->progress_at + timeout) &&
+		    n < ARRAY_SIZE(hung)) {
+			u->stopping = true;
+			hung[n++] = u;
+		}
+	}
+	spin_unlock_irqrestore(&ua->lock, flags);
+
+	for (i = 0; i < n; i++) {
+		u8 stop[1] = { 1 };	/* NVA06F_CTRL_STOP_CHANNEL_PARAMS { NvBool bImmediate }: exactly 1 byte */
+		int ret;
+
+		u = hung[i];
+		ret = nv->gsp_running ? nv_rm_control(nv, u->ch.vm->h_client, u->ch.handle, NVA06F_CTRL_CMD_STOP_CHANNEL,
+						      stop, sizeof(stop)) : -ENODEV;
+		pr_warn("nvdrv: %s[%d]: channel %u hung (no progress for %u ms, semaphore %u/%u), stopped: %d\n",
+			u->cli->comm, u->cli->pid, u->ch.chid, job_timeout_ms, u->progress_sem, u->submitted, ret);
+		spin_lock_irqsave(&ua->lock, flags);
+		if (!list_empty(&u->all) && !u->dead) {	/* not drained meanwhile */
+			struct nv_fence *f, *tmp;
+
+			u->dead = true;
+			list_for_each_entry_safe(f, tmp, &u->pending, link) {
+				dma_fence_set_error(&f->base, -ETIMEDOUT);
+				dma_fence_signal_locked(&f->base);
+				list_del_init(&f->link);
+				dma_fence_put(&f->base);
+			}
+			if (!list_empty(&u->active))
+				list_del_init(&u->active);
+		}
+		spin_unlock_irqrestore(&ua->lock, flags);
+		atomic_inc(&ua->hangs);
+	}
+	mutex_unlock(&nv->gsp_lock);
+	if (busy)
+		schedule_delayed_work(&ua->watchdog, UAPI_WATCHDOG_PERIOD);
 }
 
 /* Wait for everything submitted on u (up to 2 s), then fail what is left. */
@@ -690,6 +778,8 @@ static int ioctl_gem_new(struct drm_device *dev, void *data, struct drm_file *fi
 	u32 handle;
 	int ret;
 
+	if (READ_ONCE(dev_nv(dev)->uapi.lost))
+		return -ENODEV;
 	if (!req->info.size || !(req->info.domain & (NOUVEAU_GEM_DOMAIN_VRAM | NOUVEAU_GEM_DOMAIN_GART)))
 		return -EINVAL;
 	bo = nv_bo_new(dev, req->info.size, req->info.domain, req->align);
@@ -1356,6 +1446,8 @@ static int ioctl_vm_bind(struct drm_device *dev, void *data, struct drm_file *fi
 	u32 i;
 	int ret = 0;
 
+	if (READ_ONCE(cli->nv->uapi.lost))
+		return -ENODEV;
 	if (!cli->vm_ready || req->flags & ~DRM_NOUVEAU_VM_BIND_RUN_ASYNC)
 		return -EINVAL;
 	ops = copy_array(req->op_ptr, req->op_count, sizeof(*ops));
@@ -1448,6 +1540,8 @@ static int ioctl_channel_alloc(struct drm_device *dev, void *data, struct drm_fi
 	struct nv_uchan *u;
 	int id, chid, ret;
 
+	if (READ_ONCE(nv->uapi.lost))
+		return -ENODEV;
 	if (!cli->vm_ready)
 		return -EINVAL;	/* VM_BIND uAPI only */
 	if (req->fb_ctxdma_handle != ~0u ||
@@ -1575,6 +1669,8 @@ static int ioctl_exec(struct drm_device *dev, void *data, struct drm_file *file)
 	u32 i, *gp, free, spins = 0;
 	int ret = 0;
 
+	if (READ_ONCE(nv->uapi.lost))
+		return -ENODEV;
 	if (req->push_count > UAPI_PUSH_MAX)
 		return -EINVAL;
 	push = copy_array(req->push_ptr, req->push_count, sizeof(*push));
@@ -2079,6 +2175,8 @@ int nv_uapi_open(struct drm_device *dev, struct drm_file *file)
 	INIT_LIST_HEAD(&cli->vm.pts);
 	idr_init(&cli->chans);
 	INIT_LIST_HEAD(&cli->dead);
+	get_task_comm(cli->comm, current);
+	cli->pid = task_tgid_nr(current);
 	cli->bind_wq = alloc_ordered_workqueue("nvdrv-bind", 0);
 	if (!cli->bind_wq) {
 		kfree(cli);
@@ -2157,6 +2255,9 @@ void nv_uapi_mem_show(struct nvdrv_dev *nv, struct seq_file *m)
 	mutex_unlock(&ua->lru_lock);
 	seq_printf(m, "VRAM pool: %llu MiB, %llu MiB used\n", nv->mem.size >> 20, nv->mem.used >> 20);
 	seq_printf(m, "GEM objects in VRAM: %llu (%llu MiB, %llu MiB not evictable)\n", n, bytes >> 20, pinned >> 20);
+	seq_printf(m, "device lost: %s\n", ua->lost ? "YES (reload nvdrv)" : "no");
+	seq_printf(m, "hung channels stopped by the watchdog: %d (job_timeout_ms %u)\n", atomic_read(&ua->hangs),
+		   job_timeout_ms);
 	seq_printf(m, "evictions: %lld (%lld MiB moved to system memory)\n", atomic64_read(&ua->evictions),
 		   atomic64_read(&ua->evicted_bytes) >> 20);
 	seq_printf(m, "client PTEs written: %lld huge (2 MiB), %lld big (64 KiB), %lld small (4 KiB); compressed mappings %lld\n",
@@ -2172,11 +2273,47 @@ void nv_uapi_init(struct nvdrv_dev *nv)
 	INIT_LIST_HEAD(&ua->active);
 	mutex_init(&ua->bar1_lock);
 	INIT_WORK(&ua->boost_work, uapi_boost_work);
+	INIT_DELAYED_WORK(&ua->watchdog, uapi_watchdog);
 	init_rwsem(&ua->evict_sem);
 	mutex_init(&ua->lru_lock);
 	INIT_LIST_HEAD(&ua->vram_bos);
 	INIT_LIST_HEAD(&ua->chans);
 	hrtimer_setup(&ua->timer, uapi_poll, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+}
+
+/*
+ * The GPU is lost (GSP-RM stopped): every channel is dead at once, pending fences fail with
+ * -ENODEV, and new channels, binds, submissions and objects are refused with -ENODEV, so
+ * apps see VK_ERROR_DEVICE_LOST right away instead of hanging. Recovery: reload nvdrv.
+ * Takes only the fence lock: callable from RPC waits (gsp_lock held).
+ */
+void nv_uapi_device_lost(struct nvdrv_dev *nv, const char *why)
+{
+	struct nv_uapi *ua = &nv->uapi;
+	struct nv_uchan *u;
+	unsigned long flags;
+	int n = 0;
+
+	if (xchg(&ua->lost, true))
+		return;
+	spin_lock_irqsave(&ua->lock, flags);
+	list_for_each_entry(u, &ua->chans, all) {
+		struct nv_fence *f, *tmp;
+
+		u->dead = true;
+		list_for_each_entry_safe(f, tmp, &u->pending, link) {
+			dma_fence_set_error(&f->base, -ENODEV);
+			dma_fence_signal_locked(&f->base);
+			list_del_init(&f->link);
+			dma_fence_put(&f->base);
+		}
+		if (!list_empty(&u->active))
+			list_del_init(&u->active);
+		n++;
+	}
+	spin_unlock_irqrestore(&ua->lock, flags);
+	dev_err(&nv->pdev->dev, "GPU lost (%s): %d channels failed, programs get device lost; reload nvdrv to recover\n",
+		why, n);
 }
 
 /* GPU going away (GSP teardown): stop polling and fail every pending fence. */
@@ -2188,6 +2325,7 @@ void nv_uapi_fini(struct nvdrv_dev *nv)
 
 	hrtimer_cancel(&ua->timer);
 	cancel_work_sync(&ua->boost_work);
+	cancel_delayed_work_sync(&ua->watchdog);
 	spin_lock_irqsave(&ua->lock, flags);
 	list_for_each_entry_safe(u, tmp, &ua->active, active) {
 		struct nv_fence *f, *ftmp;
@@ -2208,4 +2346,5 @@ void nv_uapi_fini(struct nvdrv_dev *nv)
 	ua->bar1_ready = false;
 	ua->gpcs = ua->tpcs = 0;
 	ua->zcull_valid = false;
+	ua->lost = false;	/* the next GSP boot starts clean */
 }

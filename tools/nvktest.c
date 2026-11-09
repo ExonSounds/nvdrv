@@ -237,6 +237,154 @@ int main(int argc, char **argv)
 	CHECK(drmCommandWrite(fd, DRM_NOUVEAU_CHANNEL_FREE, &cf2, sizeof(cf2)));
 
 	/*
+	 * nvktest lost: device-lost handling (GSP death simulated through debugfs gpu_lost; the
+	 * module must be reloaded afterwards). A stalled job's fence must fail at once, and EXEC,
+	 * CHANNEL_ALLOC, GEM_NEW and VM_BIND must return -ENODEV.
+	 */
+	if (argc > 1 && !strcmp(argv[1], "lost")) {
+		uint32_t hgate, so_l, hx;
+		void *mgate, *mx;
+		struct timespec t0, t1;
+		int okc = 0, dbg;
+
+		CHECK(bo_new(0x10000, NOUVEAU_GEM_DOMAIN_GART, &hgate, &mgate));
+		*(volatile uint32_t *)mgate = 0;
+		CHECK(bind(hgate, 0x61000000, 0x10000, DRM_NOUVEAU_VM_BIND_OP_MAP));
+		CHECK(drmSyncobjCreate(fd, 0, &so_l));
+		p = pb;
+		mthd(0, 0x005c, 5, 0x61000000, 0x0, 1, 0, 0x2);
+		ep.va = 0x10000000;
+		ep.va_len = (uint32_t)((char *)p - (char *)pb);
+		struct drm_nouveau_sync sl = { .flags = DRM_NOUVEAU_SYNC_SYNCOBJ, .handle = so_l };
+		ex.channel = ca.channel;
+		ex.wait_count = 0;
+		ex.sig_ptr = (uintptr_t)&sl;
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_EXEC, &ex, sizeof(ex)));
+		usleep(20000);
+		dbg = open(argc > 2 ? argv[2] : "/sys/kernel/debug/nvdrv/0000:01:00.0/gpu_lost", O_WRONLY);
+		if (dbg < 0 || write(dbg, "1", 1) != 1) {
+			perror("gpu_lost");
+			return 1;
+		}
+		close(dbg);
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		r = drmSyncobjWait(fd, &so_l, 1, INT64_MAX, 0, NULL);
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+		printf("  stalled job's fence after the loss: %d in %.1f ms\n", r, ms);
+		okc += !r && ms < 100;
+		r = drmCommandWriteRead(fd, DRM_NOUVEAU_EXEC, &ex, sizeof(ex));
+		printf("  EXEC: %d\n", r);
+		okc += r == -ENODEV;
+		struct drm_nouveau_channel_alloc c5 = { .fb_ctxdma_handle = ~0u, .tt_ctxdma_handle = NOUVEAU_FIFO_ENGINE_GR };
+		r = drmCommandWriteRead(fd, DRM_NOUVEAU_CHANNEL_ALLOC, &c5, sizeof(c5));
+		printf("  CHANNEL_ALLOC: %d\n", r);
+		okc += r == -ENODEV;
+		r = bo_new(0x10000, NOUVEAU_GEM_DOMAIN_VRAM, &hx, &mx);
+		printf("  GEM_NEW: %d\n", r);
+		okc += r == -ENODEV;
+		r = bind(hgate, 0x62000000, 0x10000, DRM_NOUVEAU_VM_BIND_OP_MAP);
+		printf("  VM_BIND: %d\n", r);
+		okc += r == -ENODEV;
+		printf("lost: %d/5 -> %s (reload nvdrv now)\n", okc, okc == 5 ? "PASS" : "FAIL");
+		return 0;
+	}
+
+	/*
+	 * nvktest hang: a channel waits on a semaphore nobody releases. Meanwhile a second
+	 * channel must keep running; after job_timeout_ms (set it short via
+	 * /sys/module/nvdrv/parameters/job_timeout_ms) the watchdog stops the hung channel: its
+	 * syncobj signals, further EXECs on it fail with -ENODEV (device lost), and a new
+	 * channel works.
+	 */
+	if (argc > 1 && !strcmp(argv[1], "hang")) {
+		uint32_t hgate, so_h;
+		void *mgate;
+		struct timespec t0, t1;
+		int okc = 0;
+
+		CHECK(bo_new(0x10000, NOUVEAU_GEM_DOMAIN_GART, &hgate, &mgate));
+		*(volatile uint32_t *)mgate = 0;
+		CHECK(bind(hgate, 0x61000000, 0x10000, DRM_NOUVEAU_VM_BIND_OP_MAP));
+		CHECK(drmSyncobjCreate(fd, 0, &so_h));
+		p = pb;
+		mthd(0, 0x005c, 5, 0x61000000, 0x0, 1, 0, 0x2 /* ACQ_STRICT_GEQ, never satisfied */);
+		mthd(1, 0x0000, 1, 0xc7c0);
+		mthd(1, 0x1b00, 4, 0x0, 0x20000000, 0xbad0bad0, 1u << 28);
+		ep.va = 0x10000000;
+		ep.va_len = (uint32_t)((char *)p - (char *)pb);
+		struct drm_nouveau_sync sh = { .flags = DRM_NOUVEAU_SYNC_SYNCOBJ, .handle = so_h };
+		ex.channel = ca.channel;
+		ex.wait_count = 0;
+		ex.sig_ptr = (uintptr_t)&sh;
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_EXEC, &ex, sizeof(ex)));
+
+		/* another channel keeps working while that one is stuck */
+		struct drm_nouveau_channel_alloc c3 = { .fb_ctxdma_handle = ~0u, .tt_ctxdma_handle = NOUVEAU_FIFO_ENGINE_GR };
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_CHANNEL_ALLOC, &c3, sizeof(c3)));
+		{
+			struct { struct nvif_hdr h; struct nvif_new n; } on = {
+				.h = { .type = 2, .route = 0xff, .token = c3.channel }, .n = { .handle = 1, .oclass = 0xc7c0 } };
+			CHECK(drmCommandWrite(fd, DRM_NOUVEAU_NVIF, &on, sizeof(on)));
+		}
+		p = (uint32_t *)((char *)pb + 0x1000);
+		uint32_t *st = p;
+		mthd(1, 0x0000, 1, 0xc7c0);
+		mthd(1, 0x1b00, 4, 0x0, 0x20000010, 0x0071ce00, 1u << 28);
+		ep.va = 0x10001000;
+		ep.va_len = (uint32_t)((char *)p - (char *)st);
+		ex.channel = c3.channel;
+		ex.sig_ptr = (uintptr_t)&sig2;
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_EXEC, &ex, sizeof(ex)));
+		r = drmSyncobjWait(fd, &so2, 1, INT64_MAX, 0, NULL);
+		int hung_busy = drmSyncobjWait(fd, &so_h, 1, 0, 0, NULL) != 0;
+		printf("  other channel while one hangs: %d, reads 0x%08x; hung job still pending: %s\n", r,
+		       ((volatile uint32_t *)vram)[4], hung_busy ? "yes" : "no");
+		okc += !r && ((volatile uint32_t *)vram)[4] == 0x0071ce00 && hung_busy;
+
+		/* the watchdog */
+		r = drmSyncobjWait(fd, &so_h, 1, INT64_MAX, 0, NULL);
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		double s_ = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+		printf("  hung job's syncobj signalled after %.1f s (%d); its write %s\n", s_, r,
+		       ((volatile uint32_t *)vram)[0] == 0xbad0bad0 ? "HAPPENED?!" : "never happened (correct)");
+		okc += !r && ((volatile uint32_t *)vram)[0] != 0xbad0bad0;
+		p = pb;
+		mthd(1, 0x1b00, 4, 0x0, 0x20000000, 0x1, 1u << 28);
+		ep.va = 0x10000000;
+		ep.va_len = (uint32_t)((char *)p - (char *)pb);
+		ex.channel = ca.channel;
+		r = drmCommandWriteRead(fd, DRM_NOUVEAU_EXEC, &ex, sizeof(ex));
+		printf("  EXEC on the stopped channel: %d (%s)\n", r, r == -ENODEV ? "device lost, correct" : "WRONG");
+		okc += r == -ENODEV;
+
+		/* a new channel works */
+		struct drm_nouveau_channel_alloc c4 = { .fb_ctxdma_handle = ~0u, .tt_ctxdma_handle = NOUVEAU_FIFO_ENGINE_GR };
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_CHANNEL_ALLOC, &c4, sizeof(c4)));
+		{
+			struct { struct nvif_hdr h; struct nvif_new n; } on = {
+				.h = { .type = 2, .route = 0xff, .token = c4.channel }, .n = { .handle = 1, .oclass = 0xc7c0 } };
+			CHECK(drmCommandWrite(fd, DRM_NOUVEAU_NVIF, &on, sizeof(on)));
+		}
+		p = (uint32_t *)((char *)pb + 0x2000);
+		st = p;
+		mthd(1, 0x0000, 1, 0xc7c0);
+		mthd(1, 0x1b00, 4, 0x0, 0x20000020, 0x0e3e0001, 1u << 28);
+		ep.va = 0x10002000;
+		ep.va_len = (uint32_t)((char *)p - (char *)st);
+		ex.channel = c4.channel;
+		CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_EXEC, &ex, sizeof(ex)));
+		r = drmSyncobjWait(fd, &so2, 1, INT64_MAX, 0, NULL);
+		printf("  new channel: %d, reads 0x%08x\n", r, ((volatile uint32_t *)vram)[8]);
+		okc += !r && ((volatile uint32_t *)vram)[8] == 0x0e3e0001;
+		struct drm_nouveau_channel_free cf = { .channel = ca.channel };
+		CHECK(drmCommandWrite(fd, DRM_NOUVEAU_CHANNEL_FREE, &cf, sizeof(cf)));
+		printf("hang: %d/4 -> %s\n", okc, okc == 4 ? "PASS" : "FAIL");
+		return 0;
+	}
+
+	/*
 	 * nvktest huge: 2 MiB pages. A 6 MiB VRAM object (2 MiB aligned) at a 2 MiB-aligned VA is
 	 * three 2 MiB PTEs; a 4 KiB hole in the middle region splits it (the others stay huge);
 	 * remapping the hole with the same object range merges it back. GPU writes must land

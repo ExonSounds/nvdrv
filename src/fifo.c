@@ -1066,6 +1066,116 @@ out:
 }
 
 /*
+ * Kernel copy-channel recovery. If RM recovers (RCs) nvdrv's own CE channel, e.g. after a
+ * fault in a copy, the channel stays disabled and every later clear or eviction would time
+ * out until the module is reloaded. Instead the channel is freed and rebuilt in place
+ * (same chid, new buffers, fresh GPU VAs; the old VAs are unmapped first).
+ */
+static bool chan_rc(const struct nv_chan *ch)
+{
+	const u32 *n = ch->errnotif.cpu;
+
+	return n && (n[3] >> 16);
+}
+
+static void chan_unmap_bufs(struct nvdrv_dev *nv, struct nv_chan *ch)
+{
+	const struct { u64 va, size; } r[] = {
+		{ ch->gpfifo_va, ch->gpfifo.size }, { ch->pb_va, ch->pb.size }, { ch->sem_va, ch->sem.size },
+	};
+	u64 off;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(r); i++)
+		for (off = 0; r[i].va && off < r[i].size; off += SZ_4K)
+			nv_vmm_set_pte(nv, ch->vm, r[i].va + off, 0);
+	nv_vmm_flush(nv, ch->vm);
+}
+
+int nv_ce_recover(struct nvdrv_dev *nv, const char *why)
+{
+	struct nv_chan *ch = &nv->chan;
+	const u32 *n = ch->errnotif.cpu;
+	int ret;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	dev_warn(&nv->pdev->dev, "fifo: kernel copy channel %u %s (error notifier %u/0x%x, semaphore %u/%u): rebuilding\n",
+		 ch->chid, why, n ? n[2] : 0, n ? n[3] >> 16 : 0, ch->sem.cpu ? READ_ONCE(*(u32 *)ch->sem.cpu) : 0,
+		 ch->seq);
+	if (ch->handle) {
+		chan_unmap_bufs(nv, ch);
+		nv_chan_destroy(nv, ch);	/* RM free (stops it), host buffers, chid */
+	}
+	set_bit(CHID_CE, nv->fifo.chids);
+	ret = ce_chan_init(nv, ch);
+	if (!ret) {
+		nv_push1(ch, SUBC_CE, 0, AMPERE_DMA_COPY_B);	/* SET_OBJECT */
+		nv_kick(nv, ch);
+		nv->fifo.ce_recoveries++;
+	}
+	dev_warn(&nv->pdev->dev, "fifo: kernel copy channel rebuilt: %d\n", ret);
+	return ret;
+}
+
+/*
+ * Wait for the kernel CE channel's semaphore to reach seq. On an RC or a timeout the channel
+ * is rebuilt and the operation fails (-EIO); the next one runs on the new channel.
+ */
+static int ce_wait(struct nvdrv_dev *nv, u32 seq, u32 timeout_us)
+{
+	struct nv_chan *ch = &nv->chan;
+	ktime_t end = ktime_add_us(ktime_get(), timeout_us);
+	u32 sem;
+
+	for (;;) {
+		sem = READ_ONCE(*(u32 *)ch->sem.cpu);
+		if ((s32)(sem - seq) >= 0)
+			return 0;
+		if (chan_rc(ch))
+			break;
+		if (ktime_after(ktime_get(), end))
+			break;
+		usleep_range(20, 40);
+	}
+	nv_ce_recover(nv, chan_rc(ch) ? "was recovered by RM" : "timed out");
+	return -EIO;
+}
+
+/*
+ * debugfs ce_fault: make the kernel CE channel fault (a copy between unmapped GPU VAs), then
+ * check that it is rebuilt and that a VRAM clear works afterwards.
+ */
+int nv_ce_fault_test(struct nvdrv_dev *nv)
+{
+	struct nv_chan *ch;
+	struct drm_mm_node node;
+	u32 seq;
+	int ret, ret2;
+
+	mutex_lock(&nv->gsp_lock);
+	ret = nv_fifo_init(nv);
+	if (ret)
+		goto out;
+	ch = &nv->chan;
+	seq = ++ch->seq;
+	ce_copy(ch, 0x7f0000000000ULL, 0x7e0000000000ULL, SZ_4K, seq);	/* never mapped */
+	nv_kick(nv, ch);
+	ret = ce_wait(nv, seq, 3000000);
+	dev_info(&nv->pdev->dev, "ce fault test: faulting copy -> %d (expected -EIO), recoveries %u\n", ret,
+		 nv->fifo.ce_recoveries);
+	ret2 = nv_mem_get(nv, &node, SZ_64K, SZ_64K);
+	if (!ret2) {
+		ret2 = nv_ce_clear(nv, node.start, SZ_64K);
+		nv_mem_put(nv, &node);
+	}
+	dev_info(&nv->pdev->dev, "ce fault test: clear on the rebuilt channel -> %d\n", ret2);
+	ret = ret == -EIO && !ret2 ? 0 : -EIO;
+out:
+	mutex_unlock(&nv->gsp_lock);
+	return ret;
+}
+
+/*
  * Zero [vram, vram + size) with the copy engine in physical mode (constant remap), and
  * wait for it. Caller holds gsp_lock (nvdrv's CE channel).
  */
@@ -1078,7 +1188,7 @@ out:
 int nv_ce_clear(struct nvdrv_dev *nv, u64 vram, u64 size)
 {
 	struct nv_chan *ch = &nv->chan;
-	u32 seq = 0, sem;
+	u32 seq = 0;
 	u64 off;
 
 	lockdep_assert_held(&nv->gsp_lock);
@@ -1102,7 +1212,7 @@ int nv_ce_clear(struct nvdrv_dev *nv, u64 vram, u64 size)
 		nv_push1(ch, SUBC_CE, C7B5_LAUNCH_DMA, LAUNCH_CLEAR_PHYS_SEM);
 	}
 	nv_kick(nv, ch);
-	return read_poll_timeout(READ_ONCE, sem, (s32)(sem - seq) >= 0, 20, 2000000, false, *(u32 *)ch->sem.cpu);
+	return ce_wait(nv, seq, 2000000);
 }
 
 /*
@@ -1117,9 +1227,9 @@ int nv_ce_copy_to_sg(struct nvdrv_dev *nv, u64 vram, struct sg_table *sgt, u64 b
 {
 	struct nv_chan *ch = &nv->chan;
 	struct scatterlist *sg;
-	u32 seq = 0, sem, batch = 0;
+	u32 seq = 0, batch = 0;
 	u64 off = 0;
-	int i, ret = 0;
+	int i;
 
 	lockdep_assert_held(&nv->gsp_lock);
 	if (!ch->handle)
@@ -1158,8 +1268,7 @@ int nv_ce_copy_to_sg(struct nvdrv_dev *nv, u64 vram, struct sg_table *sgt, u64 b
 	if (off < bytes || !seq)
 		return -EINVAL;
 	nv_kick(nv, ch);
-	ret = read_poll_timeout(READ_ONCE, sem, (s32)(sem - seq) >= 0, 20, 5000000, false, *(u32 *)ch->sem.cpu);
-	return ret;
+	return ce_wait(nv, seq, 5000000);
 }
 
 static void __maybe_unused rl_state(struct nvdrv_dev *nv, const char *when)
