@@ -323,6 +323,7 @@ struct nv_evo_chan {
 
 struct nv_evo {
 	struct mutex win_lock;			/* window channel 0: flips take only this, not gsp_lock */
+	struct mutex curs_lock;			/* cursor PIO channel writes */
 	u64 vram_bottom, vram_top, vram_next;	/* nvdrv's VRAM carve-out (top-down) */
 	u64 pramin_base;			/* current BAR0 window (VRAM, 64K units) */
 	u64 instmem;				/* display instance memory (VRAM) */
@@ -340,6 +341,18 @@ struct nv_evo {
 	u64 scanout_cur;			/* surface window 0 shows (0 = own framebuffer) */
 	u32 fb_pitch;				/* own framebuffer pitch for the current mode */
 	u32 sor, head;				/* of the active modeset */
+	/* hardware cursor (modeset.c): PIO channel for the position, image via the core channel */
+	void __iomem *curs_user;		/* PIO channel user area (BAR0) */
+	u64 curs_vram;				/* two 256x256 ARGB slots (copied images) */
+	void __iomem *curs_cpu;			/* their BAR1 mapping */
+	u32 curs_slot;				/* slot shown last */
+	u32 curs_ctl, curs_ctxdma;		/* core state last sent (0: off) */
+	u64 curs_offset;
+	bool curs_ready, curs_pool_ctxdma;
+	u64 lut_vram;				/* input LUT (identity) */
+	void __iomem *lut_cpu;
+	bool lut_ready;
+	bool composed;				/* window in composition (OLUT/OCSC0 on), not bypass */
 };
 
 /* BAR1 page tables under GSP-RM's root (src/bar1.c). */
@@ -701,6 +714,11 @@ int dp_watermark(const struct nv_mode *m, u32 lanes, u32 link_bw_270m, bool ef, 
 bool nv_disp_mode_fits(struct nvdrv_dev *nv, const struct nv_mode *m);
 int nv_disp_set_mode(struct nvdrv_dev *nv, const struct nv_mode *m);
 #define NV_FB_MAX		(64ULL << 20)	/* fits 4096x4096 XRGB8888 */
+/* BAR1 VA: [0, NV_FB_MAX) scanout, then 64 KiB USERD, then the cursor slots, objects from 2 MiB up */
+#define NV_CURS_SLOT		(256 * 256 * 4)
+#define NV_BAR1_CURS_VA		(NV_FB_MAX + SZ_64K)
+#define NV_LUT_SIZE		SZ_64K	/* identity input LUT (+ room for gamma later) */
+#define NV_BAR1_LUT_VA		(NV_BAR1_CURS_VA + 2 * NV_CURS_SLOT)
 /*
  * Experiment flags for disp_modeset / disp_flip. 0 = the configuration known to
  * work on GA104: composition bypass, identity FMT, CSC/LUT methods not sent.
@@ -711,7 +729,13 @@ int nv_disp_set_mode(struct nvdrv_dev *nv, const struct nv_mode *m);
 #define NV_FLIP_NO_FMT			BIT(3)
 #define NV_FLIP_CSC			BIT(4)	/* send CSC/ILUT/TMO disables (err 0x2 with bypass) */
 #define NV_FLIP_SYSMEM			BIT(5)	/* scan out a test surface from coherent sysmem */
+#define NV_FLIP_ILUT			BIT(6)	/* with COMPOSE: identity input LUT (modeset.c lut_init) */
 int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch);
+int nv_disp_cursor_init(struct nvdrv_dev *nv);
+int nv_disp_cursor_image(struct nvdrv_dev *nv, u64 vram, const void *src, u32 src_pitch, u32 size);
+int nv_disp_cursor_off(struct nvdrv_dev *nv);
+void nv_disp_cursor_move(struct nvdrv_dev *nv, int x, int y);
+int nv_evo_pio_alloc(struct nvdrv_dev *nv, u32 cls, u32 handle, u32 instance);
 int nv_disp_flip(struct nvdrv_dev *nv, u32 flags);
 int nv_bar1_test(struct nvdrv_dev *nv);
 int nv_bar1_bench(struct nvdrv_dev *nv);

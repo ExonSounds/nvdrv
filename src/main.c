@@ -1000,6 +1000,7 @@ static int nvdrv_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	mutex_init(&nv->gsp_lock);
 	mutex_init(&nv->mem.lock);
 	mutex_init(&nv->evo.win_lock);
+	mutex_init(&nv->evo.curs_lock);
 	nv_uapi_init(nv);
 	ret = devm_add_action_or_reset(&pdev->dev, nv_put_action, nv);
 	if (ret)

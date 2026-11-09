@@ -236,7 +236,8 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
      (nvkms conversion: syncEnd = sw-1, blankEnd = total-syncStart-1, blankStart = active+total-syncStart-1),
      pixel clock in Hz, viewport, usage bounds, HEAD_SET_DISPLAY_ID. GSP-RM handles the supervisor interrupts.
   7. Window: X8R8G8B8 pitch-linear (pitch/64; pitch vs block linear comes from the ctxdma KIND bit), ctxdma
-     ISO 0, identity FMT matrix, **composition bypass, no CSC/ILUT/TMO methods**.
+     ISO 0, identity FMT matrix, composition bypass (since 2026-11-09: normal composition with identity ILUT/OLUT,
+     see the hardware cursor entry).
      - Normal blending without an input LUT → window error 0x2d (nvkms always sets an identity ILUT for 8-bit formats).
      - Bypass + explicit CSC/LUT "disable" methods → window error 0x2.
 - **Debugging display exceptions without docs:** `NV_PDISP_FE_EXCEPT(chn)` (0x611020 + 12·chn) latches METHOD_OFFSET
@@ -522,7 +523,26 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
 ### Display
 - [ ] **Multiple monitors**: the other heads/SORs, HDMI (TMDS/FRL), hotplug detection (HPD), EDID reprobe.
 - [ ] **Robust mode changes** with the AOC monitor (identity switching), DP_CONFIG_STREAM, core exceptions.
-- [ ] **Hardware cursor plane** and **overlay planes** (direct scanout of fullscreen apps).
+- [x] **Hardware cursor plane** (2026-11-09): DRM cursor plane (ARGB8888 premultiplied, 32..256 square), image
+      through the core channel (HEAD_SET_CONTROL_CURSOR/COMPOSITION/CONTEXT_DMA/OFFSET_CURSOR; VRAM pool objects
+      zero-copy through a pool ctxdma on the core channel, others copied into two 256x256 slots), position through
+      the cursor immediate PIO channel `NVC67A` (allocated as nouveau r535_curs_init: CHANNEL_PUSHBUFFER valid=0,
+      then NV50VAIO_CHANNELPIO params; user area 0x6d8000 + 0x1000·head; SET_CURSOR_HOT_SPOT_POINT_OUT + UPDATE).
+      Verified on screen (`tools/curstest`). What it took (each missing piece is its own INVALID_STATE code):
+      - The window must use **normal composition**, not bypass: with bypass, enabling the cursor fails (core 0x43).
+      - Composition needs an **identity input LUT** on the window (window 0x2d without; nouveau wndwc57e_ilut:
+        VSS header + 1025 FP16 entries, DIRECT10) **and** an **identity output LUT + OCSC0** on the head (window
+        0x2e without; OLUT alone fails with core 0x41: nvkms EvoSetOutputLutC5 enables OCSC0 after the OLUT, "as
+        required by the specification"; bypass means OLUT and OCSC0 off, nvSetupOutputLUT5).
+      - Bypass ↔ composition must switch in **one** window-interlocked core update (each half alone is invalid).
+        The modeset does it; module param `compose` (default 1) keeps the old bypass path.
+      - A disabled cursor still needs FORMAT = A8R8G8B8 (core 0x2 on HEAD_SET_CONTROL_CURSOR otherwise).
+      - Interlock flags are sticky method state: the modeset leaves the core interlocked with window 0, so every
+        later core update sets both flags explicitly (otherwise the core waits forever in WAIT_FOR_UPD).
+      - DRM's damage helper reports full damage on plain moves: only a new fb, reappearing cursor or explicit
+        damage clips re-upload the image; moves are one PIO write.
+      - The old "bypass + CSC/LUT disables → window error 0x2" was TMO_CONTROL = 0 (invalid argument); not sent.
+- [ ] **Overlay planes** (direct scanout of fullscreen apps).
 - [ ] **Adaptive sync (VRR / FreeSync)**.
 - [x] **Real vblank interrupts and timestamps** (2026-11-09): GSP-RM's kernel interrupt table gives the CPU the
       DISP stall vector (engine 2, vector 154 on GA104); head timing as kdispServiceLowLatencyIntrs_KERNEL /

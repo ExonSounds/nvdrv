@@ -67,6 +67,7 @@
 #define C67E_SET_COMPOSITION_CONSTANT_ALPHA	0x02f0
 #define C67E_SET_COMPOSITION_FACTOR_SELECT	0x02f4
 #define C67E_SET_PRESENT_CONTROL		0x0308
+#define C67E_SET_KEY_ALPHA			0x02f8	/* then RED_CR, GREEN_Y, BLUE_CB */
 #define C67E_SET_SCAN_DIRECTION			0x033c
 #define C67E_SET_INTERLOCK_FLAGS		0x0370
 #define C67E_SET_WINDOW_INTERLOCK_FLAGS		0x0374
@@ -89,6 +90,50 @@
 #define NVDRV_H_FB_CTXDMA			0xd000f100
 #define NVDRV_H_SYSFB_CTXDMA			0xd000f101
 #define NVDRV_H_POOL_CTXDMA			0xd000f102
+#define NVDRV_H_CURS_CTXDMA			0xd000f103	/* cursor slots, core channel */
+#define NVDRV_H_POOL_CORE_CTXDMA		0xd000f104	/* VRAM pool, core channel */
+#define NVDRV_H_CURS				0xd000c67a
+#define NVDRV_H_LUT_CTXDMA			0xd000f105	/* LUTs, window channel */
+#define NVDRV_H_LUT_CORE_CTXDMA			0xd000f106	/* LUTs, core channel */
+#define OLUT_OFFSET				0x4000		/* in the LUT buffer, after the ILUT */
+
+#define C67D_HEAD_SET_OCSC0CONTROL		0x2240
+#define C67D_HEAD_SET_OCSC0COEFFICIENT_C00	0x2244
+#define C67D_HEAD_SET_OLUT_CONTROL		0x2280
+#define   OLUT_INTERPOLATE			BIT(0)
+#define   OLUT_DIRECT10				(2 << 2)
+#define C67D_HEAD_SET_OLUT_FP_NORM_SCALE	0x2284
+#define C67D_HEAD_SET_CONTEXT_DMA_OLUT		0x2288
+#define C67D_HEAD_SET_OFFSET_OLUT		0x228c
+
+#define C67E_SET_OFFSET_ILUT			0x0448
+#define   ILUT_DIRECT10				(2 << 2)
+#define   ILUT_ENTRIES				(4 + 1024 + 1)	/* VSS header + entries + one to interpolate */
+
+/*
+ * compose=1: the window goes through the normal composition pipeline (opaque, with an
+ * identity input LUT), which the hardware cursor needs; 0: composition bypass as before.
+ */
+static bool compose = true;
+module_param(compose, bool, 0444);
+MODULE_PARM_DESC(compose, "Window composition with an identity input LUT (needed for the hardware cursor)");
+
+/* cursor: core channel methods (clc67d.h) and the cursor immediate PIO channel (clc67a.h) */
+#define NVC67A_CURSOR_IMM_CHANNEL_PIO		0xc67a
+#define C67D_HEAD_SET_CONTEXT_DMA_CURSOR	0x2088
+#define C67D_HEAD_SET_OFFSET_CURSOR		0x2090
+#define C67D_HEAD_SET_PRESENT_CONTROL_CURSOR	0x2098
+#define C67D_HEAD_SET_CONTROL_CURSOR		0x209c
+#define   CURSOR_ENABLE				BIT(31)
+#define   CURSOR_FORMAT_A8R8G8B8		0xcf
+#define C67D_HEAD_SET_CONTROL_CURSOR_COMPOSITION 0x20a0
+#define   CURSOR_BLEND_PREMULT			(0xff | 2 << 8 /* K1 */ | 7 << 12 /* NEG_K1_TIMES_SRC */)
+#define C67A_USER(head)				(0x006d8000 + (head) * 0x1000)
+#define C67A_FREE				0x0008
+#define C67A_UPDATE				0x0200
+#define C67A_SET_INTERLOCK_FLAGS		0x0204
+#define   C67A_INTERLOCK_WITH_CORE		BIT(16)
+#define C67A_SET_CURSOR_HOT_SPOT_POINT_OUT	0x0208
 
 #define NV0073_CTRL_CMD_DP_CONFIG_STREAM	0x731362
 #define NV0073_CTRL_CMD_DP_GET_CAPS		0x731369
@@ -175,6 +220,100 @@ static u32 pattern_px(void *ctx, u64 i)
 }
 
 /* Window channel methods for a pitch-linear X8R8G8B8 surface (EvoFlipC3Common/C5Common). */
+/* nouveau wndwc57e_ilut_load: unsigned 0.16 to FP16 */
+static u16 u0_16_to_fp16(u16 fixed)
+{
+	int exp = 0, man = 0;
+
+	if (fixed) {
+		while (--exp && !(fixed & 0x8000))
+			fixed <<= 1;
+		man = ((fixed << 1) & 0xffc0) >> 6;
+		exp += 15;
+	}
+	return exp << 10 | man;
+}
+
+/*
+ * Identity input LUT in VRAM (nouveau wndwc57e_ilut with ilut_identity): 32-byte VSS header,
+ * 1024 DIRECT10 entries of FP16 R, G, B (8 bytes each), the last one repeated.
+ * Caller holds gsp_lock; BAR1 is set up (the framebuffer is mapped first).
+ */
+static int lut_init(struct nvdrv_dev *nv)
+{
+	struct nv_evo *e = &nv->evo;
+	u32 i;
+	int ret;
+
+	if (e->lut_ready)
+		return 0;
+	if (!e->lut_vram) {
+		ret = nv_vram_alloc(nv, NV_LUT_SIZE, SZ_64K, &e->lut_vram);
+		if (ret)
+			return ret;
+	}
+	if (!e->lut_cpu) {
+		e->lut_cpu = nv_bar1_map(nv, NV_BAR1_LUT_VA, e->lut_vram, NV_LUT_SIZE);
+		if (!e->lut_cpu)
+			return -EIO;
+	}
+	memset_io(e->lut_cpu, 0, 0x20);
+	for (i = 0; i <= 1024; i++) {
+		u16 v = u0_16_to_fp16(min(i, 1023u) * 0xffff / 1023);
+		void __iomem *p = e->lut_cpu + 0x20 + i * 8;
+
+		writew(v, p);
+		writew(v, p + 2);
+		writew(v, p + 4);
+		writew(0, p + 6);
+	}
+	/* identity output LUT (nouveau headc57d_olut_load): unsigned 16-bit entries */
+	memset_io(e->lut_cpu + OLUT_OFFSET, 0, 0x20);
+	for (i = 0; i <= 1024; i++) {
+		u16 v = min(i, 1023u) * 0xffff / 1023;
+		void __iomem *p = e->lut_cpu + OLUT_OFFSET + 0x20 + i * 8;
+
+		writew(v, p);
+		writew(v, p + 2);
+		writew(v, p + 4);
+		writew(0, p + 6);
+	}
+	wmb();
+	(void)ioread32(e->lut_cpu);
+	ret = nv_evo_ctxdma(nv, NVDRV_H_LUT_CTXDMA, e->lut_vram, NV_LUT_SIZE, e->win[0].chn, false);
+	if (!ret)
+		ret = nv_evo_ctxdma(nv, NVDRV_H_LUT_CORE_CTXDMA, e->lut_vram, NV_LUT_SIZE, e->core.chn, false);
+	if (ret)
+		return ret;
+	e->lut_ready = true;
+	return 0;
+}
+
+/* Head output LUT (identity) on the core channel: nouveau headc57d_olut_set. */
+/*
+ * Head output LUT (identity) on the core channel, nvkms EvoSetOutputLutC5: OCSC0 matrix
+ * first, the OLUT, then OCSC0 enabled ("only enable OCSC0 after enabling the OLUT": the
+ * specification requires the two together).
+ */
+static void olut_methods(struct nv_evo_chan *core, u32 head, bool on)
+{
+	u32 i;
+
+	if (!on) {	/* composition bypass: no OLUT, OCSC0 off (nvSetupOutputLUT5) */
+		m1(core, C67D_HEAD(head, C67D_HEAD_SET_OCSC0CONTROL), 0);
+		m1(core, C67D_HEAD(head, C67D_HEAD_SET_OLUT_CONTROL), 0);
+		m1(core, C67D_HEAD(head, C67D_HEAD_SET_CONTEXT_DMA_OLUT), 0);
+		return;
+	}
+	for (i = 0; i < 12; i++)	/* identity, S5.16 in 20:0 (nvCscCoefConvertS514) */
+		m1(core, C67D_HEAD(head, C67D_HEAD_SET_OCSC0COEFFICIENT_C00) + 4 * i, (i % 5 == 0) ? 0x10000 : 0);
+	m1(core, C67D_HEAD(head, C67D_HEAD_SET_OLUT_CONTROL), OLUT_INTERPOLATE | OLUT_DIRECT10 | ILUT_ENTRIES << 8);
+	m1(core, C67D_HEAD(head, C67D_HEAD_SET_CONTEXT_DMA_OLUT), NVDRV_H_LUT_CORE_CTXDMA);
+	m1(core, C67D_HEAD(head, C67D_HEAD_SET_OFFSET_OLUT), OLUT_OFFSET >> 8);
+	m1(core, C67D_HEAD(head, C67D_HEAD_SET_OLUT_FP_NORM_SCALE), 0xffffffff);
+	m1(core, C67D_HEAD(head, C67D_HEAD_SET_OCSC0CONTROL), 1);	/* ENABLE */
+}
+
 static void win_methods(struct nv_evo_chan *win, u32 flags, u32 ctxdma, u32 w, u32 h, u32 pitch,
 			bool interlock_core)
 {
@@ -208,15 +347,22 @@ static void win_methods(struct nv_evo_chan *win, u32 flags, u32 ctxdma, u32 w, u
 	m1(win, C67E_SET_CSC11CONTROL, 0);
 	m1(win, C67E_SET_ILUT_CONTROL, 0);
 	m1(win, C67E_SET_CONTEXT_DMA_ILUT, 0);
-	m1(win, C67E_SET_TMO_CONTROL, 0);
-	m1(win, C67E_SET_CONTEXT_DMA_TMO_LUT, 0);
+	/* not TMO_CONTROL = 0: an invalid argument (window error 0x2) */
 	}
 	if (!(flags & NV_FLIP_COMPOSE)) {
 		m1(win, C67E_SET_COMPOSITION_CONTROL, BIT(16));	/* BYPASS */
 	} else {
-		m1(win, C67E_SET_COMPOSITION_CONTROL, 0);	/* no colour key, depth 0 */
+		if (flags & NV_FLIP_ILUT) {	/* identity input LUT: blending needs one (err 0x2d) */
+			m1(win, C67E_SET_ILUT_CONTROL, ILUT_ENTRIES << 8 | ILUT_DIRECT10);
+			m1(win, C67E_SET_CONTEXT_DMA_ILUT, NVDRV_H_LUT_CTXDMA);
+			m1(win, C67E_SET_OFFSET_ILUT, 0);
+		}
+		/* nouveau wndwc37e_blend_set for an opaque bottom window: depth 255, K1 = 1.0 */
+		m1(win, C67E_SET_COMPOSITION_CONTROL, 255 << 4);	/* no colour key */
 		m1(win, C67E_SET_COMPOSITION_CONSTANT_ALPHA, 0xff);
-		m1(win, C67E_SET_COMPOSITION_FACTOR_SELECT, 1 << 0 | 1 << 4);	/* src ONE, dst ZERO */
+		m1(win, C67E_SET_COMPOSITION_FACTOR_SELECT, 0x4422);	/* src K1, dst NEG_K1 */
+		for (i = 0; i < 4; i++)				/* colour key ranges: all */
+			m1(win, C67E_SET_KEY_ALPHA + 4 * i, 0xffff0000);
 	}
 	m1(win, C67E_SET_INTERLOCK_FLAGS, interlock_core);	/* INTERLOCK_WITH_CORE */
 	m1(win, C67E_SET_WINDOW_INTERLOCK_FLAGS, 0);
@@ -302,7 +448,7 @@ static int modeset_win_locked(struct nvdrv_dev *nv, u32 flags)
 	}
 
 	/* 2. DP stream parameters for the trained link */
-	ret = nv_evo_begin(nv, core, 512);
+	ret = nv_evo_begin(nv, core, 640);
 	if (!ret)
 		ret = nv_evo_begin(nv, win, 768);
 	if (ret)
@@ -350,7 +496,9 @@ static int modeset_win_locked(struct nvdrv_dev *nv, u32 flags)
 		e->win_mapped = true;
 	}
 
-	/* 3. window 0 */
+	/* 3. window 0: normal composition with an identity input LUT unless compose=0 */
+	if (compose && !(flags & NV_FLIP_COMPOSE) && !lut_init(nv))
+		flags |= NV_FLIP_COMPOSE | NV_FLIP_ILUT | NV_FLIP_CSC;
 	win_methods(win, flags, NVDRV_H_FB_CTXDMA, w, h, pitch, true);
 
 	/* 4. core: window -> head, SOR, raster, viewport, usage bounds */
@@ -387,6 +535,8 @@ static int modeset_win_locked(struct nvdrv_dev *nv, u32 flags)
 	m1(core, C67D_HEAD(head, HEAD_SET_VIEWPORT_SIZE_OUT), w | h << 16);
 	m1(core, C67D_HEAD(head, HEAD_SET_MAX_OUTPUT_SCALE_FACTOR), SCALE_1X | SCALE_1X << 16);
 	m1(core, C67D_HEAD(head, HEAD_SET_HEAD_USAGE_BOUNDS), 4 | BIT(4) | 1 << 12);
+	/* composition needs the head's OLUT + OCSC0 in the same (window-interlocked) update */
+	olut_methods(core, head, flags & NV_FLIP_COMPOSE);
 	m1(core, C67D_SET_INTERLOCK_FLAGS, 0);
 	m1(core, C67D_SET_WINDOW_INTERLOCK_FLAGS, BIT(0));
 	m1(core, C67D_UPDATE, 1);			/* RELEASE_ELV */
@@ -417,6 +567,7 @@ static int modeset_win_locked(struct nvdrv_dev *nv, u32 flags)
 			 nv_rd32(nv, 0x611028 + chn * 12));
 	}
 	e->active = true;
+	e->composed = flags & NV_FLIP_COMPOSE;
 	return 0;
 }
 
@@ -521,6 +672,157 @@ out:
 	return ret;
 }
 
+/* ---- hardware cursor ----------------------------------------------------- */
+
+/*
+ * Cursor of the active head (nouveau headc37d_curs_set, cursc37a): image, size and blending
+ * through the core channel, position through the cursor PIO channel. Images that are not in
+ * the VRAM pool are copied into one of two slots in nvdrv's carve-out. Caller holds gsp_lock.
+ */
+int nv_disp_cursor_init(struct nvdrv_dev *nv)
+{
+	struct nv_evo *e = &nv->evo;
+	int ret;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	if (e->curs_ready)
+		return 0;
+	if (!e->active || !e->core.handle)
+		return -ENODEV;
+	ret = nv_vram_alloc(nv, 2 * NV_CURS_SLOT, SZ_64K, &e->curs_vram);
+	if (ret)
+		return ret;
+	e->curs_cpu = nv_bar1_map(nv, NV_BAR1_CURS_VA, e->curs_vram, 2 * NV_CURS_SLOT);
+	if (!e->curs_cpu)
+		return -EIO;
+	ret = nv_evo_ctxdma(nv, NVDRV_H_CURS_CTXDMA, e->curs_vram, 2 * NV_CURS_SLOT, e->core.chn, false);
+	if (ret)
+		return ret;
+	ret = nv_evo_pio_alloc(nv, NVC67A_CURSOR_IMM_CHANNEL_PIO, NVDRV_H_CURS, e->head);
+	if (ret)
+		return ret;
+	e->curs_user = nv->bar0 + C67A_USER(e->head);
+	e->curs_ready = true;
+	return 0;
+}
+
+static int cursor_core(struct nvdrv_dev *nv, u32 ctl, u32 ctxdma, u64 offset)
+{
+	struct nv_evo *e = &nv->evo;
+	struct nv_evo_chan *core = &e->core;
+	u32 head = e->head;
+	int ret;
+
+	if (ctl == e->curs_ctl && ctxdma == e->curs_ctxdma && offset == e->curs_offset)
+		return 0;
+	/*
+	 * Needs the window in normal composition (compose=1): with composition bypass GSP-RM
+	 * rejects enabling the cursor (INVALID_STATE, error code 0x43). The interlock flags are
+	 * sticky; the modeset leaves the core interlocked with window 0.
+	 */
+	mutex_lock(&e->win_lock);
+	ret = nv_evo_begin(nv, core, 8 * 8);
+	if (ret)
+		goto out;
+	m1(core, C67D_HEAD(head, C67D_HEAD_SET_PRESENT_CONTROL_CURSOR), 0);	/* MONO */
+	m1(core, C67D_HEAD(head, C67D_HEAD_SET_CONTROL_CURSOR), ctl);
+	m1(core, C67D_HEAD(head, C67D_HEAD_SET_CONTROL_CURSOR_COMPOSITION), CURSOR_BLEND_PREMULT);
+	m1(core, C67D_HEAD(head, C67D_HEAD_SET_CONTEXT_DMA_CURSOR), ctxdma);
+	m1(core, C67D_HEAD(head, C67D_HEAD_SET_OFFSET_CURSOR), offset >> 8);
+	m1(core, C67D_SET_INTERLOCK_FLAGS, 0);
+	m1(core, C67D_SET_WINDOW_INTERLOCK_FLAGS, 0);
+	m1(core, C67D_UPDATE, 1);
+	ret = nv_evo_kick(nv, core);
+	dev_dbg(&nv->pdev->dev, "cursor: ctl 0x%08x ctxdma 0x%08x offset 0x%llx: %d, core status 0x%08x except 0x%08x err 0x%08x\n",
+		ctl, ctxdma, offset, ret, nv_rd32(nv, 0x610630), nv_rd32(nv, 0x611020), nv_rd32(nv, 0x611028));
+	if (!ret) {
+		e->curs_ctl = ctl;
+		e->curs_ctxdma = ctxdma;
+		e->curs_offset = offset;
+	}
+out:
+	mutex_unlock(&e->win_lock);
+	return ret;
+}
+
+/*
+ * Show a square ARGB8888 (premultiplied) cursor of @size pixels (32/64/128/256): either
+ * the pool object at @vram (packed, 256-byte aligned) or @src (rows @src_pitch apart)
+ * copied into a slot.
+ */
+int nv_disp_cursor_image(struct nvdrv_dev *nv, u64 vram, const void *src, u32 src_pitch, u32 size)
+{
+	struct nv_evo *e = &nv->evo;
+	u32 ctl, ctxdma, code = ilog2(size) - 5;
+	u64 offset;
+	int ret;
+
+	if (size < 32 || size > 256 || !is_power_of_2(size))
+		return -EINVAL;
+	mutex_lock(&nv->gsp_lock);
+	ret = nv_disp_cursor_init(nv);
+	if (ret)
+		goto out;
+	if (vram) {
+		if (!nv->mem.ready || vram < nv->mem.base || vram + size * size * 4 > nv->mem.base + nv->mem.size ||
+		    (vram & 255)) {
+			ret = -EINVAL;
+			goto out;
+		}
+		if (!e->curs_pool_ctxdma) {
+			ret = nv_evo_ctxdma(nv, NVDRV_H_POOL_CORE_CTXDMA, nv->mem.base, nv->mem.size,
+					    e->core.chn, false);
+			if (ret)
+				goto out;
+			e->curs_pool_ctxdma = true;
+		}
+		ctxdma = NVDRV_H_POOL_CORE_CTXDMA;
+		offset = vram - nv->mem.base;
+	} else {
+		u32 y;
+
+		e->curs_slot ^= 1;	/* the other slot: the one on screen stays intact */
+		for (y = 0; y < size; y++)
+			memcpy_toio(e->curs_cpu + e->curs_slot * NV_CURS_SLOT + y * size * 4,
+				    src + y * src_pitch, size * 4);
+		wmb();
+		(void)ioread32(e->curs_cpu);
+		ctxdma = NVDRV_H_CURS_CTXDMA;
+		offset = e->curs_slot * NV_CURS_SLOT;
+	}
+	ctl = CURSOR_ENABLE | CURSOR_FORMAT_A8R8G8B8 | code << 8;
+	ret = cursor_core(nv, ctl, ctxdma, offset);
+out:
+	mutex_unlock(&nv->gsp_lock);
+	return ret;
+}
+
+int nv_disp_cursor_off(struct nvdrv_dev *nv)
+{
+	int ret = 0;
+
+	mutex_lock(&nv->gsp_lock);
+	if (nv->evo.curs_ready && nv->evo.active)	/* disabled still needs a valid format */
+		ret = cursor_core(nv, CURSOR_FORMAT_A8R8G8B8, 0, 0);
+	mutex_unlock(&nv->gsp_lock);
+	return ret;
+}
+
+/* Top-left corner of the cursor on the head (may be negative). */
+void nv_disp_cursor_move(struct nvdrv_dev *nv, int x, int y)
+{
+	struct nv_evo *e = &nv->evo;
+	u32 free;
+
+	mutex_lock(&e->curs_lock);
+	if (e->curs_ready && !readl_poll_timeout(e->curs_user + C67A_FREE, free, (free & 0x3f) >= 2,
+						 1, 20000)) {
+		iowrite32((u16)x | (u32)(u16)y << 16, e->curs_user + C67A_SET_CURSOR_HOT_SPOT_POINT_OUT);
+		iowrite32(0, e->curs_user + C67A_UPDATE);
+	}
+	mutex_unlock(&e->curs_lock);
+}
+
 int nv_disp_flip(struct nvdrv_dev *nv, u32 flags)
 {
 	struct nv_evo *e = &nv->evo;
@@ -544,15 +846,44 @@ int nv_disp_flip(struct nvdrv_dev *nv, u32 flags)
 	if (ret)
 		goto out_win;
 	ctxdma = NVDRV_H_FB_CTXDMA;
+	if (flags & NV_FLIP_ILUT) {
+		ret = lut_init(nv);
+		if (ret)
+			goto out_win;
+	}
 	if (flags & NV_FLIP_SYSMEM) {
 		ret = sysfb_prepare(nv, w, h);
 		if (ret)
 			goto out_win;
 		ctxdma = NVDRV_H_SYSFB_CTXDMA;
 	}
-	win_methods(win, flags, ctxdma, w, h, ALIGN(w * 4, 256), false);
-	ret = nv_evo_kick(nv, win);
-	msleep(50);
+	if ((flags & NV_FLIP_ILUT) || e->composed != !!(flags & NV_FLIP_COMPOSE)) {
+		/* bypass <-> composition: head OLUT/OCSC0 and window together, interlocked */
+		struct nv_evo_chan *core = &e->core;
+
+		ret = nv_evo_begin(nv, core, 24 * 8);
+		if (ret)
+			goto out_win;
+		olut_methods(core, e->head, flags & NV_FLIP_COMPOSE);
+		m1(core, C67D_SET_INTERLOCK_FLAGS, 0);
+		m1(core, C67D_SET_WINDOW_INTERLOCK_FLAGS, BIT(0));
+		m1(core, C67D_UPDATE, 1);
+		win_methods(win, flags, ctxdma, w, h, ALIGN(w * 4, 256), true);
+		ret = nv_evo_kick_nowait(nv, win);
+		if (!ret)
+			ret = nv_evo_kick(nv, core);
+		if (!ret)
+			ret = nv_evo_wait(nv, win);
+		if (!ret)
+			e->composed = flags & NV_FLIP_COMPOSE;
+		msleep(50);
+		dev_info(&nv->pdev->dev, "flip: with core (OLUT %s): %d, core except 0x%08x err 0x%08x\n",
+			 flags & NV_FLIP_COMPOSE ? "on" : "off", ret, nv_rd32(nv, 0x611020), nv_rd32(nv, 0x611028));
+	} else {
+		win_methods(win, flags, ctxdma, w, h, ALIGN(w * 4, 256), false);
+		ret = nv_evo_kick(nv, win);
+		msleep(50);
+	}
 	dev_info(&nv->pdev->dev, "flip 0x%x: %d, window except 0x%08x arg 0x%08x err 0x%08x, scanline %u\n",
 		 flags, ret, nv_rd32(nv, 0x611020 + win->chn * 12), nv_rd32(nv, 0x611024 + win->chn * 12),
 		 nv_rd32(nv, 0x611028 + win->chn * 12), ioread32(e->core.user + C67D_GET_RG_SCAN_LINE(0)) & 0xffff);

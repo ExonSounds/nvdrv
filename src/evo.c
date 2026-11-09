@@ -281,6 +281,29 @@ static int evo_channel_alloc(struct nvdrv_dev *nv, struct nv_evo_chan *c, u32 cl
 	return 0;
 }
 
+/*
+ * PIO channel (cursor immediate, class 0xc67a): no push buffer. GSP-RM is told so through
+ * CHANNEL_PUSHBUFFER with valid = 0 (nouveau r535_curs_init), then the class is allocated
+ * with NV50VAIO_CHANNELPIO_ALLOCATION_PARAMETERS. Methods are BAR0 writes to its user area.
+ */
+int nv_evo_pio_alloc(struct nvdrv_dev *nv, u32 cls, u32 handle, u32 instance)
+{
+	struct nv2080_channel_pushbuffer pb = {};
+	struct { __le32 channel_instance, h_object_notify; __le64 p_control; } a = {};
+	int ret;
+
+	pb.hclass = cpu_to_le32(cls);
+	pb.channel_instance = cpu_to_le32(instance);
+	ret = nv_rm_control(nv, nv->gsp_info.h_internal_client, nv->gsp_info.h_internal_subdevice,
+			    NV2080_CTRL_CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER, &pb, sizeof(pb));
+	if (ret)
+		return ret;
+	a.channel_instance = cpu_to_le32(instance);
+	ret = nv_rm_alloc(nv, nv->rm.h_client, nv->evo.h_disp, handle, cls, &a, sizeof(a));
+	dev_info(&nv->pdev->dev, "evo: PIO channel 0x%04x/%u: %d\n", cls, instance, ret);
+	return ret;
+}
+
 static void evo_channel_free_mem(struct nvdrv_dev *nv, struct nv_evo_chan *c)
 {
 	if (c->pb.cpu)
@@ -427,11 +450,15 @@ void nv_evo_fini(struct nvdrv_dev *nv)
 		evo_channel_free_mem(nv, &e->win[i]);
 	if (e->fb_cpu)
 		iounmap(e->fb_cpu);
+	if (e->curs_cpu)
+		iounmap(e->curs_cpu);
+	if (e->lut_cpu)
+		iounmap(e->lut_cpu);
 	if (e->sysfb.cpu)
 		dma_free_coherent(&nv->pdev->dev, e->sysfb.size, e->sysfb.cpu, e->sysfb.dma);
-	/* everything but the lock, which lives as long as nvdrv_dev */
-	memset((char *)e + offsetofend(struct nv_evo, win_lock), 0,
-	       sizeof(*e) - offsetofend(struct nv_evo, win_lock));
+	/* everything but the locks, which live as long as nvdrv_dev */
+	memset((char *)e + offsetofend(struct nv_evo, curs_lock), 0,
+	       sizeof(*e) - offsetofend(struct nv_evo, curs_lock));
 	mutex_unlock(&e->win_lock);
 }
 

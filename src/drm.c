@@ -43,7 +43,7 @@
 struct nv_drm {
 	struct drm_device dev;
 	struct nvdrv_dev *nv;
-	struct drm_plane primary;
+	struct drm_plane primary, cursor;
 	struct drm_crtc crtc;
 	struct drm_encoder encoder;
 	struct drm_connector connector;
@@ -213,6 +213,92 @@ static void nv_plane_atomic_disable(struct drm_plane *plane, struct drm_atomic_c
 	memset_io(d->scanout, 0, (size_t)d->pitch * d->mode.vdisplay);	/* black */
 	drm_dev_exit(idx);
 }
+
+/* ---- cursor plane --------------------------------------------------------- */
+
+static const u32 nv_cursor_formats[] = { DRM_FORMAT_ARGB8888 };
+static const u64 nv_cursor_modifiers[] = { DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID };
+
+static int nv_cursor_atomic_check(struct drm_plane *plane, struct drm_atomic_commit *state)
+{
+	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_crtc_state *cs = NULL;
+	struct drm_framebuffer *fb = ps->fb;
+	u64 vram;
+	int ret;
+
+	if (ps->crtc)
+		cs = drm_atomic_get_new_crtc_state(state, ps->crtc);
+	ret = drm_atomic_helper_check_plane_state(ps, cs, DRM_PLANE_NO_SCALING, DRM_PLANE_NO_SCALING,
+						  true, true);
+	if (ret || !fb || !ps->visible)
+		return ret;
+	/* the hardware shows whole square images of 32..256 pixels */
+	if (fb->width != fb->height || fb->width < 32 || fb->width > 256 || !is_power_of_2(fb->width) ||
+	    ps->src_x || ps->src_y || (ps->src_w >> 16) != fb->width || (ps->src_h >> 16) != fb->height)
+		return -EINVAL;
+	if (fb->modifier != DRM_FORMAT_MOD_LINEAR)
+		return -EINVAL;
+	if (nv_uapi_bo_vram(fb->obj[0], &vram) &&
+	    (fb->pitches[0] != fb->width * 4 || ((vram + fb->offsets[0]) & 255)))
+		return -EINVAL;
+	return 0;
+}
+
+static void nv_cursor_atomic_update(struct drm_plane *plane, struct drm_atomic_commit *state)
+{
+	struct nv_drm *d = to_nv_drm(plane->dev);
+	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_plane_state *old = drm_atomic_get_old_plane_state(state, plane);
+	struct drm_framebuffer *fb = ps->fb;
+	struct drm_rect damage;
+	u64 vram;
+	int idx, ret = 0;
+
+	if (!drm_dev_enter(&d->dev, &idx))
+		return;
+	if (!fb || !ps->visible) {
+		nv_disp_cursor_off(d->nv);
+		goto out;
+	}
+	/*
+	 * New image: another framebuffer, the cursor reappearing, or damage on the same one
+	 * (dirtyfb). Not the damage helper's default "whole plane" for a plain move: that
+	 * would turn every move into a core channel update.
+	 */
+	if (fb != old->fb || !old->visible ||
+	    (ps->fb_damage_clips && drm_atomic_helper_damage_merged(old, ps, &damage))) {
+		if (nv_uapi_bo_vram(fb->obj[0], &vram))
+			ret = nv_disp_cursor_image(d->nv, vram + fb->offsets[0], NULL, 0, fb->width);
+		else
+			ret = nv_disp_cursor_image(d->nv, 0, to_drm_shadow_plane_state(ps)->data[0].vaddr +
+						   fb->offsets[0], fb->pitches[0], fb->width);
+		if (ret)
+			drm_err_once(&d->dev, "cursor image: %d\n", ret);
+	}
+	nv_disp_cursor_move(d->nv, ps->crtc_x, ps->crtc_y);
+out:
+	drm_dev_exit(idx);
+}
+
+static void nv_cursor_atomic_disable(struct drm_plane *plane, struct drm_atomic_commit *state)
+{
+	struct nv_drm *d = to_nv_drm(plane->dev);
+	int idx;
+
+	if (!drm_dev_enter(&d->dev, &idx))
+		return;
+	nv_disp_cursor_off(d->nv);
+	drm_dev_exit(idx);
+}
+
+static const struct drm_plane_helper_funcs nv_cursor_helper_funcs = {
+	.begin_fb_access = nv_plane_begin_fb_access,
+	.end_fb_access = nv_plane_end_fb_access,
+	.atomic_check = nv_cursor_atomic_check,
+	.atomic_update = nv_cursor_atomic_update,
+	.atomic_disable = nv_cursor_atomic_disable,
+};
 
 static const struct drm_plane_helper_funcs nv_plane_helper_funcs = {
 	.begin_fb_access = nv_plane_begin_fb_access,
@@ -542,9 +628,9 @@ int nv_drm_register(struct nvdrv_dev *nv)
 	ret = drmm_mode_config_init(dev);
 	if (ret)
 		goto err;
-	dev->mode_config.min_width = 320;
+	dev->mode_config.min_width = 32;	/* framebuffers: cursors are 32..256 */
 	dev->mode_config.max_width = 4096;
-	dev->mode_config.min_height = 200;
+	dev->mode_config.min_height = 32;
 	dev->mode_config.max_height = 4096;
 	dev->mode_config.preferred_depth = 24;
 	dev->mode_config.funcs = &nv_mode_config_funcs;
@@ -556,7 +642,17 @@ int nv_drm_register(struct nvdrv_dev *nv)
 	drm_plane_helper_add(&d->primary, &nv_plane_helper_funcs);
 	drm_plane_enable_fb_damage_clips(&d->primary);
 
-	ret = drm_crtc_init_with_planes(dev, &d->crtc, &d->primary, NULL,
+	ret = drm_universal_plane_init(dev, &d->cursor, 0, &nv_plane_funcs, nv_cursor_formats,
+				       ARRAY_SIZE(nv_cursor_formats), nv_cursor_modifiers,
+				       DRM_PLANE_TYPE_CURSOR, NULL);
+	if (ret)
+		goto err;
+	drm_plane_helper_add(&d->cursor, &nv_cursor_helper_funcs);
+	drm_plane_enable_fb_damage_clips(&d->cursor);
+	dev->mode_config.cursor_width = 256;
+	dev->mode_config.cursor_height = 256;
+
+	ret = drm_crtc_init_with_planes(dev, &d->crtc, &d->primary, &d->cursor,
 					nv_intr_has_vblank(nv) ? &nv_crtc_funcs_hw : &nv_crtc_funcs, NULL);
 	if (ret)
 		goto err;
