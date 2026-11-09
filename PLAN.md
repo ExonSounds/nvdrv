@@ -437,7 +437,17 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       - NVK compresses dedicated unshared optimal-tiling images (64 KiB / 2 MiB aligned); everything else it binds
         at 4 KiB alignment (its nouveau backend's choice), so most mappings stay small. `tools/gltest.c` (Zink
         off-screen FBO, gradient + depth test, full readback): exact with a compressed, big-page color target.
-- [ ] **2 MiB GPU pages** (PD0 entry as PTE): needs splitting a 2 MiB PTE back into tables on partial unmap.
+- [x] **2 MiB GPU pages** (2026-11-09): a 2 MiB region of a client VM covered by one VRAM mapping at a 2 MiB-aligned
+      VA and physical address is a single PTE in the PD0 entry ([0] = PTE with VALID, [1] = 0).
+      - Split (partial unmap, eviction, different mapping): the small table is hooked into [1] and filled first
+        while the huge PTE still applies, then [0] becomes a zeroed big table; the region's 64 KiB chunks are
+        then re-upgraded. Tables of a region are kept (`vm.huge` xarray) while it is huge and reused on split.
+      - Merge: VM_BIND coalesces adjacent mappings of the same object range and kind, so remapping a hole makes
+        the region huge again.
+      - VRAM objects of >= 2 MiB are placed 2 MiB aligned when the pool allows (fallback: requested alignment).
+      - `nvktest huge`: 3 x 2 MiB, split by a 4 KiB hole, merged again; GPU writes correct in each state.
+        Overcommit (10 GiB) maps 5127 huge pages, eviction splits them correctly. NVK's small allocations and
+        4 KiB-aligned binds still get small pages (VA placement is NVK's).
 - [x] **Z-cull** (2026-11-09): `DRM_NOUVEAU_GET_ZCULL_INFO` answered from `NV2080_CTRL_CMD_GR_GET_ZCULL_INFO`
       (0x20801206, GSP's internal subdevice) plus the GRAPHICS_ZCULL context-buffer size/alignment (as nouveau
       r570). GA104: align 304x32, aliquots 4864/5120, region x160, headers 224/1344, 16 subregions 304x64, ctxsw

@@ -139,6 +139,38 @@ int nv_vmm_set_pte(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pte)
 	return 0;
 }
 
+/* Address of the 16-byte PD0 entry covering va (directories above it created on demand). */
+int nv_vmm_pd0_entry(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 *entry)
+{
+	u64 pd2, pd1, pd0;
+	int ret;
+
+	ret = pd_next(nv, vm, vm->root + ((va >> 47) & 3) * 8, &pd2);
+	if (!ret)
+		ret = pd_next(nv, vm, pd2 + ((va >> 38) & 511) * 8, &pd1);
+	if (!ret)
+		ret = pd_next(nv, vm, pd1 + ((va >> 29) & 511) * 8, &pd0);
+	if (!ret)
+		*entry = pd0 + ((va >> 21) & 255) * 16;
+	return ret;
+}
+
+u64 nv_vmm_rd64(struct nvdrv_dev *nv, u64 addr)
+{
+	return rd64(nv, addr);
+}
+
+void nv_vmm_wr64(struct nvdrv_dev *nv, u64 addr, u64 v)
+{
+	wr64(nv, addr, v);
+}
+
+/* A zeroed page-table page owned by vm (client VMs: from the pool, freed with the VM). */
+int nv_vmm_table(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 *out)
+{
+	return pt_page(nv, vm, out);
+}
+
 /*
  * Write the 64 KiB-page PTE (LPTE) for va: the big page table hangs off PD0 dual entry [0]
  * (32 entries per 2 MiB; nvdrv gives it a 4 KiB page). LPTE 0 = "use the small page table",
@@ -417,6 +449,7 @@ int nv_vmm_client_init(struct nvdrv_dev *nv, struct nv_vmm *vm, u32 h_client, u6
 	lockdep_assert_held(&nv->gsp_lock);
 	memset(vm, 0, sizeof(*vm));
 	INIT_LIST_HEAD(&vm->pts);
+	xa_init(&vm->huge);
 	vm->external = true;
 	vm->next = kernel_va;
 	ret = nv_rm_client_alloc(nv, h_client);
@@ -456,6 +489,14 @@ void nv_vmm_client_fini(struct nvdrv_dev *nv, struct nv_vmm *vm)
 				      un, sizeof(un));
 		}
 		nv_rm_free(nv, vm->h_client, vm->h_client);
+	}
+	if (vm->external) {	/* tables remembered for huge regions (the pages are in vm->pts) */
+		unsigned long idx;
+		void *e;
+
+		xa_for_each(&vm->huge, idx, e)
+			kfree(e);
+		xa_destroy(&vm->huge);
 	}
 	if (vm->pts.next)
 		list_for_each_entry_safe(pt, tmp, &vm->pts, head) {

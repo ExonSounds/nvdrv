@@ -595,8 +595,14 @@ static struct nv_bo *nv_bo_new(struct drm_device *dev, u64 size, u32 domain, u64
 		mutex_lock(&nv->gsp_lock);
 		ret = nv_fifo_init(nv);	/* CE channel; also sets up the pool under gsp_lock */
 		mutex_unlock(&nv->gsp_lock);
-		if (!ret)
+		/* >= 2 MiB: 2 MiB aligned when possible, so aligned mappings get 2 MiB pages */
+		if (!ret && size >= SZ_2M && align < SZ_2M) {
+			ret = nv_mem_get(nv, &bo->node, size, SZ_2M);
+			if (ret == -ENOSPC)
+				ret = nv_mem_get(nv, &bo->node, size, max_t(u64, align, SZ_64K));
+		} else if (!ret) {
 			ret = nv_mem_get(nv, &bo->node, size, max_t(u64, align, SZ_64K));
+		}
 		if (ret == -ENOSPC)	/* VRAM full: move older objects to system memory */
 			ret = evict_for(nv, &bo->node, size, max_t(u64, align, SZ_64K));
 		if (!ret) {		/* never hand out old VRAM contents */
@@ -924,16 +930,134 @@ static int write_chunk(struct nv_cli *cli, struct nv_vma *hint, u64 va64, bool w
 	return ret ?: nv_vmm_set_lpte(nv, &cli->vm, va64, 0);
 }
 
-/* Bring [addr, addr + range) in line with the client's mappings; v: the mapping just made. */
-static int write_ptes(struct nv_cli *cli, struct nv_vma *v, u64 addr, u64 range)
+/* ---- 2 MiB pages: the PD0 entry itself is the PTE ([0] valid PTE, [1] 0) ---------- */
+
+#define PDE_VRAM_	(1ULL << 1)
+#define PDE_ADDR(e)	(((e) & ~0xfULL) << 4)
+
+struct nv_huge_saved {		/* tables of a region while it is a 2 MiB PTE, reused on split */
+	u64 lpt, spt;
+};
+
+static void vm_cache_reset(struct nv_vmm *vm)
 {
-	u64 end = addr + range, c;
+	vm->pt_valid = false;
+	vm->lpt_valid = false;
+}
+
+/* The single VRAM mapping covering all of region r at a 2 MiB-aligned address, if any. */
+static struct nv_vma *huge_vma(struct nv_cli *cli, struct nv_vma *hint, u64 r)
+{
+	struct nv_vma *v = vma_covers(hint, r, SZ_2M) ? hint : bo_vma_at(cli, r);
+	u64 pa;
+
+	if (!v || !v->bo || !v->bo->vram || !vma_covers(v, r, SZ_2M))
+		return NULL;
+	pa = v->bo->node.start + v->bo_offset + (r - v->addr);
+	return pa & (SZ_2M - 1) ? NULL : v;
+}
+
+/* Make region r one 2 MiB PTE: PTE qword first (the entry becomes a PTE), then [1] = 0. */
+static int region_set_huge(struct nv_cli *cli, u64 ent, u64 r, struct nv_vma *v)
+{
+	struct nvdrv_dev *nv = cli->nv;
+	u64 pa = v->bo->node.start + v->bo_offset + (r - v->addr);
+	u64 pte = (pa >> 4) | BIT_ULL(0) | (u64)v->kind << NV_PTE_KIND_SHIFT;
+	u64 e0 = nv_vmm_rd64(nv, ent), e1 = nv_vmm_rd64(nv, ent + 8);
+
+	if (e0 == pte && !e1)
+		return 0;
+	if (!(e0 & BIT_ULL(0)) && ((e0 | e1) & (3ULL << 1))) {	/* was tables: keep them for a split */
+		struct nv_huge_saved *sv = xa_load(&cli->vm.huge, r >> 21);
+
+		if (!sv) {
+			sv = kzalloc(sizeof(*sv), GFP_KERNEL);
+			if (!sv)
+				return -ENOMEM;
+			if (xa_err(xa_store(&cli->vm.huge, r >> 21, sv, GFP_KERNEL))) {
+				kfree(sv);
+				return -ENOMEM;
+			}
+		}
+		if (e0 & (3ULL << 1))
+			sv->lpt = PDE_ADDR(e0);
+		if (e1 & (3ULL << 1))
+			sv->spt = PDE_ADDR(e1);
+	}
+	nv_vmm_wr64(nv, ent, pte);
+	nv_vmm_wr64(nv, ent + 8, 0);
+	vm_cache_reset(&cli->vm);
+	atomic64_inc(&nv->uapi.huge_ptes);
+	return 0;
+}
+
+/*
+ * Turn huge region r back into tables, consistent before the switch: the small table is
+ * hooked up and filled first (the huge PTE in [0] stays in effect), then [0] becomes the
+ * (zeroed) big table, so the region reads as all small pages; the caller then upgrades
+ * eligible 64 KiB chunks.
+ */
+static int region_split(struct nv_cli *cli, u64 ent, u64 r, struct nv_vma *hint)
+{
+	struct nvdrv_dev *nv = cli->nv;
+	struct nv_huge_saved *sv = xa_load(&cli->vm.huge, r >> 21);
+	u64 lpt = sv ? sv->lpt : 0, spt = sv ? sv->spt : 0, i;
 	int ret = 0;
 
-	for (c = ALIGN_DOWN(addr, SZ_64K); c < end && !ret; c += SZ_64K) {
-		bool whole = c >= addr && c + SZ_64K <= end;
+	if (!spt)
+		ret = nv_vmm_table(nv, &cli->vm, &spt);
+	if (!ret && !lpt)
+		ret = nv_vmm_table(nv, &cli->vm, &lpt);
+	if (ret)
+		return ret;
+	nv_vmm_wr64(nv, ent + 8, (spt >> 4) | PDE_VRAM_);
+	vm_cache_reset(&cli->vm);
+	for (i = 0; i < SZ_2M && !ret; i += SZ_4K) {
+		const struct nv_vma *p = vma_covers(hint, r + i, SZ_4K) ? hint : bo_vma_at(cli, r + i);
 
-		ret = write_chunk(cli, v, c, whole);
+		ret = nv_vmm_set_pte(nv, &cli->vm, r + i, spte_for(cli, p, r + i));
+	}
+	atomic64_add(SZ_2M / SZ_4K, &nv->uapi.small_ptes);
+	for (i = 0; i < 32; i++)
+		nv_vmm_wr64(nv, lpt + i * 8, 0);
+	nv_vmm_wr64(nv, ent, (lpt >> 4) | PDE_VRAM_);
+	vm_cache_reset(&cli->vm);
+	if (sv) {
+		xa_erase(&cli->vm.huge, r >> 21);
+		kfree(sv);
+	}
+	return ret;
+}
+
+/*
+ * Bring [addr, addr + range) in line with the client's mappings; v: the mapping just made.
+ * Per 2 MiB region: one 2 MiB PTE when a single VRAM mapping covers it at an aligned
+ * address, otherwise tables (split first if it was huge), then per 64 KiB chunk.
+ */
+static int write_ptes(struct nv_cli *cli, struct nv_vma *v, u64 addr, u64 range)
+{
+	struct nvdrv_dev *nv = cli->nv;
+	u64 end = addr + range, r, c, ent;
+	int ret = 0;
+
+	for (r = ALIGN_DOWN(addr, SZ_2M); r < end && !ret; r += SZ_2M) {
+		u64 rs = max(addr, r), re = min(end, r + SZ_2M);
+		struct nv_vma *hv = huge_vma(cli, v, r);
+
+		ret = nv_vmm_pd0_entry(nv, &cli->vm, r, &ent);
+		if (ret)
+			break;
+		if (hv) {
+			ret = region_set_huge(cli, ent, r, hv);
+			continue;
+		}
+		if (nv_vmm_rd64(nv, ent) & BIT_ULL(0)) {	/* huge, but no longer one mapping */
+			ret = region_split(cli, ent, r, v);
+			rs = r;			/* every chunk can go back to 64 KiB pages */
+			re = r + SZ_2M;
+		}
+		for (c = ALIGN_DOWN(rs, SZ_64K); c < re && !ret; c += SZ_64K)
+			ret = write_chunk(cli, v, c, c >= addr && c + SZ_64K <= end && vma_covers(v, c, SZ_64K));
 	}
 	return ret;
 }
@@ -1044,20 +1168,47 @@ static int vm_bind_op(struct drm_file *file, struct nv_cli *cli, const struct dr
 			atomic64_inc(&cli->nv->uapi.compressed_maps);
 		}
 	}
-	ret = write_ptes(cli, v, v->addr, v->range);
-	if (ret) {
-		if (v->bo)
-			drm_gem_object_put(&v->bo->base);
-		kfree(v);
-		return ret;
-	}
+	/*
+	 * Record the mapping first, merged with an adjacent mapping of the same object range
+	 * (so a region split by an unmap can become one 2 MiB page again), then write the PTEs
+	 * for the requested range with the merged mapping as reference.
+	 */
 	list_add_tail(&v->link, &cli->vmas);
 	cli->nsparse += !v->bo;
 	v->cli = cli;
 	if (v->bo) {
+		struct nv_vma *w, *gone;
+
 		mutex_lock(&cli->nv->uapi.lru_lock);
 		list_add(&v->bo_link, &v->bo->vmas);
+		do {	/* restart after each merge: the freed entry may be the iterator's next */
+			gone = NULL;
+			list_for_each_entry(w, &cli->vmas, link) {
+				if (w == v || w->bo != v->bo || w->kind != v->kind)
+					continue;
+				if (w->addr + w->range == v->addr && w->bo_offset + w->range == v->bo_offset) {
+					w->range += v->range;	/* v joins w on the left */
+					gone = v;
+					v = w;
+				} else if (v->addr + v->range == w->addr && v->bo_offset + v->range == w->bo_offset) {
+					v->range += w->range;	/* w joins v on the right */
+					gone = w;
+				} else {
+					continue;
+				}
+				list_del(&gone->link);
+				list_del(&gone->bo_link);
+				drm_gem_object_put(&gone->bo->base);	/* the survivor holds a reference */
+				kfree(gone);
+				break;
+			}
+		} while (gone);
 		mutex_unlock(&cli->nv->uapi.lru_lock);
+	}
+	ret = write_ptes(cli, v, op->addr, op->range);
+	if (ret) {	/* the mapping stays recorded; its PTEs may be partial (out of page-table memory) */
+		pr_warn_ratelimited("nvdrv: VM_BIND map PTE write failed: %d\n", ret);
+		return ret;
 	}
 	return 0;
 }
@@ -2008,8 +2159,9 @@ void nv_uapi_mem_show(struct nvdrv_dev *nv, struct seq_file *m)
 	seq_printf(m, "GEM objects in VRAM: %llu (%llu MiB, %llu MiB not evictable)\n", n, bytes >> 20, pinned >> 20);
 	seq_printf(m, "evictions: %lld (%lld MiB moved to system memory)\n", atomic64_read(&ua->evictions),
 		   atomic64_read(&ua->evicted_bytes) >> 20);
-	seq_printf(m, "client PTEs written: %lld big (64 KiB), %lld small (4 KiB); compressed mappings %lld\n",
-		   atomic64_read(&ua->big_ptes), atomic64_read(&ua->small_ptes), atomic64_read(&ua->compressed_maps));
+	seq_printf(m, "client PTEs written: %lld huge (2 MiB), %lld big (64 KiB), %lld small (4 KiB); compressed mappings %lld\n",
+		   atomic64_read(&ua->huge_ptes), atomic64_read(&ua->big_ptes), atomic64_read(&ua->small_ptes),
+		   atomic64_read(&ua->compressed_maps));
 }
 
 void nv_uapi_init(struct nvdrv_dev *nv)

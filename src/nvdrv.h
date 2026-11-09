@@ -11,6 +11,7 @@
 #include <linux/pci.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
+#include <linux/xarray.h>
 
 #define DRV_NAME "nvdrv"
 
@@ -362,6 +363,7 @@ struct nv_vmm {
 	bool pt_valid;
 	u64 lpt_key, lpt_addr;	/* same for the 64 KiB-page table */
 	bool lpt_valid;
+	struct xarray huge;	/* client VMs: VA >> 21 -> tables kept while the region is a 2 MiB PTE */
 	struct list_head pts;	/* struct nv_pt, external only */
 };
 
@@ -427,6 +429,7 @@ struct nv_uapi {
 	struct list_head chans;			/* every client channel (idle wait), under lock */
 	atomic64_t evicted_bytes, evictions;
 	atomic64_t big_ptes, small_ptes;		/* client PTEs written: 64 KiB / 4 KiB */
+	atomic64_t huge_ptes;			/* 2 MiB PTEs (PD0 entries) */
 	atomic64_t compressed_maps;		/* VM_BIND maps with a compressible kind */
 	bool zcull_valid;			/* zcull[] holds drm_nouveau_get_zcull_info */
 	u32 zcull[12];
@@ -593,6 +596,10 @@ void nv_mem_fini(struct nvdrv_dev *nv);
 int nv_vmm_map_4k(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pa, u64 pte_flags);
 int nv_vmm_set_pte(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pte);
 int nv_vmm_set_lpte(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 pte);
+int nv_vmm_pd0_entry(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 va, u64 *entry);
+int nv_vmm_table(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 *out);
+u64 nv_vmm_rd64(struct nvdrv_dev *nv, u64 addr);
+void nv_vmm_wr64(struct nvdrv_dev *nv, u64 addr, u64 v);
 int nv_vmm_flush(struct nvdrv_dev *nv, struct nv_vmm *vm);
 void nv_vmm_join(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 inst);
 int nv_vmm_map_vram_flags(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 vram, u64 size, u64 align,

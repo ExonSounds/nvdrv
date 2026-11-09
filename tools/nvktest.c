@@ -39,10 +39,10 @@ static int param(uint64_t p, uint64_t *v)
 	return r;
 }
 
-static int bo_new(uint64_t size, uint32_t domain, uint32_t *handle, void **map)
+static int bo_new_align(uint64_t size, uint32_t domain, uint32_t align, uint32_t *handle, void **map)
 {
 	struct drm_nouveau_gem_new n = { .info = { .size = size, .domain = domain | NOUVEAU_GEM_DOMAIN_MAPPABLE },
-					 .align = 0x10000 };
+					 .align = align };
 	int r = drmCommandWriteRead(fd, DRM_NOUVEAU_GEM_NEW, &n, sizeof(n));
 
 	if (r)
@@ -50,6 +50,11 @@ static int bo_new(uint64_t size, uint32_t domain, uint32_t *handle, void **map)
 	*handle = n.info.handle;
 	*map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, n.info.map_handle);
 	return *map == MAP_FAILED ? -errno : 0;
+}
+
+static int bo_new(uint64_t size, uint32_t domain, uint32_t *handle, void **map)
+{
+	return bo_new_align(size, domain, 0x10000, handle, map);
 }
 
 static int bind(uint32_t handle, uint64_t va, uint64_t size, uint32_t op)
@@ -230,6 +235,56 @@ int main(int argc, char **argv)
 		       ((volatile uint32_t *)vram)[i]);
 	struct drm_nouveau_channel_free cf2 = { .channel = ca2.channel };
 	CHECK(drmCommandWrite(fd, DRM_NOUVEAU_CHANNEL_FREE, &cf2, sizeof(cf2)));
+
+	/*
+	 * nvktest huge: 2 MiB pages. A 6 MiB VRAM object (2 MiB aligned) at a 2 MiB-aligned VA is
+	 * three 2 MiB PTEs; a 4 KiB hole in the middle region splits it (the others stay huge);
+	 * remapping the hole with the same object range merges it back. GPU writes must land
+	 * correctly in every state. Read debugfs mem for the PTE counters.
+	 */
+	if (argc > 1 && !strcmp(argv[1], "huge")) {
+		uint32_t hh;
+		void *mh;
+		const uint64_t base = 0x80000000, hole = 0x200000 + 0x81000;
+		static const uint32_t offs[] = { 0x0, 0x1ff000, 0x200000, 0x280000, 0x2ff004, 0x400100, 0x5ffff0 };
+		int bad = 0, rounds = 3;
+
+		CHECK(bo_new_align(0x600000, NOUVEAU_GEM_DOMAIN_VRAM, 0x200000, &hh, &mh));
+		CHECK(bind(hh, base, 0x600000, DRM_NOUVEAU_VM_BIND_OP_MAP));
+		for (int round = 0; round < rounds; round++) {
+			if (round == 1)	/* split the middle region */
+				CHECK(bind(0, base + hole, 0x1000, DRM_NOUVEAU_VM_BIND_OP_UNMAP));
+			if (round == 2) {	/* the same object range back: the region can merge */
+				struct drm_nouveau_vm_bind_op o = { .op = DRM_NOUVEAU_VM_BIND_OP_MAP, .handle = hh,
+								    .addr = base + hole, .bo_offset = hole, .range = 0x1000 };
+				struct drm_nouveau_vm_bind b = { .op_count = 1, .op_ptr = (uintptr_t)&o };
+				CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_VM_BIND, &b, sizeof(b)));
+			}
+			p = pb;
+			mthd(1, 0x0000, 1, 0xc7c0);
+			for (i = 0; i < (int)(sizeof(offs) / sizeof(offs[0])); i++)
+				mthd(1, 0x1b00, 4, (uint32_t)((base + offs[i]) >> 32), (uint32_t)(base + offs[i]),
+				     0x48000000u + round * 0x100 + i, 1u << 28);
+			ep.va = 0x10000000;
+			ep.va_len = (uint32_t)((char *)p - (char *)pb);
+			ex.channel = ca.channel;
+			ex.wait_count = 0;
+			ex.sig_ptr = (uintptr_t)&sig2;
+			CHECK(drmCommandWriteRead(fd, DRM_NOUVEAU_EXEC, &ex, sizeof(ex)));
+			r = drmSyncobjWait(fd, &so2, 1, INT64_MAX, 0, NULL);
+			for (i = 0; i < (int)(sizeof(offs) / sizeof(offs[0])); i++) {
+				uint32_t got = ((volatile uint32_t *)mh)[offs[i] / 4], want = 0x48000000u + round * 0x100 + i;
+
+				bad += got != want || r;
+				if (got != want)
+					printf("  round %d +0x%06x: 0x%08x, expected 0x%08x\n", round, offs[i], got, want);
+			}
+			printf("  round %d (%s): GPU writes %s\n", round, round == 0 ? "3 x 2 MiB" : round == 1 ?
+			       "middle split" : "merged again", bad ? "WRONG" : "ok");
+		}
+		printf("huge: %d wrong -> %s\n", bad, bad ? "FAIL" : "PASS");
+		return 0;
+	}
 
 	/*
 	 * nvktest sync: (1) a channel stalled on a semaphore the CPU releases later; meanwhile
