@@ -728,6 +728,24 @@ static ssize_t gpu_lost_write(struct file *f, const char __user *buf, size_t cou
 	return count;
 }
 
+/* pm_test: "1" suspend + resume, "2" with an FLR in between (src/pm.c nv_pm_test) */
+static ssize_t pm_test_write(struct file *f, const char __user *buf, size_t count, loff_t *ppos)
+{
+	u32 mode;
+	int ret = kstrtou32_from_user(buf, count, 0, &mode);
+
+	if (ret)
+		return ret;
+	ret = nv_pm_test(f->private_data, mode);
+	return ret ? ret : count;
+}
+
+static const struct file_operations pm_test_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = pm_test_write,
+};
+
 static const struct file_operations gpu_lost_fops = {
 	.owner = THIS_MODULE,
 	.open = simple_open,
@@ -791,6 +809,7 @@ static void nv_debugfs_init(struct nvdrv_dev *nv)
 		debugfs_create_file("gr_test", 0200, nv->dbg, nv, &gr_test_fops);
 		debugfs_create_file("ce_fault", 0200, nv->dbg, nv, &ce_fault_fops);
 		debugfs_create_file("gpu_lost", 0200, nv->dbg, nv, &gpu_lost_fops);
+		debugfs_create_file("pm_test", 0200, nv->dbg, nv, &pm_test_fops);
 		debugfs_create_file("preempt", 0400, nv->dbg, nv, &preempt_fops);
 		debugfs_create_file("chan_status", 0400, nv->dbg, nv, &chan_status_fops);
 		debugfs_create_file("chan_kick", 0200, nv->dbg, nv, &chan_kick_fops);
@@ -1061,29 +1080,60 @@ static const struct pci_device_id nvdrv_ids[] = {
 };
 
 /*
- * System sleep is not supported yet: it needs GSP-RM save/restore (UNLOADING_GUEST_DRIVER
- * with a PM transition, then a resume boot), moving VRAM objects to system memory and back,
- * and restoring display and channels. Without that the GPU would come back powered off
- * under a driver that believes it is running, so refuse instead of breaking. Once GSP-RM
- * has never run (read-only probing), sleep is harmless.
+ * System sleep (S3): GSP-RM keeps its state across suspend (src/pm.c), the display goes
+ * off and comes back through the DRM helpers. Hibernation is not supported yet (the SR
+ * data would have to survive in the image): refused while GSP-RM runs.
  */
 static int nvdrv_pm_suspend(struct device *dev)
+{
+	struct nvdrv_dev *nv = dev_get_drvdata(dev);
+	int ret;
+
+	if (!nv->gsp_running)
+		return nv->gsp_touched ? -EBUSY : 0;
+	ret = nv_drm_suspend(nv);
+	if (ret)
+		return ret;
+	ret = nv_pm_suspend(nv);
+	if (ret)
+		nv_drm_resume(nv);
+	return ret;
+}
+
+static int nvdrv_pm_resume(struct device *dev)
+{
+	struct nvdrv_dev *nv = dev_get_drvdata(dev);
+	int ret;
+
+	if (!nv->pm.suspended)
+		return 0;
+	ret = nv_pm_resume(nv);
+	nv_drm_resume(nv);
+	return ret;
+}
+
+static int nvdrv_pm_freeze(struct device *dev)
 {
 	struct nvdrv_dev *nv = dev_get_drvdata(dev);
 
 	if (!nv->gsp_touched)
 		return 0;
-	dev_warn(dev, "system suspend is not supported while GSP-RM runs (unbind nvdrv first)\n");
+	dev_warn(dev, "hibernation is not supported while GSP-RM runs\n");
 	return -EBUSY;
 }
 
-static int nvdrv_pm_resume(struct device *dev)
+static int nvdrv_pm_nop(struct device *dev)
 {
 	return 0;
 }
 
 static const struct dev_pm_ops nvdrv_pm_ops = {
-	SYSTEM_SLEEP_PM_OPS(nvdrv_pm_suspend, nvdrv_pm_resume)
+	.suspend = nvdrv_pm_suspend,
+	.resume = nvdrv_pm_resume,
+	.freeze = nvdrv_pm_freeze,
+	.thaw = nvdrv_pm_nop,
+	.poweroff = nvdrv_pm_freeze,
+	.restore = nvdrv_pm_nop,
 };
 
 static struct pci_driver nvdrv_driver = {

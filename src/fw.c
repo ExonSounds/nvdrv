@@ -254,12 +254,12 @@ static int elf_section(const struct firmware *fw, const char *name, const u8 **d
 	return -ENOENT;
 }
 
-static void radix3_free(struct nvdrv_dev *nv, struct nv_radix3 *r)
+void nv_radix3_free(struct nvdrv_dev *nv, struct nv_radix3 *r)
 {
 	u32 i;
 
 	if (r->mapped)
-		dma_unmap_sgtable(&nv->pdev->dev, &r->sgt, DMA_TO_DEVICE, 0);
+		dma_unmap_sgtable(&nv->pdev->dev, &r->sgt, DMA_BIDIRECTIONAL, 0);
 	if (r->sgt.sgl)
 		sg_free_table(&r->sgt);
 	if (r->vaddr)
@@ -280,7 +280,8 @@ static void radix3_free(struct nvdrv_dev *nv, struct nv_radix3 *r)
  * Pages are allocated individually, so no large physically contiguous block
  * is needed with or without an IOMMU.
  */
-static int radix3_build(struct nvdrv_dev *nv, struct nv_radix3 *r, const u8 *data, u64 size)
+/* @data NULL: a zeroed buffer that GSP fills (suspend/resume data). */
+int nv_radix3_build(struct nvdrv_dev *nv, struct nv_radix3 *r, const u8 *data, u64 size)
 {
 	struct device *dev = &nv->pdev->dev;
 	struct sg_dma_page_iter it;
@@ -322,7 +323,7 @@ static int radix3_build(struct nvdrv_dev *nv, struct nv_radix3 *r, const u8 *dat
 					(size_t)r->npages << PAGE_SHIFT, GFP_KERNEL);
 	if (ret)
 		goto err;
-	ret = dma_map_sgtable(dev, &r->sgt, DMA_TO_DEVICE, 0);
+	ret = dma_map_sgtable(dev, &r->sgt, DMA_BIDIRECTIONAL, 0);
 	if (ret)
 		goto err;
 	r->mapped = true;
@@ -339,7 +340,8 @@ static int radix3_build(struct nvdrv_dev *nv, struct nv_radix3 *r, const u8 *dat
 	}
 
 	/* Data first, then every level's entries point at the next level's pages. */
-	memcpy(r->vaddr + ((size_t)r->lvl_first[3] << PAGE_SHIFT), data, size);
+	if (data)
+		memcpy(r->vaddr + ((size_t)r->lvl_first[3] << PAGE_SHIFT), data, size);
 	pt = r->vaddr;
 	for (i = 0; i < 3; i++) {
 		u64 *ents = pt + ((size_t)r->lvl_first[i] << RADIX3_ENTRIES_SHIFT);
@@ -348,11 +350,11 @@ static int radix3_build(struct nvdrv_dev *nv, struct nv_radix3 *r, const u8 *dat
 		for (j = 0; j < r->lvl_pages[i + 1]; j++)
 			ents[j] = cpu_to_le64(r->dma[r->lvl_first[i + 1] + j]);
 	}
-	dma_sync_sgtable_for_device(dev, &r->sgt, DMA_TO_DEVICE);
+	dma_sync_sgtable_for_device(dev, &r->sgt, DMA_BIDIRECTIONAL);
 	r->root = r->dma[0];
 	return 0;
 err:
-	radix3_free(nv, r);
+	nv_radix3_free(nv, r);
 	return ret;
 }
 
@@ -415,7 +417,7 @@ static int fw_load_gsp(struct nvdrv_dev *nv)
 	}
 	memcpy(g->sig, sig, sig_size);
 
-	ret = radix3_build(nv, &g->radix3, img, img_size);
+	ret = nv_radix3_build(nv, &g->radix3, img, img_size);
 	if (!ret)
 		ret = radix3_verify(nv, &g->radix3, img);
 	if (ret) {
@@ -454,7 +456,7 @@ void nv_fw_fini(struct nvdrv_dev *nv)
 	struct nv_gsp_fw *g = &nv->gsp_fw;
 	struct device *dev = &nv->pdev->dev;
 
-	radix3_free(nv, &g->radix3);
+	nv_radix3_free(nv, &g->radix3);
 	if (g->sig)
 		dma_free_coherent(dev, g->sig_size, g->sig, g->sig_dma);
 	if (g->bl)

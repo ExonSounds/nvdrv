@@ -662,9 +662,33 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
 - [x] **P-state governor**: GSP-RM's governor works by itself (P8 -> P0 within 2.5 s at ~90 % graphics
       utilisation, back to P8 at idle; a desktop's light load correctly stays at P8). The EXEC boost is now off
       (module parameter `exec_boost=1` re-enables it).
-- [ ] ▶ **System suspend/resume**: GSP-RM save/restore (UNLOADING_GUEST_DRIVER with a PM transition, resume boot),
-      VRAM objects to system memory and back (needs eviction), display and channel restore. Until then nvdrv
-      *refuses* system suspend while GSP-RM runs (-EBUSY, logged) instead of resuming into a dead GPU.
+- [ ] ▶ **System suspend/resume** (S3; `src/pm.c`, 2026-11-10). Works through suspend → FLR → resume (debugfs
+      `pm_test`: 1 = plain cycle, 2 = FLR in between, 3 = FLR without DRM, then bring-up); a real S3 cycle is
+      the remaining check. Hibernation (freeze/poweroff) is still refused with -EBUSY.
+      - Sequence (r570 kernel RM + nouveau r535/r570, no closed code): DRM suspend (heads off) → no new
+        submissions, GPU idle → display channels freed, each after `NV5070_CTRL_CMD_SET_RMFREE_FLAGS`
+        PRESERVE_HW (nvkms' suspend path) → `FIFO_TOGGLE_ACTIVE_CHANNEL_SCHEDULING` off (preempts every
+        channel: GR contexts and RAMFCs are written back) → new kernel copy channel (channels made after the
+        toggle still run) copies the nvdrv carve-out minus unused pool to sysmem → that copy channel freed →
+        FBSR sysmem buffer to RM (`ALLOC_MEMORY` RPC with a page list, continuation records, then
+        `FBSR_INIT`) → GSP's BAR1 root entry 0 back → `UNLOADING_GUEST_DRIVER` {PM 1, level 3} → Booter-Unload
+        with the `GspFwSRMeta` (SR data radix3, 190 MiB) mailboxes. ~0.55 s.
+      - Resume: GFW boot wait → Booter-Load with the SR meta, rmargs `srInitArguments` {old level 3, flags
+        PRESERVING | PM_TRANSITION, bInPMTransition 1}, no FRTS → carve-out restored (PRAMIN outside the pool,
+        then BAR1 root entry 0 again, pool through BAR1) → scheduling on → new kernel copy channel →
+        display object and core channel → DRM resume (full DP bring-up). ~1.7 s, display back on attempt 1.
+      - What it took: (1) every RM display-channel free used to run into RM's 4 s timeout (an ASSERT NOCAT
+        each); with PRESERVE_HW it is 15 ms, and the GSP PM unload no longer hangs behind it. (2) the VRAM
+        snapshot must be taken after the preemption: a resident GR context is only written back when
+        preempted (stale: RC 13 GR exception after resume), and the copy channel's own RAMFC is in the
+        snapshot from before its copies (restored, it replays them into the freed buffers: IOMMU
+        IO_PAGE_FAULTs). (3) the carve-out restore must come after GSP-RM's boot (before it: RC 45 on a GR
+        channel). (4) `DP_SET_MANUAL_DISPLAYPORT` again after resume; display-common object and hotplug
+        events are kept (re-allocated after a PM resume, the events cannot be armed: no event list).
+      - Verified: vkmark (NVK) keeps running across suspend → FLR → resume (32.5k, no device loss, no RC, no
+        IOMMU faults); DPMS and DP IRQ events after resume; 2560x1440 @ 180 Hz back.
+      - A failed suspend before the unload recovers (display back), but RM refuses to re-enable scheduling
+        outside a PM resume (INVALID_STATE): client channels stay stopped until a reload.
 - [ ] Runtime power-down when idle (GC6 / D3cold): not available on a desktop board with an active display.
 - [x] **Clean unload** instead of FLR (2026-11-09, `gsp_unload_locked` in `src/gsp.c`, as kgspUnloadRm_IMPL +
       kgspTeardown_TU102): after our RM client is freed, `UNLOADING_GUEST_DRIVER` (RPC 47, {bInPMTransition 0,

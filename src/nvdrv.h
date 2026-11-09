@@ -332,6 +332,7 @@ struct nv_evo {
 	u64 vram_bottom, vram_top, vram_next;	/* nvdrv's VRAM carve-out (top-down) */
 	u64 pramin_base;			/* current BAR0 window (VRAM, 64K units) */
 	u64 instmem;				/* display instance memory (VRAM) */
+	bool instmem_ready;			/* announced to RM and cleared */
 	u32 inst_next;				/* next free instance, 16-byte units */
 	u32 h_disp;				/* NVC670_DISPLAY */
 	struct nv_evo_chan core;
@@ -470,6 +471,25 @@ struct nv_uapi {
 	u32 gpcs, tpcs;
 };
 
+/* System suspend/resume state (src/pm.c). */
+struct nv_pm_region {
+	u64 vram, size;
+	struct page **pages;
+	u32 npages;
+	struct sg_table sgt;
+	bool mapped;
+};
+
+struct nv_pm {
+	bool suspended;
+	struct nv_radix3 sr_data;		/* WPR2 contents, written by Booter-Unload */
+	struct nv_dma_buf sr_meta;		/* GspFwSRMeta */
+	struct nv_pm_region fbsr;		/* RM's VRAM allocations (FBSR) */
+	struct nv_pm_region *regs;		/* nvdrv's own VRAM */
+	u32 nregs;
+	ktime_t t_suspend;
+};
+
 struct nvdrv_dev {
 	struct kref ref;	/* PCI binding + DRM device: outlives unbind while DRM files are open */
 	bool unplugged;		/* DRM unplugged: no more hardware access from file/object teardown */
@@ -506,6 +526,7 @@ struct nvdrv_dev {
 	struct nv_mem mem;
 	struct nv_uapi uapi;
 	struct nv_intr intr;
+	struct nv_pm pm;
 	bool gsp_touched;	/* Booter/FWSEC ran: GSP may DMA into our memory */
 	bool gsp_running;	/* GSP_INIT_DONE received */
 	unsigned int gsp_nocat;	/* GSP_POST_NOCAT_RECORD events (diagnostic journal) */
@@ -560,6 +581,9 @@ u32 nv_fuse_ucode_version(struct nvdrv_dev *nv, u8 ucode_id);
 
 /* gsp.c */
 int nv_gsp_boot(struct nvdrv_dev *nv);
+int nv_gsp_suspend_locked(struct nvdrv_dev *nv, dma_addr_t sr_meta);
+int nv_gsp_resume_locked(struct nvdrv_dev *nv, dma_addr_t sr_meta);
+void nv_libos_set_sr(struct nvdrv_dev *nv, bool resume);
 void nv_gsp_fini(struct nvdrv_dev *nv);
 int nv_gsp_handle_event(struct nvdrv_dev *nv, u32 fn, struct nv_rpc_header *h, void *payload, u32 len);
 void nv_gsp_dump_state(struct nvdrv_dev *nv, const char *why);
@@ -765,6 +789,18 @@ int nv_bar1_test(struct nvdrv_dev *nv);
 int nv_bar1_bench(struct nvdrv_dev *nv);
 int nv_evo_init(struct nvdrv_dev *nv);
 int nv_evo_window_init(struct nvdrv_dev *nv, u32 win);
+void nv_evo_suspend(struct nvdrv_dev *nv);
+void nv_vram_write(struct nvdrv_dev *nv, u64 off, const void *src, u64 len);
+int nv_uapi_pm(struct nvdrv_dev *nv, bool suspend);
+
+/* System suspend/resume (src/pm.c). */
+void nv_bar1_resume(struct nvdrv_dev *nv);
+void nv_bar1_detach(struct nvdrv_dev *nv);
+int nv_pm_suspend(struct nvdrv_dev *nv);
+int nv_pm_resume(struct nvdrv_dev *nv);
+int nv_pm_test(struct nvdrv_dev *nv, u32 mode);
+int nv_drm_suspend(struct nvdrv_dev *nv);
+void nv_drm_resume(struct nvdrv_dev *nv);
 void nv_evo_fini(struct nvdrv_dev *nv);
 void nv_evo_show(struct nvdrv_dev *nv, struct seq_file *m);
 
@@ -778,6 +814,8 @@ int nv_rpc_queue_preboot(struct nvdrv_dev *nv);
 int nv_rpc_wait(struct nvdrv_dev *nv, u32 fn, unsigned int timeout_ms,
 		struct nv_rpc_header **hdr, void **payload, u32 *len);
 int nv_rpc_drain_events(struct nvdrv_dev *nv);
+int nv_rpc_call_timeout(struct nvdrv_dev *nv, u32 fn, const void *req, u32 req_len, unsigned int timeout_ms);
+int nv_rpc_call_large(struct nvdrv_dev *nv, u32 fn, const void *req, u32 req_len);
 int nv_rpc_call(struct nvdrv_dev *nv, u32 fn, const void *req, u32 req_len,
 		void *reply, u32 reply_len);
 
@@ -787,6 +825,8 @@ void nv_libos_reset(struct nvdrv_dev *nv);
 void nv_libos_fini(struct nvdrv_dev *nv);
 
 /* wpr.c */
+int nv_radix3_build(struct nvdrv_dev *nv, struct nv_radix3 *r, const u8 *data, u64 size);
+void nv_radix3_free(struct nvdrv_dev *nv, struct nv_radix3 *r);
 int nv_wpr_meta_build(struct nvdrv_dev *nv);
 void nv_wpr_meta_fini(struct nvdrv_dev *nv);
 

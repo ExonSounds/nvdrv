@@ -151,6 +151,20 @@ static void msgq_format(struct nv_libos *l)
 }
 
 /* Fresh queues and empty logs for a new boot attempt (PTEs and args unchanged). */
+/* GSP_SR_INIT_ARGUMENTS in GSP_ARGUMENTS_CACHED: a resume boot after suspend (level 3) or normal. */
+void nv_libos_set_sr(struct nvdrv_dev *nv, bool resume)
+{
+	struct gsp_args_cached *ga = nv->libos.rmargs.cpu;
+
+	if (!ga)
+		return;
+	ga->sr_old_level = cpu_to_le32(resume ? 3 : 0);	/* NV2080_CTRL_GPU_SET_POWER_STATE_GPU_LEVEL_3 */
+	/* GPU_STATE_FLAGS_PRESERVING | GPU_STATE_FLAGS_PM_TRANSITION on resume (nouveau r570) */
+	ga->sr_flags = cpu_to_le32(resume ? BIT(0) | BIT(2) : 0);
+	ga->sr_in_pm_transition = resume;
+	wmb();
+}
+
 void nv_libos_reset(struct nvdrv_dev *nv)
 {
 	struct nv_libos *l = &nv->libos;

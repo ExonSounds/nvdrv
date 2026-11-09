@@ -2451,6 +2451,26 @@ void nv_uapi_init(struct nvdrv_dev *nv)
  * apps see VK_ERROR_DEVICE_LOST right away instead of hanging. Recovery: reload nvdrv.
  * Takes only the fence lock: callable from RPC waits (gsp_lock held).
  */
+/*
+ * System suspend: no submission or VM_BIND may start (user tasks are frozen by now, this
+ * also keeps kernel-side binds out) and the GPU finishes what it has. Resume releases it.
+ */
+int nv_uapi_pm(struct nvdrv_dev *nv, bool suspend)
+{
+	struct nv_uapi *ua = &nv->uapi;
+	int ret;
+
+	if (!suspend) {
+		up_write(&ua->evict_sem);
+		return 0;
+	}
+	down_write(&ua->evict_sem);
+	ret = wait_gpu_idle(nv);
+	if (ret)
+		up_write(&ua->evict_sem);
+	return ret;
+}
+
 void nv_uapi_device_lost(struct nvdrv_dev *nv, const char *why)
 {
 	struct nv_uapi *ua = &nv->uapi;

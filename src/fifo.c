@@ -1366,8 +1366,8 @@ int nv_fifo_init(struct nvdrv_dev *nv)
 	int ret;
 
 	lockdep_assert_held(&nv->gsp_lock);
-	if (nv->fifo.gr_ready)
-		return 0;
+	if (nv->fifo.gr_ready && nv->chan.handle && nv->grch.handle)
+		return 0;	/* (suspend destroys both and calls this again) */
 	if (!nv->rm.h_device)
 		return -ENODEV;
 	ret = nv_bar1_init(nv);

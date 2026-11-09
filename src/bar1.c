@@ -137,6 +137,44 @@ void nv_bar1_map_pool(struct nvdrv_dev *nv)
 		 nv->mem.size >> 20, ret, ktime_ms_delta(ktime_get(), t0));
 }
 
+/*
+ * Before the suspend unload: GSP-RM's own entry 0 back into its BAR1 root, so the state it
+ * preserves is its own. nv_bar1_resume attaches nvdrv's tables again. Caller holds gsp_lock.
+ */
+void nv_bar1_detach(struct nvdrv_dev *nv)
+{
+	struct nv_bar1 *b = &nv->bar1;
+	u64 root = nv->gsp_info.bar1_pde_base;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	if (!b->tables || !root)
+		return;
+	wr64(nv, root, b->old_root0);
+	dev_info(&nv->pdev->dev, "bar1: GSP-RM root entry 0x%llx restored, invalidate %d\n", b->old_root0,
+		 bar1_invalidate(nv));
+}
+
+/*
+ * After resume: GSP-RM brought its BAR1 root back from the FBSR copy, which should still
+ * point at nvdrv's PD2; put the entry back if not, and flush the BAR1 TLB either way.
+ * Caller holds gsp_lock; nvdrv's tables are restored already.
+ */
+void nv_bar1_resume(struct nvdrv_dev *nv)
+{
+	struct nv_bar1 *b = &nv->bar1;
+	u64 root = nv->gsp_info.bar1_pde_base, want, cur;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	if (!b->tables || !root)
+		return;
+	want = (b->tables >> 4) | PDE_VRAM;
+	cur = (u64)nv_vram_rd32(nv, root + 4) << 32 | nv_vram_rd32(nv, root);
+	if (cur != want)
+		wr64(nv, root, want);
+	dev_info(&nv->pdev->dev, "bar1: resume: root entry 0 0x%llx%s, invalidate %d\n", cur,
+		 cur != want ? " (rewritten)" : "", bar1_invalidate(nv));
+}
+
 /* Map and return a write-combined CPU mapping of it. */
 void __iomem *nv_bar1_map(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size)
 {

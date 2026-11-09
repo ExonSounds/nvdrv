@@ -735,10 +735,13 @@ int nv_disp_cursor_init(struct nvdrv_dev *nv)
 		return 0;
 	if (!e->active || !e->core.handle)
 		return -ENODEV;
-	ret = nv_vram_alloc(nv, 2 * NV_CURS_SLOT, SZ_64K, &e->curs_vram);
-	if (ret)
-		return ret;
-	e->curs_cpu = nv_bar1_map(nv, NV_BAR1_CURS_VA, e->curs_vram, 2 * NV_CURS_SLOT);
+	if (!e->curs_vram) {	/* kept across suspend */
+		ret = nv_vram_alloc(nv, 2 * NV_CURS_SLOT, SZ_64K, &e->curs_vram);
+		if (ret)
+			return ret;
+	}
+	if (!e->curs_cpu)
+		e->curs_cpu = nv_bar1_map(nv, NV_BAR1_CURS_VA, e->curs_vram, 2 * NV_CURS_SLOT);
 	if (!e->curs_cpu)
 		return -EIO;
 	ret = nv_evo_ctxdma(nv, NVDRV_H_CURS_CTXDMA, e->curs_vram, 2 * NV_CURS_SLOT, e->core.chn, 0);

@@ -331,8 +331,67 @@ int nv_rpc_drain_events(struct nvdrv_dev *nv)
 	return ret == -EAGAIN ? n : ret;
 }
 
+/*
+ * RPCs larger than one queue message (16 elements): _issueRpcAndWaitLarge / nouveau
+ * r535_gsp_rpc_push. The first message carries the function and as much payload as fits,
+ * the rest follows in CONTINUATION_RECORD messages; then the reply is awaited once (a long
+ * reply comes back the same way; its continuation records are drained as events).
+ */
+#define NV_RPC_CONTINUATION_RECORD	71
+
+int nv_rpc_call_large(struct nvdrv_dev *nv, u32 fn, const void *req, u32 req_len)
+{
+	const u32 max = MSGQ_ELEM_SIZE * MSGQ_ELEM_MAX - ELEM_HDR_SIZE - sizeof(struct nv_rpc_header);
+	struct nv_rpc_header *h;
+	unsigned long until;
+	u32 off = 0, len;
+	void *p;
+	int ret;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	if (req_len <= max)
+		return nv_rpc_call(nv, fn, req, req_len, NULL, 0);
+	if (!nv->gsp_running)
+		return -ENODEV;
+	while (off < req_len) {
+		u32 n = min(req_len - off, max);
+
+		until = jiffies + msecs_to_jiffies(2000);
+		while ((ret = nv_rpc_send(nv, off ? NV_RPC_CONTINUATION_RECORD : fn, req + off, n)) == -EBUSY) {
+			nv_wr32(nv, NV_PGSP_QUEUE_HEAD(NV_PGSP_RPC_QUEUE_IDX), 0);	/* let GSP drain */
+			if (time_after(jiffies, until))
+				break;
+			usleep_range(100, 200);
+		}
+		if (ret)
+			return ret;
+		off += n;
+	}
+	nv_wr32(nv, NV_PGSP_QUEUE_HEAD(NV_PGSP_RPC_QUEUE_IDX), 0);
+	ret = nv_rpc_wait(nv, fn, RPC_CALL_TIMEOUT_MS, &h, &p, &len);
+	if (ret)
+		return ret;
+	nv->rpc.last_result = le32_to_cpu(h->rpc_result);
+	return nv->rpc.last_result ? -EREMOTEIO : 0;
+}
+
+static int rpc_call(struct nvdrv_dev *nv, u32 fn, const void *req, u32 req_len,
+		    void *reply, u32 reply_len, unsigned int timeout_ms);
+
+/* For RPCs that do a lot of work on GSP (the suspend unload saves its VRAM first). */
+int nv_rpc_call_timeout(struct nvdrv_dev *nv, u32 fn, const void *req, u32 req_len, unsigned int timeout_ms)
+{
+	return rpc_call(nv, fn, req, req_len, NULL, 0, timeout_ms);
+}
+
 int nv_rpc_call(struct nvdrv_dev *nv, u32 fn, const void *req, u32 req_len,
 		void *reply, u32 reply_len)
+{
+	return rpc_call(nv, fn, req, req_len, reply, reply_len, RPC_CALL_TIMEOUT_MS);
+}
+
+static int rpc_call(struct nvdrv_dev *nv, u32 fn, const void *req, u32 req_len,
+		    void *reply, u32 reply_len, unsigned int timeout_ms)
 {
 	struct device *dev = &nv->pdev->dev;
 	struct nv_rpc_header *h;
@@ -352,13 +411,14 @@ int nv_rpc_call(struct nvdrv_dev *nv, u32 fn, const void *req, u32 req_len,
 	/* Register write: doorbell. GSP-RM ignores the value (RM writes 0). */
 	nv_wr32(nv, NV_PGSP_QUEUE_HEAD(NV_PGSP_RPC_QUEUE_IDX), 0);
 
-	ret = nv_rpc_wait(nv, fn, RPC_CALL_TIMEOUT_MS, &h, &p, &len);
+	ret = nv_rpc_wait(nv, fn, timeout_ms, &h, &p, &len);
 	if (ret)
 		return ret;
 	result = le32_to_cpu(h->rpc_result);
 	nv->rpc.last_result = result;
 	nv->rpc.last_result_private = le32_to_cpu(h->rpc_result_private);
-	memcpy(reply, p, min(len, reply_len));
+	if (reply)
+		memcpy(reply, p, min(len, reply_len));
 	if (result) {
 		dev_dbg(dev, "rpc: function %u: result 0x%x private 0x%x\n", fn, result,
 			nv->rpc.last_result_private);

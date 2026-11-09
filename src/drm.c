@@ -638,6 +638,22 @@ static const struct drm_encoder_funcs nv_encoder_funcs = {
 	.destroy = drm_encoder_cleanup,
 };
 
+/* System sleep: the DRM helpers turn the display off (state saved) and back on. */
+int nv_drm_suspend(struct nvdrv_dev *nv)
+{
+	struct nv_drm *d = READ_ONCE(nv->drm);
+
+	return d ? drm_mode_config_helper_suspend(&d->dev) : 0;
+}
+
+void nv_drm_resume(struct nvdrv_dev *nv)
+{
+	struct nv_drm *d = READ_ONCE(nv->drm);
+
+	if (d)
+		drm_mode_config_helper_resume(&d->dev);
+}
+
 /* Hotplug from GSP-RM (disp.c): userspace and the fbdev client re-probe. */
 void nv_drm_hotplug(struct nvdrv_dev *nv)
 {

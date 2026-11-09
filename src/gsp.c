@@ -400,7 +400,12 @@ static_assert(sizeof(struct nv_rpc_unloading_guest_driver) == 8);
  * Normal unload. Returns 0 only if GSP-RM stopped, FWSEC-SB ran and Booter-Unload
  * took WPR2 down; then nothing on the GPU references our memory any more.
  */
-static int gsp_unload_locked(struct nvdrv_dev *nv)
+/*
+ * @sr_meta: 0 = normal unload; else suspend (kgspUnloadRm SR_SUSPEND): the RPC says PM
+ * transition to level 3 and Booter-Unload gets the GspFwSRMeta address, so it saves WPR2
+ * to the SR data in sysmem.
+ */
+static int gsp_unload_locked(struct nvdrv_dev *nv, dma_addr_t sr_meta)
 {
 	struct device *dev = &nv->pdev->dev;
 	struct nv_rpc_unloading_guest_driver req = {};
@@ -408,12 +413,18 @@ static int gsp_unload_locked(struct nvdrv_dev *nv)
 	ktime_t t0 = ktime_get();
 	int ret;
 
+	if (sr_meta) {
+		req.in_pm_transition = 1;
+		req.new_level = cpu_to_le32(3);	/* NV2080_CTRL_GPU_SET_POWER_STATE_GPU_LEVEL_3 */
+		m0 = lower_32_bits(sr_meta);
+		m1 = upper_32_bits(sr_meta);
+	}
 	if (!nv->gsp_running || nv->intr.gsp_dead || !nv_gsp_riscv_active(nv))
 		return -ENODEV;
 	if (!nv->fwsec_sb || !nv->gsp_fw.booter_unload.image)
 		return -ENODATA;
 
-	ret = nv_rpc_call(nv, NV_RPC_UNLOADING_GUEST_DRIVER, &req, sizeof(req), &req, 0);
+	ret = nv_rpc_call_timeout(nv, NV_RPC_UNLOADING_GUEST_DRIVER, &req, sizeof(req), sr_meta ? 30000 : 6000);
 	nv->gsp_running = false;	/* no RPC from here on, whatever happens */
 	if (ret) {
 		dev_err(dev, "gsp: UNLOADING_GUEST_DRIVER failed: %d\n", ret);
@@ -450,6 +461,57 @@ static int gsp_unload_locked(struct nvdrv_dev *nv)
 	return 0;
 }
 
+/* Suspend: GSP-RM saves itself (SR data via @sr_meta). Caller holds gsp_lock. */
+int nv_gsp_suspend_locked(struct nvdrv_dev *nv, dma_addr_t sr_meta)
+{
+	int ret = gsp_unload_locked(nv, sr_meta);
+
+	nv->gsp_running = false;
+	return ret;
+}
+
+/*
+ * Resume boot (kgspBootstrap_TU102 with KGSP_BOOT_MODE_SR_RESUME): no FWSEC-FRTS, no RISC-V
+ * reset, no LibOS mailboxes, no status queue linking - Booter and GSP-RM restore all of
+ * that from the SR data. The sysmem flush buffer comes first (GSP-RM needs it while it
+ * resets falcons), then Booter-Load with the GspFwSRMeta address, FALCON_OS, INIT_DONE.
+ * The queues keep the state they had at suspend. Caller holds gsp_lock.
+ */
+int nv_gsp_resume_locked(struct nvdrv_dev *nv, dma_addr_t sr_meta)
+{
+	struct device *dev = &nv->pdev->dev;
+	u32 m0 = lower_32_bits(sr_meta), m1 = upper_32_bits(sr_meta);
+	int ret;
+
+	pci_set_master(nv->pdev);
+	nv_wr32(nv, NV_PFB_NISO_FLUSH_SYSMEM_ADDR_HI,
+		upper_32_bits(nv->libos.flush.dma >> NV_PFB_NISO_FLUSH_SYSMEM_ADDR_SHIFT) & 0x7f);
+	nv_wr32(nv, NV_PFB_NISO_FLUSH_SYSMEM_ADDR,
+		lower_32_bits(nv->libos.flush.dma >> NV_PFB_NISO_FLUSH_SYSMEM_ADDR_SHIFT));
+	nv_libos_set_sr(nv, true);
+	ret = nv_falcon_hs_exec(nv, NV_FALCON_SEC2, &nv->gsp_fw.booter_load, &m0, &m1);
+	if (!ret && m0) {
+		nv_gsp_dump_state(nv, "Booter-Load (resume) failed");
+		ret = -EIO;
+	}
+	if (ret)
+		goto out;
+	nv_gsp_write_os(nv, nv->gsp_fw.bl_desc.appVersion);
+	if (!nv_gsp_riscv_active(nv)) {
+		nv_gsp_dump_state(nv, "GSP RISC-V not active after resume Booter");
+		ret = -EIO;
+		goto out;
+	}
+	ret = gsp_wait_init_done(nv);
+	if (!ret)
+		nv->gsp_running = true;
+	dev_info(dev, "gsp: resume boot %s, WPR2 0x%llx-0x%llx\n", ret ? "FAILED" : "done",
+		 nv_wpr2_lo(nv), nv_wpr2_hi(nv));
+out:
+	nv_libos_set_sr(nv, false);
+	return ret;
+}
+
 /*
  * Called from .remove (device lock held): once Booter has run, GSP may keep
  * DMAing into our queues and logs. Shut GSP-RM down properly (the GPU then
@@ -466,7 +528,7 @@ void nv_gsp_fini(struct nvdrv_dev *nv)
 	mutex_lock(&nv->gsp_lock);
 	nv_rm_fini_objects(nv);		/* frees our client: channels and display objects go with it */
 	if (clean_unload && nv_hw_writes_allowed())
-		ret = gsp_unload_locked(nv);
+		ret = gsp_unload_locked(nv, 0);
 	nv->gsp_running = false;
 	mutex_unlock(&nv->gsp_lock);
 	if (ret) {

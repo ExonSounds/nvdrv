@@ -144,6 +144,21 @@ u32 nv_vram_rd32(struct nvdrv_dev *nv, u64 off)
 	return ioread32(pramin(nv, off, &avail));
 }
 
+/* Copy @len bytes (4-byte multiple) from @src into VRAM at @off through the PRAMIN window. */
+void nv_vram_write(struct nvdrv_dev *nv, u64 off, const void *src, u64 len)
+{
+	while (len) {
+		u32 avail, n;
+		void __iomem *p = pramin(nv, off, &avail);
+
+		n = min_t(u64, len, avail);
+		memcpy_toio(p, src, n);
+		off += n;
+		src += n;
+		len -= n;
+	}
+}
+
 /* Fill [off, off + len) with 32-bit words from fn(index) (or a constant if fn is NULL). */
 void nv_vram_fill(struct nvdrv_dev *nv, u64 off, u64 len, u32 val,
 		  u32 (*fn)(void *ctx, u64 i), void *ctx)
@@ -172,9 +187,11 @@ static int evo_instmem_init(struct nvdrv_dev *nv)
 	struct nv2080_write_inst_mem p = {};
 	int ret;
 
-	ret = nv_vram_alloc(nv, NV_UDISP_INSTMEM_SIZE, DISP_INST_MEM_ALIGN, &e->instmem);
-	if (ret)
-		return ret;
+	if (!e->instmem) {	/* kept across suspend: only re-announced and cleared */
+		ret = nv_vram_alloc(nv, NV_UDISP_INSTMEM_SIZE, DISP_INST_MEM_ALIGN, &e->instmem);
+		if (ret)
+			return ret;
+	}
 	nv_vram_fill(nv, e->instmem, NV_UDISP_INSTMEM_SIZE, 0, NULL, NULL);
 	/* instance 0x200 (16-byte units) is the reserved NULL instance; ctxdmas follow */
 	e->inst_next = (NV_UDISP_HASH_SIZE >> 4) + 2;
@@ -401,10 +418,11 @@ int nv_evo_init(struct nvdrv_dev *nv)
 		return -ENODEV;
 	if (e->core.handle)
 		return 0;
-	if (!e->instmem) {
+	if (!e->instmem_ready) {
 		ret = evo_instmem_init(nv);
 		if (ret)
 			return ret;
+		e->instmem_ready = true;
 	}
 	if (!e->h_disp) {
 		ret = nv_rm_alloc(nv, nv->rm.h_client, nv->rm.h_device, NVDRV_H_DISP, NVC670_DISPLAY,
@@ -436,6 +454,77 @@ int nv_evo_window_init(struct nvdrv_dev *nv, u32 win)
 			evo_channel_free_mem(nv, &e->win[win]);
 	}
 	return ret;
+}
+
+/*
+ * Suspend (nvkms frees its display channels too): the display object goes, and its
+ * channels with it; VRAM allocations and BAR1 mappings stay. After resume nv_evo_init
+ * announces and clears the instance memory again and everything is set up anew.
+ * Caller holds gsp_lock; the head is already off.
+ */
+#define NV5070_CTRL_CMD_SET_RMFREE_FLAGS	0x50700117
+
+void nv_evo_suspend(struct nvdrv_dev *nv)
+{
+	struct nv_evo *e = &nv->evo;
+	u32 i;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	mutex_lock(&e->win_lock);
+	if (e->h_disp && nv->gsp_running) {
+		/* nvkms nvFreeCoreChannelEvo order: cursors, windows, core, then the display */
+		ktime_t t0 = ktime_get();
+
+		u32 h[6], k = 0;
+
+		if (e->curs_ready)
+			h[k++] = 0xd000c67a;	/* NVDRV_H_CURS (modeset.c) */
+		for (i = 0; i < ARRAY_SIZE(e->win); i++)
+			if (e->win[i].handle)
+				h[k++] = e->win[i].handle;
+		if (e->core.handle)
+			h[k++] = e->core.handle;
+		h[k++] = e->h_disp;
+		for (i = 0; i < k; i++) {
+			ktime_t t = ktime_get();
+			int r;
+
+			/*
+			 * nvkms RmFreeEvoChannel with skipConsoleRestore (its suspend path): RM frees
+			 * the core and window channels without shutting the hardware down, which
+			 * otherwise runs into RM's 4 s timeout per channel. One-shot flag, per free.
+			 */
+			if (h[i] != e->h_disp && h[i] != 0xd000c67a) {
+				struct { __le32 subdevice, flags; } rf = { 0, cpu_to_le32(1) };	/* PRESERVE_HW */
+
+				r = nv_rm_control(nv, nv->rm.h_client, e->h_disp, NV5070_CTRL_CMD_SET_RMFREE_FLAGS,
+						  &rf, sizeof(rf));
+				if (r)
+					dev_warn(&nv->pdev->dev, "evo: RMFREE_FLAGS: %d\n", r);
+			}
+			r = nv_rm_free(nv, nv->rm.h_client, h[i]);
+
+			dev_info(&nv->pdev->dev, "evo: free 0x%08x: %d (%lld ms)\n", h[i], r,
+				 ktime_ms_delta(ktime_get(), t));
+		}
+		dev_info(&nv->pdev->dev, "evo: display freed for suspend (%lld ms)\n",
+			 ktime_ms_delta(ktime_get(), t0));
+	}
+	evo_channel_free_mem(nv, &e->core);
+	for (i = 0; i < ARRAY_SIZE(e->win); i++)
+		evo_channel_free_mem(nv, &e->win[i]);
+	e->h_disp = 0;
+	e->instmem_ready = false;
+	e->active = e->win_mapped = e->fb_bound = e->pool_ctxdma = false;
+	e->curs_ready = e->curs_pool_ctxdma = e->lut_ready = e->composed = false;
+	e->vrr_active = e->vrr_msa = false;
+	e->curs_user = NULL;
+	e->curs_ctl = e->curs_ctxdma = 0;
+	e->curs_offset = 0;
+	e->scanout_cur = 0;
+	e->scanout_bh = -1;
+	e->pramin_base = ~0ULL;
+	mutex_unlock(&e->win_lock);
 }
 
 /*
