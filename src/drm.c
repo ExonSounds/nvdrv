@@ -412,9 +412,18 @@ static void nv_drm_audio(struct nv_drm *d, bool on)
 	 * The HD-Audio side only reads the ELD on a clean presence change: switching it on
 	 * from an unknown state (first commit after load) left eld_valid 0. Clear it first.
 	 */
+	u32 max_freq = 0, i, n = size ? drm_eld_sad_count(eld) : 0;
+
+	/* highest sample rate in the SADs -> MAX_FREQ_SUPPORTED code (1 = 32 kHz ... 7 = 192 kHz) */
+	for (i = 0; i < n; i++) {
+		u8 rates = drm_eld_sad(eld)[i * 3 + 1] & 0x7f;
+
+		if (rates)
+			max_freq = max_t(u32, max_freq, fls(rates));
+	}
 	if (size && !d->audio_on)
-		nv_disp_audio(d->nv, NULL, 0);
-	nv_disp_audio(d->nv, size ? eld : NULL, size);
+		nv_disp_audio(d->nv, NULL, 0, 0);
+	nv_disp_audio(d->nv, size ? eld : NULL, size, max_freq);
 	d->audio_on = size;
 }
 

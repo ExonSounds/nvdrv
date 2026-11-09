@@ -503,6 +503,8 @@ static int modeset_win_locked(struct nvdrv_dev *nv, u32 flags)
 	      nv_rm_control(nv, nv->rm.h_client, dp->h_common, NV0073_CTRL_CMD_DP_CONFIG_STREAM, &cs, sizeof(cs));
 	dev_info(dev, "modeset: DP stream: tu %u watermark %u hblank %u vblank %u (increased limits %d): %s\n",
 		 tu, wm, hbs, vbs, increased, ret ? "refused, continuing with RM defaults" : "set");
+	if (ret && ret != -ECANCELED && dp->manual_dp)	/* library mode: nobody else programs it */
+		dev_warn(dev, "modeset: DP stream configuration failed in library mode: %d\n", ret);
 
 	/*
 	 * 3a. window -> head mapping in its own core update, not interlocked with the
@@ -965,7 +967,6 @@ int nv_disp_vrr(struct nvdrv_dev *nv, bool enable, u32 timeout_us)
 	struct nv_disp_dpy *d;
 	struct { __le32 sub_device, display_id; u8 add, pad[3]; } info = {};
 	struct { __le32 sub_device, display_id; } elv = {};
-	u8 v;
 	int ret;
 
 	mutex_lock(&nv->gsp_lock);
@@ -978,11 +979,7 @@ int nv_disp_vrr(struct nvdrv_dev *nv, bool enable, u32 timeout_us)
 	if (enable == e->vrr_active)
 		goto out;
 	if (enable && !e->vrr_msa) {
-		ret = nv_disp_dpcd(nv, d->id, false, 0x107, &v, 1);
-		if (!ret) {
-			v |= 0x80;	/* DOWNSPREAD_CTRL.MSA_TIMING_PAR_IGNORE_EN */
-			ret = nv_disp_dpcd(nv, d->id, true, 0x107, &v, 1);
-		}
+		ret = dp_msa_ignore(nv, d, true);
 		if (ret)
 			goto out;
 		e->vrr_msa = true;
@@ -1012,6 +1009,10 @@ int nv_disp_vrr(struct nvdrv_dev *nv, bool enable, u32 timeout_us)
 	vrr_lwsv(nv, d, enable, false);
 	if (!ret)
 		e->vrr_active = enable;
+	if (!ret && !enable && e->vrr_msa) {	/* back to MSA timing (nvDPLibSetAdaptiveSync FALSE) */
+		dp_msa_ignore(nv, d, false);
+		e->vrr_msa = false;
+	}
 	dev_info(&nv->pdev->dev, "vrr: %s (min refresh interval %u us): %d, core except 0x%08x err 0x%08x\n",
 		 enable ? "on" : "off", timeout_us, ret, nv_rd32(nv, 0x611020), nv_rd32(nv, 0x611028));
 out:

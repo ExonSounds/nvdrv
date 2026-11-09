@@ -25,6 +25,7 @@
 #define NV0073_CTRL_CMD_SPECIFIC_GET_TYPE		0x730240
 #define NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2		0x730245
 #define NV0073_CTRL_CMD_SPECIFIC_OR_GET_INFO		0x73028b
+#define NV0073_CTRL_CMD_DP_SET_MANUAL_DISPLAYPORT	0x731365
 
 /* GSP-RM event notifications (nouveau r535_gsp_device_event_ctor) */
 #define NV01_EVENT_KERNEL_CALLBACK_EX			0x7e
@@ -129,6 +130,18 @@ static int disp_probe_locked(struct nvdrv_dev *nv)
 		dp->h_common = h;
 	}
 
+	if (!dp->manual_dp) {
+		/*
+		 * DPLib's first call (dp_evoadapter.cpp): RM hands the DisplayPort hardware to the
+		 * client. Without it RM programs watermark and audio blanking itself (text jitters
+		 * sideways at 2560x1440@180 while audio plays) and refuses DP_CONFIG_STREAM.
+		 */
+		__le32 sub = 0;
+
+		ret = nv_rm_control(nv, rm->h_client, h, NV0073_CTRL_CMD_DP_SET_MANUAL_DISPLAYPORT, &sub, sizeof(sub));
+		dev_info(dev, "disp: DisplayPort library mode (RM hands off): %d\n", ret);
+		dp->manual_dp = !ret;
+	}
 	if (!dp->events) {	/* hotplug and DP IRQ (short pulse) notifications, repeating */
 		static const u32 ids[] = { NV2080_NOTIFIERS_HOTPLUG, NV2080_NOTIFIERS_DP_IRQ };
 		u32 i;
@@ -304,6 +317,22 @@ static int dp_aux(struct nvdrv_dev *nv, u32 dpy, bool write, u32 addr, u8 *buf, 
 	return le32_to_cpu(a.size) == len ? 0 : -EIO;
 }
 
+/*
+ * DOWNSPREAD_CTRL.MSA_TIMING_PAR_IGNORE_EN (DPCD 0x107 bit 7; DPLib setIgnoreMSAEnable): with it
+ * the sink ignores the MSA timing, as Adaptive-Sync needs. Left on without VRR it makes the
+ * sink lose the line timing whenever audio packets fill the blanking (text jitters sideways).
+ */
+int dp_msa_ignore(struct nvdrv_dev *nv, struct nv_disp_dpy *d, bool on)
+{
+	u8 v;
+	int ret = dp_aux(nv, d->id, false, 0x107, &v, 1);
+
+	if (ret || !!(v & 0x80) == on)
+		return ret;
+	v = on ? v | 0x80 : v & ~0x80;
+	return dp_aux(nv, d->id, true, 0x107, &v, 1);
+}
+
 /* DPCD access for other units (caller holds gsp_lock). */
 int nv_disp_dpcd(struct nvdrv_dev *nv, u32 dpy, bool write, u32 addr, u8 *buf, u32 len)
 {
@@ -357,6 +386,8 @@ static int dp_link_up(struct nvdrv_dev *nv, struct nv_disp_dpy *d)
 	if (dp_aux(nv, d->id, true, 0x600, &d0, 1))	/* SET_POWER: D0 */
 		dev_warn(dev, "disp: could not set sink power state D0\n");
 	msleep(1);
+	dp_msa_ignore(nv, d, false);	/* left set by an earlier VRR session otherwise */
+	nv->evo.vrr_msa = false;
 
 	as.display_id = cpu_to_le32(d->id);
 	ret = nv_rm_control(nv, nv->rm.h_client, dp->h_common, NV0073_CTRL_CMD_DFP_ASSIGN_SOR, &as, sizeof(as));
@@ -707,20 +738,26 @@ int nv_disp_power(struct nvdrv_dev *nv, bool on, const struct nv_mode *m)
 }
 
 /*
- * DP/HDMI audio: hand the sink's ELD to the GPU's HD-Audio function through RM (nouveau
- * r535_sor_hda_eld / _hpd): presence detect + ELD valid with the ELD, or both clear (@eld
- * NULL). snd_hda_intel on the audio PCI function then sees the monitor.
+ * DP audio, nvkms nvHdmiDpEnableDisableAudio for a DPLib connector: on = DFP_SET_AUDIO_ENABLE,
+ * then the sink's ELD with presence detect + ELD valid and the highest sample rate
+ * (NV0073_CTRL_DFP_ELD_AUDIO_CAPS_MAX_FREQ_SUPPORTED_*); off (@eld NULL) = mute the stream,
+ * ELD invalid, audio disabled. snd_hda_intel on the audio PCI function then sees the monitor.
  */
 #define NV0073_CTRL_CMD_DFP_SET_ELD_AUDIO_CAPS		0x731144
+#define NV0073_CTRL_CMD_DFP_SET_AUDIO_ENABLE		0x731150
+#define NV0073_CTRL_CMD_DP_SET_AUDIO_MUTESTREAM		0x731359
 
-int nv_disp_audio(struct nvdrv_dev *nv, const u8 *eld, u32 size)
+int nv_disp_audio(struct nvdrv_dev *nv, const u8 *eld, u32 size, u32 max_freq)
 {
 	struct {
 		__le32 sub_device, display_id, size;
 		u8 eld[96];
 		__le32 max_freq, ctrl, device_entry;
 	} *p;
+	struct { __le32 sub_device, display_id; u8 enable, pad[3]; } en = {};
+	struct { __le32 sub_device, display_id, mute; } mu = {};
 	struct nv_disp_dpy *d;
+	bool on = eld && size;
 	int ret = -ENODEV;
 
 	if (size > 96)
@@ -731,20 +768,30 @@ int nv_disp_audio(struct nvdrv_dev *nv, const u8 *eld, u32 size)
 	mutex_lock(&nv->gsp_lock);
 	d = first_dp(nv);
 	if (d && nv->disp.h_common) {
-		p->display_id = cpu_to_le32(d->id);
+		u32 h = nv->disp.h_common;
+
+		en.display_id = mu.display_id = p->display_id = cpu_to_le32(d->id);
 		p->device_entry = cpu_to_le32(nv->evo.head);
-		if (eld && size) {
+		if (on) {
+			en.enable = 1;
+			nv_rm_control(nv, nv->rm.h_client, h, NV0073_CTRL_CMD_DFP_SET_AUDIO_ENABLE, &en, sizeof(en));
 			/* the codec reads the whole 96-byte buffer: pad with zeros (nouveau gf119 hda_eld) */
 			p->size = cpu_to_le32(sizeof(p->eld));
 			memcpy(p->eld, eld, size);
+			p->max_freq = cpu_to_le32(max_freq);
 			p->ctrl = cpu_to_le32(BIT(0) | BIT(1));	/* PD, ELDV */
+		} else {
+			mu.mute = cpu_to_le32(1);
+			nv_rm_control(nv, nv->rm.h_client, h, NV0073_CTRL_CMD_DP_SET_AUDIO_MUTESTREAM, &mu, sizeof(mu));
 		}
-		ret = nv_rm_control(nv, nv->rm.h_client, nv->disp.h_common,
-				    NV0073_CTRL_CMD_DFP_SET_ELD_AUDIO_CAPS, p, sizeof(*p));
+		ret = nv_rm_control(nv, nv->rm.h_client, h, NV0073_CTRL_CMD_DFP_SET_ELD_AUDIO_CAPS, p, sizeof(*p));
+		if (!on)
+			nv_rm_control(nv, nv->rm.h_client, h, NV0073_CTRL_CMD_DFP_SET_AUDIO_ENABLE, &en, sizeof(en));
 	}
 	mutex_unlock(&nv->gsp_lock);
 	kfree(p);
-	dev_info(&nv->pdev->dev, "disp: audio %s (ELD %u bytes): %d\n", eld && size ? "on" : "off", size, ret);
+	dev_info(&nv->pdev->dev, "disp: audio %s (ELD %u bytes, max freq %u): %d\n", on ? "on" : "off", size,
+		 max_freq, ret);
 	return ret;
 }
 
@@ -869,6 +916,9 @@ void nv_disp_dp_status_show(struct nvdrv_dev *nv, struct seq_file *m)
 				   st[0], st[1], st[2], st[3], st[4], st[5], st[5] & 1 ? " (in sync)" : " (NOT in sync)");
 		if (!dp_aux(nv, d->id, false, 0x600, &pwr, 1))
 			seq_printf(m, "  0x600 power state 0x%02x%s\n", pwr, pwr == 1 ? " (D0)" : "");
+		if (!dp_aux(nv, d->id, false, 0x107, &pwr, 1))
+			seq_printf(m, "  0x107 downspread ctrl 0x%02x (MSA timing %s)\n", pwr,
+				   pwr & 0x80 ? "IGNORED: VRR" : "used");
 		if (!dp_aux(nv, d->id, false, 0x100, rev, 3))
 			seq_printf(m, "  0x100 link bw set 0x%02x, lane count set 0x%02x, pattern 0x%02x\n", rev[0], rev[1], rev[2]);
 	}

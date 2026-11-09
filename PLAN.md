@@ -605,7 +605,17 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       head when the display comes on; cleared when it goes off. The buffer is padded to its full 96 bytes (the
       codec reads all of it: "invalid ELD data byte 33" otherwise), and the first set after load is preceded by a
       clear (else the HDA side keeps eld_valid 0). snd_hda_intel on 01:00.1 then shows monitor Q27G42XE, LPCM
-      32/44.1/48 kHz, and PipeWire offers the HDMI/DP sink.
+      32/44.1/48 kHz, and PipeWire offers the HDMI/DP sink. DFP_SET_AUDIO_ENABLE (0x731150) before the ELD,
+      DP_SET_AUDIO_MUTESTREAM (0x731359) + disable when off, max sample rate from the SADs (nvkms
+      nvHdmiDpEnableDisableAudio).
+      - **Text jittered sideways while audio played** at 2560x1440@180. Not bandwidth (no underflow, NVIDIA's
+        driver is steady in the same mode, ruling out the monitor). Cause: without
+        **NV0073_CTRL_CMD_DP_SET_MANUAL_DISPLAYPORT** (0x731365, DPLib's first call, also nouveau r535) RM
+        programs the DP stream itself and refuses DP_CONFIG_STREAM (NV_ERR_ILLEGAL_ACTION, the long-standing
+        "refused, continuing with RM defaults"): its audio hblank symbols stayed at 313 (the 60 Hz bring-up mode)
+        where 180 Hz has room for 65, so audio packets overran the blanking. In library mode nvdrv's values are
+        set. Also: the sink's MSA_TIMING_PAR_IGNORE_EN (DPCD 0x107 bit 7) is now cleared at link-up and when VRR
+        goes off (it stayed set after a VRR session); debugfs dp_status shows it.
 - [x] **Display power (DPMS)** (2026-11-09): CRTC ACTIVE=0 (not a mode change) turns VRR off, detaches the head
       and puts the sink in D3 (DPCD 0x600 = 2): the monitor shows "no signal" and goes to standby. ACTIVE=1: D0,
       link retrain, mode set with the usual retries. `tools/dpmstest`: off in ~10 ms; on in 0.26 s right away,
