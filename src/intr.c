@@ -39,9 +39,22 @@
 #define FALCON_INTR_RETRIGGER		0x3e8
 #define FALCON_IRQ_SWGEN0		BIT(6)
 
+/*
+ * Display head timing (vblank): GSP-RM leaves these to the CPU driver on the DISP stall
+ * vector (kdispServiceLowLatencyIntrs_KERNEL, nouveau tu102_disp_intr). DISPATCH bit h:
+ * head h has a pending RM head-timing interrupt; STAT bit 1 LAST_DATA = vblank start,
+ * acknowledged through EVT_STAT; enabled per head in RM_INTR_EN (dev_disp.h v03/v04).
+ */
+#define PDISP_FE_EVT_STAT_HEAD_TIMING(h)	(0x00611800 + (h) * 4)
+#define PDISP_FE_RM_INTR_STAT_HEAD_TIMING(h)	(0x00611c00 + (h) * 4)
+#define PDISP_FE_RM_INTR_EN_HEAD_TIMING(h)	(0x00611d80 + (h) * 4)
+#define PDISP_FE_RM_INTR_DISPATCH		0x00611ec0
+#define HEAD_TIMING_LAST_DATA			BIT(1)
+
 #define NV2080_CTRL_CMD_INTERNAL_INTR_GET_KERNEL_TABLE	0x20800a5c
 #define INTR_TABLE_MAX			128
-#define MC_ENGINE_IDX_CE0		15	/* r570 nvrm/engine.h */
+#define MC_ENGINE_IDX_DISP		2	/* r570 nvrm/engine.h */
+#define MC_ENGINE_IDX_CE0		15
 #define MC_ENGINE_IDX_GSP		50
 #define MC_ENGINE_IDX_GR0		84
 #define NV_VECTOR_NONE			0xffffffff
@@ -103,7 +116,7 @@ static irqreturn_t nv_intr_handler(int irq, void *data)
 	struct nvdrv_dev *nv = data;
 	struct nv_intr *in = &nv->intr;
 	u32 top, leaf, stat, mine, stray;
-	bool fence = false, gsp = false;
+	bool fence = false, gsp = false, disp = false;
 
 	top = nv_rd32(nv, VFN_TOP);
 	if (!top || top == 0xffffffff)
@@ -128,6 +141,22 @@ static irqreturn_t nv_intr_handler(int irq, void *data)
 			fence = true;
 		if (in->gsp_vec != NV_VECTOR_NONE && leaf == in->gsp_vec / 32 && (mine & BIT(in->gsp_vec % 32)))
 			gsp = true;
+		if (in->disp_vec != NV_VECTOR_NONE && leaf == in->disp_vec / 32 && (mine & BIT(in->disp_vec % 32)))
+			disp = true;
+	}
+	if (disp) {
+		unsigned long heads = nv_rd32(nv, PDISP_FE_RM_INTR_DISPATCH) & 0xff;
+		int h;
+
+		for_each_set_bit(h, &heads, 8) {
+			if (nv_rd32(nv, PDISP_FE_RM_INTR_STAT_HEAD_TIMING(h)) & HEAD_TIMING_LAST_DATA) {
+				nv_wr32(nv, PDISP_FE_EVT_STAT_HEAD_TIMING(h), HEAD_TIMING_LAST_DATA);
+				atomic_inc(&in->vblank_irqs);
+				nv_drm_vblank_irq(nv, h);
+			}
+		}
+		/* the source is clear now; drop the leaf bit it may have re-latched meanwhile */
+		nv_wr32(nv, VFN_LEAF(in->disp_vec / 32), BIT(in->disp_vec % 32));
 	}
 	if (gsp) {
 		u32 irq_stat = nv_rd32(nv, GSP_FALCON + FALCON_IRQSTAT) &
@@ -149,6 +178,27 @@ static irqreturn_t nv_intr_handler(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/* Head-timing (vblank) interrupt on/off for @head; false if there is no DISP vector. */
+bool nv_intr_vblank_enable(struct nvdrv_dev *nv, u32 head, bool on)
+{
+	struct nv_intr *in = &nv->intr;
+	u32 v;
+
+	if (!in->active || in->disp_vec == NV_VECTOR_NONE || head >= 8)
+		return false;
+	if (on)
+		nv_wr32(nv, PDISP_FE_EVT_STAT_HEAD_TIMING(head), HEAD_TIMING_LAST_DATA);	/* stale */
+	v = nv_rd32(nv, PDISP_FE_RM_INTR_EN_HEAD_TIMING(head));
+	v = on ? v | HEAD_TIMING_LAST_DATA : v & ~HEAD_TIMING_LAST_DATA;
+	nv_wr32(nv, PDISP_FE_RM_INTR_EN_HEAD_TIMING(head), v);
+	return true;
+}
+
+bool nv_intr_has_vblank(struct nvdrv_dev *nv)
+{
+	return nv->intr.active && nv->intr.disp_vec != NV_VECTOR_NONE;
+}
+
 /* After GSP-RM boot (internal client from the static info). Failure leaves polling in charge. */
 int nv_intr_init(struct nvdrv_dev *nv)
 {
@@ -164,6 +214,7 @@ int nv_intr_init(struct nvdrv_dev *nv)
 	memset(in->enabled, 0, sizeof(in->enabled));
 	memset(in->fence_mask, 0, sizeof(in->fence_mask));
 	in->gsp_vec = NV_VECTOR_NONE;
+	in->disp_vec = NV_VECTOR_NONE;
 	t = kzalloc(sizeof(*t), GFP_KERNEL);
 	if (!t)
 		return -ENOMEM;
@@ -179,6 +230,10 @@ int nv_intr_init(struct nvdrv_dev *nv)
 		dev_dbg(&nv->pdev->dev, "intr: %2u: engine %3u stall 0x%08x nonstall 0x%08x\n", i, idx, st, ns);
 		if (idx == MC_ENGINE_IDX_GSP)
 			in->gsp_vec = st;
+		if (idx == MC_ENGINE_IDX_DISP && st != NV_VECTOR_NONE && st / 32 < VFN_LEAVES) {
+			in->disp_vec = st;
+			leaf_enable(nv, st);
+		}
 		if ((idx == MC_ENGINE_IDX_GR0 || (idx >= MC_ENGINE_IDX_CE0 && idx < MC_ENGINE_IDX_CE0 + 10)) &&
 		    ns != NV_VECTOR_NONE && ns / 32 < VFN_LEAVES) {
 			leaf_enable(nv, ns);
@@ -235,6 +290,10 @@ void nv_intr_fini(struct nvdrv_dev *nv)
 
 	if (in->irq <= 0)
 		return;
+	if (in->disp_vec != NV_VECTOR_NONE)
+		for (leaf = 0; leaf < 8; leaf++)	/* heads */
+			nv_wr32(nv, PDISP_FE_RM_INTR_EN_HEAD_TIMING(leaf),
+				nv_rd32(nv, PDISP_FE_RM_INTR_EN_HEAD_TIMING(leaf)) & ~HEAD_TIMING_LAST_DATA);
 	in->active = false;
 	for (leaf = 0; leaf < VFN_LEAVES; leaf++)
 		if (in->enabled[leaf])
@@ -252,6 +311,7 @@ void nv_intr_show(struct nvdrv_dev *nv, struct seq_file *m)
 
 	seq_printf(m, "irq %d (%s), active %d, GSP vector %d, GR nonstall %d\n", in->irq,
 		   nv->pdev->msi_enabled ? "MSI" : "INTx", in->active, (int)in->gsp_vec, (int)in->gr_vec);
+	seq_printf(m, "display vector %d, vblank interrupts %d\n", (int)in->disp_vec, atomic_read(&in->vblank_irqs));
 	seq_printf(m, "fence interrupts %d, GSP events drained by interrupt %d, GSP health %s\n",
 		   atomic_read(&in->fence_irqs), atomic_read(&in->gsp_events),
 		   in->gsp_dead ? "DEAD" : in->active ? "ok (checked every 5 s)" : "-");

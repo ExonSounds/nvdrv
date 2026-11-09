@@ -524,7 +524,14 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
 - [ ] **Robust mode changes** with the AOC monitor (identity switching), DP_CONFIG_STREAM, core exceptions.
 - [ ] **Hardware cursor plane** and **overlay planes** (direct scanout of fullscreen apps).
 - [ ] **Adaptive sync (VRR / FreeSync)**.
-- [ ] **Async (tearing) page flips**; **real vblank interrupts and timestamps** instead of the software timer.
+- [x] **Real vblank interrupts and timestamps** (2026-11-09): GSP-RM's kernel interrupt table gives the CPU the
+      DISP stall vector (engine 2, vector 154 on GA104); head timing as kdispServiceLowLatencyIntrs_KERNEL /
+      nouveau tu102_disp_intr: DISPATCH 0x611ec0 bit h → RM_INTR_STAT 0x611c00+4h bit 1 (LAST_DATA) → ack
+      EVT_STAT 0x611800+4h, enable RM_INTR_EN 0x611d80+4h bit 1 in enable/disable_vblank. Timestamps from the
+      raster line counter (0x616330+0x800h) and the ARMed head timing (0x68a064/6c/70+0x400h), nouveau's
+      scanoutpos conversion. `tools/vblanktest`: 180.001 Hz, interval jitter ±0.5 µs; kmsgl flips at 179.8 of
+      180 Hz. The software timer stays as the fallback without interrupts.
+- [ ] **Async (tearing) page flips**.
 - [ ] **Colour**: gamma LUT / CTM, 10-bit formats, HDR metadata; DSC.
 - [ ] **Block-linear scanout modifiers** (NVK renders scanout buffers linear today).
 - [ ] **Audio** over DisplayPort / HDMI.

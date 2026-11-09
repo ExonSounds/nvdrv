@@ -4,8 +4,9 @@
  *
  * Structure follows drivers/gpu/drm/tiny/cirrus-qemu.c (GPL-2.0, Red Hat): GEM-shmem
  * buffers, a shadow-buffered primary plane whose damaged rectangles are copied into
- * the scanout surface, software vblank timer, fbdev emulation through the client
- * library. Here the scanout surface is nvdrv's VRAM framebuffer, which the CPU reaches
+ * the scanout surface, fbdev emulation through the client library. Vblank comes from
+ * the head-timing interrupt (src/intr.c) with timestamps from the raster position, or
+ * from a software timer when interrupts are unavailable. Here the scanout surface is nvdrv's VRAM framebuffer, which the CPU reaches
  * through BAR1 (src/bar1.c). All EDID modes that fit the trained DP link are offered;
  * a mode change in an atomic commit becomes an nvdrv modeset (mode_set_nofb).
  */
@@ -268,12 +269,76 @@ static void nv_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_commi
 	drm_crtc_vblank_on(crtc);	/* the head itself stays configured by nvdrv */
 }
 
+/* ---- hardware vblank ---------------------------------------------------- */
+
+#define PDISP_RG_DPCA(h)		(0x00616330 + (h) * 0x800)	/* vline, latches hline */
+#define PDISP_RG_DPCB(h)		(0x00616334 + (h) * 0x800)
+#define CORE_ARM_HEAD(h, r)		(0x0068a000 + (h) * 0x400 + (r))	/* nouveau gv100_head_state */
+
+static int nv_crtc_enable_vblank(struct drm_crtc *crtc)
+{
+	struct nv_drm *d = to_nv_drm(crtc->dev);
+
+	return nv_intr_vblank_enable(d->nv, d->nv->evo.head, true) ? 0 : -ENODEV;
+}
+
+static void nv_crtc_disable_vblank(struct drm_crtc *crtc)
+{
+	struct nv_drm *d = to_nv_drm(crtc->dev);
+
+	nv_intr_vblank_enable(d->nv, d->nv->evo.head, false);
+}
+
+/* Called from the interrupt handler on LAST_DATA (start of vblank) of @head. */
+void nv_drm_vblank_irq(struct nvdrv_dev *nv, u32 head)
+{
+	struct nv_drm *d = READ_ONCE(nv->drm);
+
+	if (d && head == nv->evo.head)
+		drm_crtc_handle_vblank(&d->crtc);
+}
+
+/*
+ * Raster position for vblank timestamps (nouveau_display_scanoutpos): vtotal and the
+ * blank start/end lines from the core channel's ARMed head state, the line counter
+ * from the raster generator; lines from blank start on count as negative.
+ */
+static bool nv_crtc_get_scanout_position(struct drm_crtc *crtc, bool in_vblank_irq, int *vpos,
+					 int *hpos, ktime_t *stime, ktime_t *etime,
+					 const struct drm_display_mode *mode)
+{
+	struct nv_drm *d = to_nv_drm(crtc->dev);
+	struct nvdrv_dev *nv = d->nv;
+	u32 h = nv->evo.head, total, blank_end, blank_start;
+	int vline, hline;
+
+	total = nv_rd32(nv, CORE_ARM_HEAD(h, 0x064)) >> 16;
+	blank_end = nv_rd32(nv, CORE_ARM_HEAD(h, 0x06c)) >> 16;
+	blank_start = nv_rd32(nv, CORE_ARM_HEAD(h, 0x070)) >> 16;
+	if (!total || total == 0xffff)
+		return false;
+	if (stime)
+		*stime = ktime_get();
+	vline = nv_rd32(nv, PDISP_RG_DPCA(h)) & 0xffff;
+	hline = nv_rd32(nv, PDISP_RG_DPCB(h)) & 0xffff;
+	if (etime)
+		*etime = ktime_get();
+	if (vline >= blank_start)	/* nouveau calc() */
+		vline -= total;
+	if (blank_end < blank_start)
+		vline -= blank_end + 1;
+	*vpos = vline;
+	*hpos = hline;
+	return true;
+}
+
 static const struct drm_crtc_helper_funcs nv_crtc_helper_funcs = {
 	.atomic_check = nv_crtc_atomic_check,
 	.mode_set_nofb = nv_crtc_mode_set_nofb,
 	.atomic_flush = drm_crtc_vblank_atomic_flush,
 	.atomic_enable = nv_crtc_atomic_enable,
 	.atomic_disable = drm_crtc_vblank_atomic_disable,
+	.get_scanout_position = nv_crtc_get_scanout_position,
 };
 
 static const struct drm_crtc_funcs nv_crtc_funcs = {
@@ -284,6 +349,18 @@ static const struct drm_crtc_funcs nv_crtc_funcs = {
 	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
 	DRM_CRTC_VBLANK_TIMER_FUNCS,
+};
+
+static const struct drm_crtc_funcs nv_crtc_funcs_hw = {
+	.reset = drm_atomic_helper_crtc_reset,
+	.destroy = drm_crtc_cleanup,
+	.set_config = drm_atomic_helper_set_config,
+	.page_flip = drm_atomic_helper_page_flip,
+	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
+	.enable_vblank = nv_crtc_enable_vblank,
+	.disable_vblank = nv_crtc_disable_vblank,
+	.get_vblank_timestamp = drm_crtc_vblank_helper_get_vblank_timestamp,
 };
 
 static const struct drm_encoder_funcs nv_encoder_funcs = {
@@ -479,7 +556,8 @@ int nv_drm_register(struct nvdrv_dev *nv)
 	drm_plane_helper_add(&d->primary, &nv_plane_helper_funcs);
 	drm_plane_enable_fb_damage_clips(&d->primary);
 
-	ret = drm_crtc_init_with_planes(dev, &d->crtc, &d->primary, NULL, &nv_crtc_funcs, NULL);
+	ret = drm_crtc_init_with_planes(dev, &d->crtc, &d->primary, NULL,
+					nv_intr_has_vblank(nv) ? &nv_crtc_funcs_hw : &nv_crtc_funcs, NULL);
 	if (ret)
 		goto err;
 	drm_crtc_helper_add(&d->crtc, &nv_crtc_helper_funcs);
@@ -508,8 +586,8 @@ int nv_drm_register(struct nvdrv_dev *nv)
 	drm_client_setup(dev, NULL);
 	/* make the fbdev client commit its mode now instead of on the next VT switch */
 	drm_kms_helper_hotplug_event(dev);
-	drm_info(dev, "%s on %s, scanout VRAM 0x%llx via BAR1, pitch %u\n", d->mode.name,
-		 pci_name(pdev), e->fb, d->pitch);
+	drm_info(dev, "%s on %s, scanout VRAM 0x%llx via BAR1, pitch %u, %s vblank\n", d->mode.name,
+		 pci_name(pdev), e->fb, d->pitch, nv_intr_has_vblank(nv) ? "hardware" : "timer");
 	return 0;
 err:
 	d->scanout = NULL;
@@ -539,6 +617,9 @@ void nv_drm_unregister(struct nvdrv_dev *nv)
 	nv->unplugged = true;	/* file / GEM teardown from here on: software state only */
 	drm_dev_unplug(&d->dev);
 	drm_atomic_helper_shutdown(&d->dev);
+	WRITE_ONCE(nv->drm, NULL);	/* the vblank interrupt stops using it */
+	if (nv->intr.irq > 0)
+		synchronize_irq(nv->intr.irq);
 	cancel_work_sync(&d->boost_work);
 	d->scanout = NULL;
 	drm_edid_free(d->edid);

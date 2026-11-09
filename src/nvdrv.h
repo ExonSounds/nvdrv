@@ -410,13 +410,13 @@ struct nv_fifo {
 struct nv_intr {
 	int irq;
 	bool active;
-	u32 gsp_vec, gr_vec;
+	u32 gsp_vec, gr_vec, disp_vec;
 	u32 enabled[8];				/* per leaf: vectors nvdrv owns */
 	u32 fence_mask[8];			/* per leaf: nonstall vectors */
 	struct work_struct msg_work;
 	struct delayed_work health_work;	/* GSP RISC-V still running? every 5 s */
 	bool gsp_dead;
-	atomic_t fence_irqs, gsp_events;
+	atomic_t fence_irqs, gsp_events, vblank_irqs;
 };
 
 /* nouveau-compatible uAPI state (src/uapi.c) */
@@ -645,6 +645,9 @@ int nv_intr_init(struct nvdrv_dev *nv);
 void nv_intr_fini(struct nvdrv_dev *nv);
 void nv_intr_show(struct nvdrv_dev *nv, struct seq_file *m);
 void nv_uapi_fence_irq(struct nvdrv_dev *nv);
+bool nv_intr_vblank_enable(struct nvdrv_dev *nv, u32 head, bool on);
+bool nv_intr_has_vblank(struct nvdrv_dev *nv);
+void nv_drm_vblank_irq(struct nvdrv_dev *nv, u32 head);
 
 /* src/sensors.c */
 int nv_sensor_temp(struct nvdrv_dev *nv, long *mc);

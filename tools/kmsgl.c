@@ -5,7 +5,7 @@
  * front buffer, page flips. With nvdrv the flips are zero-copy (window points at the
  * buffer in VRAM). Draws moving colour bars for N seconds and reports the flip rate.
  *   cc -O2 -o kmsgl tools/kmsgl.c $(pkg-config --cflags --libs gbm egl glesv2 libdrm)
- *   kmsgl [/dev/dri/card0] [seconds]
+ *   [KMSGL_HZ=refresh] kmsgl [/dev/dri/card0] [seconds]
  */
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -88,6 +88,13 @@ int main(int argc, char **argv)
 	for (i = 0; i < conn->count_modes; i++)
 		if (conn->modes[i].type & DRM_MODE_TYPE_PREFERRED)
 			mode = conn->modes[i];
+	if (getenv("KMSGL_HZ"))	/* same size, this refresh rate */
+		for (i = 0; i < conn->count_modes; i++)
+			if (conn->modes[i].hdisplay == mode.hdisplay && conn->modes[i].vdisplay == mode.vdisplay &&
+			    conn->modes[i].vrefresh == (unsigned)atoi(getenv("KMSGL_HZ"))) {
+				mode = conn->modes[i];
+				break;
+			}
 	crtc = res->crtcs[0];
 	printf("%s: %ux%u@%u\n", path, mode.hdisplay, mode.vdisplay, mode.vrefresh);
 
