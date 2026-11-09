@@ -600,7 +600,12 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       besides LINEAR, for VRAM framebuffers (copied ones stay linear). Scanout through a second VRAM-pool ctxdma
       with the KIND bit (bit 20, nouveau gv100_dmaobj_new) and SET_STORAGE = log2 block height; the pitch stays
       in 64-byte units. `KMSGL_BL=1 tools/kmsgl`: GBM picks 32-GOB blocks, picture correct on screen.
-- [ ] **Audio** over DisplayPort / HDMI.
+- [x] **Audio over DisplayPort** (2026-11-09): the connector's ELD (DRM builds it from the EDID's CTA audio block)
+      goes to NV0073_CTRL_CMD_DFP_SET_ELD_AUDIO_CAPS (0x731144; nouveau r535_sor_hda_eld) with PD + ELDV and the
+      head when the display comes on; cleared when it goes off. The buffer is padded to its full 96 bytes (the
+      codec reads all of it: "invalid ELD data byte 33" otherwise), and the first set after load is preceded by a
+      clear (else the HDA side keeps eld_valid 0). snd_hda_intel on 01:00.1 then shows monitor Q27G42XE, LPCM
+      32/44.1/48 kHz, and PipeWire offers the HDMI/DP sink.
 - [x] **Display power (DPMS)** (2026-11-09): CRTC ACTIVE=0 (not a mode change) turns VRR off, detaches the head
       and puts the sink in D3 (DPCD 0x600 = 2): the monitor shows "no signal" and goes to standby. ACTIVE=1: D0,
       link retrain, mode set with the usual retries. `tools/dpmstest`: off in ~10 ms; on in 0.26 s right away,

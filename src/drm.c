@@ -22,6 +22,7 @@
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
+#include <drm/drm_eld.h>
 #include <drm/drm_fbdev_shmem.h>
 #include <drm/drm_file.h>
 #include <drm/drm_format_helper.h>
@@ -45,6 +46,7 @@ struct nv_drm {
 	struct drm_device dev;
 	struct nvdrv_dev *nv;
 	struct drm_plane primary, cursor;
+	bool audio_on;			/* ELD handed to the HD-Audio function */
 	struct drm_crtc crtc;
 	struct drm_encoder encoder;
 	struct drm_connector connector;
@@ -398,6 +400,24 @@ static void nv_crtc_mode_set_nofb(struct drm_crtc *crtc)
 	drm_dev_exit(idx);
 }
 
+/* Monitor audio follows the display: ELD from the connector's EDID while the head runs. */
+static void nv_drm_audio(struct nv_drm *d, bool on)
+{
+	const u8 *eld = d->connector.eld;
+	u32 size = on ? drm_eld_size(eld) : 0;
+
+	if (on && (size <= DRM_ELD_HEADER_BLOCK_SIZE || size > 96))	/* no audio blocks / too long */
+		size = 0;
+	/*
+	 * The HD-Audio side only reads the ELD on a clean presence change: switching it on
+	 * from an unknown state (first commit after load) left eld_valid 0. Clear it first.
+	 */
+	if (size && !d->audio_on)
+		nv_disp_audio(d->nv, NULL, 0);
+	nv_disp_audio(d->nv, size ? eld : NULL, size);
+	d->audio_on = size;
+}
+
 /* Display power: CRTC active again (DPMS on) brings the head and the sink back. */
 static void nv_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
 {
@@ -413,6 +433,10 @@ static void nv_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_commi
 		drm_dev_exit(idx);
 	}
 	drm_crtc_vblank_on(crtc);
+	if (drm_dev_enter(crtc->dev, &idx)) {
+		nv_drm_audio(d, true);
+		drm_dev_exit(idx);
+	}
 }
 
 /* CRTC inactive (DPMS off, not a mode change): head off, monitor to standby. */
@@ -424,6 +448,7 @@ static void nv_crtc_atomic_disable(struct drm_crtc *crtc, struct drm_atomic_comm
 
 	drm_crtc_vblank_atomic_disable(crtc, state);
 	if (!cs->active && drm_dev_enter(crtc->dev, &idx)) {
+		nv_drm_audio(d, false);
 		nv_disp_power(d->nv, false, NULL);
 		drm_dev_exit(idx);
 	}

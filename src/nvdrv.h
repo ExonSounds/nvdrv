@@ -747,6 +747,7 @@ int nv_disp_color(struct nvdrv_dev *nv, const u16 *lut, const u32 *ocsc);
 int nv_disp_vrr(struct nvdrv_dev *nv, bool enable, u32 timeout_us);
 int nv_disp_power(struct nvdrv_dev *nv, bool on, const struct nv_mode *m);
 void nv_disp_event(struct nvdrv_dev *nv, u32 h_event, const u8 *data, u32 size);
+int nv_disp_audio(struct nvdrv_dev *nv, const u8 *eld, u32 size);
 void nv_disp_hpd_work(struct work_struct *w);
 void nv_drm_hotplug(struct nvdrv_dev *nv);
 bool nv_drm_connector_state(struct nvdrv_dev *nv, u8 *edid, u32 *edid_size);

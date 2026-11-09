@@ -706,6 +706,48 @@ int nv_disp_power(struct nvdrv_dev *nv, bool on, const struct nv_mode *m)
 	return ret;
 }
 
+/*
+ * DP/HDMI audio: hand the sink's ELD to the GPU's HD-Audio function through RM (nouveau
+ * r535_sor_hda_eld / _hpd): presence detect + ELD valid with the ELD, or both clear (@eld
+ * NULL). snd_hda_intel on the audio PCI function then sees the monitor.
+ */
+#define NV0073_CTRL_CMD_DFP_SET_ELD_AUDIO_CAPS		0x731144
+
+int nv_disp_audio(struct nvdrv_dev *nv, const u8 *eld, u32 size)
+{
+	struct {
+		__le32 sub_device, display_id, size;
+		u8 eld[96];
+		__le32 max_freq, ctrl, device_entry;
+	} *p;
+	struct nv_disp_dpy *d;
+	int ret = -ENODEV;
+
+	if (size > 96)
+		return -E2BIG;
+	p = kzalloc(sizeof(*p), GFP_KERNEL);
+	if (!p)
+		return -ENOMEM;
+	mutex_lock(&nv->gsp_lock);
+	d = first_dp(nv);
+	if (d && nv->disp.h_common) {
+		p->display_id = cpu_to_le32(d->id);
+		p->device_entry = cpu_to_le32(nv->evo.head);
+		if (eld && size) {
+			/* the codec reads the whole 96-byte buffer: pad with zeros (nouveau gf119 hda_eld) */
+			p->size = cpu_to_le32(sizeof(p->eld));
+			memcpy(p->eld, eld, size);
+			p->ctrl = cpu_to_le32(BIT(0) | BIT(1));	/* PD, ELDV */
+		}
+		ret = nv_rm_control(nv, nv->rm.h_client, nv->disp.h_common,
+				    NV0073_CTRL_CMD_DFP_SET_ELD_AUDIO_CAPS, p, sizeof(*p));
+	}
+	mutex_unlock(&nv->gsp_lock);
+	kfree(p);
+	dev_info(&nv->pdev->dev, "disp: audio %s (ELD %u bytes): %d\n", eld && size ? "on" : "off", size, ret);
+	return ret;
+}
+
 /* From the GSP message path (gsp_lock held): note the event, act on it in process context. */
 void nv_disp_event(struct nvdrv_dev *nv, u32 h_event, const u8 *data, u32 size)
 {
