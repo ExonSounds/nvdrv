@@ -156,6 +156,17 @@ static int nv_plane_atomic_check(struct drm_plane *plane, struct drm_atomic_comm
 	return 0;
 }
 
+/* Async (tearing) flips: only zero-copy VRAM framebuffers, which flip the window directly. */
+static int nv_plane_atomic_async_check(struct drm_plane *plane, struct drm_atomic_commit *state, bool flip)
+{
+	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
+	u64 vram;
+
+	if (!ps || !ps->fb || !nv_uapi_bo_vram(ps->fb->obj[0], &vram))
+		return -EINVAL;
+	return 0;
+}
+
 /* The shadow-plane vmap only for framebuffers that are copied (shmem objects). */
 static int nv_plane_begin_fb_access(struct drm_plane *plane, struct drm_plane_state *ps)
 {
@@ -192,13 +203,16 @@ static void nv_plane_atomic_update(struct drm_plane *plane, struct drm_atomic_co
 	if (!fb || !drm_dev_enter(&d->dev, &idx))
 		return;
 	if (nv_uapi_bo_vram(fb->obj[0], &vram)) {	/* zero copy: flip the window to it */
-		nv_disp_scanout(d->nv, vram + fb->offsets[0], fb->pitches[0], nv_mod_block_h(fb->modifier));
+		struct drm_crtc_state *cs = ps->crtc ? drm_atomic_get_new_crtc_state(state, ps->crtc) : NULL;
+
+		nv_disp_scanout(d->nv, vram + fb->offsets[0], fb->pitches[0], nv_mod_block_h(fb->modifier),
+				cs && cs->async_flip);
 		atomic64_inc(&d->updates);
 		drm_dev_exit(idx);
 		return;
 	}
 	if (d->nv->evo.scanout_cur) {	/* back from a direct framebuffer: copy all of this one */
-		nv_disp_scanout(d->nv, 0, 0, -1);
+		nv_disp_scanout(d->nv, 0, 0, -1, false);
 		ps->ignore_damage_clips = true;
 	}
 	drm_atomic_helper_damage_iter_init(&iter, old, ps);
@@ -329,6 +343,7 @@ static const struct drm_plane_helper_funcs nv_plane_helper_funcs = {
 	.begin_fb_access = nv_plane_begin_fb_access,
 	.end_fb_access = nv_plane_end_fb_access,
 	.atomic_check = nv_plane_atomic_check,
+	.atomic_async_check = nv_plane_atomic_async_check,
 	.atomic_update = nv_plane_atomic_update,
 	.atomic_disable = nv_plane_atomic_disable,
 };
@@ -507,6 +522,12 @@ static void nv_crtc_atomic_flush(struct drm_crtc *crtc, struct drm_atomic_commit
 		nv_crtc_color(to_nv_drm(crtc->dev), cs);
 		drm_dev_exit(idx);
 	}
+	if (cs->async_flip && cs->event) {	/* tearing flip: done as soon as the window has it */
+		spin_lock_irq(&crtc->dev->event_lock);
+		drm_crtc_send_vblank_event(crtc, cs->event);
+		cs->event = NULL;
+		spin_unlock_irq(&crtc->dev->event_lock);
+	}
 	drm_crtc_vblank_atomic_flush(crtc, state);
 }
 
@@ -580,6 +601,37 @@ static const struct drm_connector_funcs nv_connector_funcs = {
 	.reset = drm_atomic_helper_connector_reset,
 	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
+};
+
+/*
+ * drm_atomic_helper_commit_tail, except that a tearing flip does not wait for the next vblank
+ * before releasing the old framebuffer (it is off screen once the window took the flip);
+ * otherwise async flips would be capped at two per frame.
+ */
+static void nv_commit_tail(struct drm_atomic_commit *state)
+{
+	struct drm_device *dev = state->dev;
+	struct drm_crtc_state *cs;
+	struct drm_crtc *crtc;
+	bool async = false;
+	int i;
+
+	for_each_new_crtc_in_state(state, crtc, cs, i)
+		async |= cs->async_flip;
+	drm_atomic_helper_commit_modeset_disables(dev, state);
+	drm_atomic_helper_commit_planes(dev, state, 0);
+	drm_atomic_helper_commit_modeset_enables(dev, state);
+	drm_atomic_helper_fake_vblank(state);
+	drm_atomic_helper_commit_hw_done(state);
+	if (async)
+		drm_atomic_helper_wait_for_flip_done(dev, state);
+	else
+		drm_atomic_helper_wait_for_vblanks(dev, state);
+	drm_atomic_helper_cleanup_planes(dev, state);
+}
+
+static const struct drm_mode_config_helper_funcs nv_mode_config_helpers = {
+	.atomic_commit_tail = nv_commit_tail,
 };
 
 static const struct drm_mode_config_funcs nv_mode_config_funcs = {
@@ -726,6 +778,8 @@ int nv_drm_register(struct nvdrv_dev *nv)
 	dev->mode_config.max_height = 4096;
 	dev->mode_config.preferred_depth = 24;
 	dev->mode_config.funcs = &nv_mode_config_funcs;
+	dev->mode_config.helper_private = &nv_mode_config_helpers;
+	dev->mode_config.async_page_flip = true;	/* tearing flips of VRAM framebuffers */
 
 	ret = drm_universal_plane_init(dev, &d->primary, 0, &nv_plane_funcs, nv_formats,
 				       ARRAY_SIZE(nv_formats), nv_modifiers, DRM_PLANE_TYPE_PRIMARY, NULL);

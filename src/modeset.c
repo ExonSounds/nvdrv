@@ -639,9 +639,10 @@ static int sysfb_prepare(struct nvdrv_dev *nv, u32 w, u32 h)
  * Point window 0 at a VRAM pool surface (zero-copy flip) or back at nvdrv's own framebuffer
  * (vram == 0). @block_h: log2 block height in GOBs of a block-linear surface, -1 for pitch
  * linear; block linear is selected by the ctxdma KIND, the block height by SET_STORAGE, and
- * the pitch is in 64-byte units for both (nouveau wndwc67e_image_set).
+ * the pitch is in 64-byte units for both (nouveau wndwc67e_image_set). @immediate: tearing
+ * flip (BEGIN_MODE IMMEDIATE) instead of at the next vblank.
  */
-int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch, int block_h)
+int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch, int block_h, bool immediate)
 {
 	struct nv_evo *e = &nv->evo;
 	struct nv_evo_chan *win = &e->win[0];
@@ -682,9 +683,10 @@ int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch, int block_h)
 	} else {
 		pitch = e->fb_pitch;
 	}
-	ret = nv_evo_begin(nv, win, 7 * 8);	/* bytes: seven single-word methods */
+	ret = nv_evo_begin(nv, win, 8 * 8);	/* bytes: eight single-word methods */
 	if (ret)
 		goto out;
+	m1(win, C67E_SET_PRESENT_CONTROL, immediate ? 1 << 4 : 0);	/* BEGIN_MODE, sticky */
 	m1(win, C67E_SET_CONTEXT_DMA_ISO(0), ctxdma);
 	m1(win, C67E_SET_OFFSET(0), offset >> 8);
 	m1(win, C67E_SET_STORAGE, block_h >= 0 ? block_h : 0);

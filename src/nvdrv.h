@@ -735,7 +735,7 @@ int nv_disp_set_mode(struct nvdrv_dev *nv, const struct nv_mode *m);
 #define NV_FLIP_CSC			BIT(4)	/* send CSC/ILUT/TMO disables (err 0x2 with bypass) */
 #define NV_FLIP_SYSMEM			BIT(5)	/* scan out a test surface from coherent sysmem */
 #define NV_FLIP_ILUT			BIT(6)	/* with COMPOSE: identity input LUT (modeset.c lut_init) */
-int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch, int block_h);
+int nv_disp_scanout(struct nvdrv_dev *nv, u64 vram, u32 pitch, int block_h, bool immediate);
 int nv_disp_cursor_init(struct nvdrv_dev *nv);
 int nv_disp_color(struct nvdrv_dev *nv, const u16 *lut, const u32 *ocsc);
 #define NV_OLUT_ENTRIES		1025	/* 1024 + the last repeated (interpolation) */

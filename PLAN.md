@@ -551,7 +551,13 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       raster line counter (0x616330+0x800h) and the ARMed head timing (0x68a064/6c/70+0x400h), nouveau's
       scanoutpos conversion. `tools/vblanktest`: 180.001 Hz, interval jitter ±0.5 µs; kmsgl flips at 179.8 of
       180 Hz. The software timer stays as the fallback without interrupts.
-- [ ] **Async (tearing) page flips**.
+- [x] **Async (tearing) page flips** (2026-11-09): `async_page_flip`; the primary plane's atomic_async_check accepts
+      zero-copy VRAM framebuffers; a flip with `async_flip` sets window SET_PRESENT_CONTROL BEGIN_MODE IMMEDIATE
+      (sticky: every flip writes it), sends its event at once, and the commit tail waits for flip_done instead of
+      a vblank (else two flips per frame). kmsgl: vsync 180.0 fps, async 7,300–9,800 fps; `KMSGL_ALT=1`
+      (alternating red/blue frames) shows even purple with vsync and bands with tearing, verified on screen.
+      Note: the window's armed copy (+0x800) changes at UPDATE for both modes, so it cannot show when a flip
+      reaches the screen.
 - [x] **Gamma LUT and CTM** (2026-11-09, needs `compose=1`): DRM GAMMA_LUT (1024, any size resampled; the legacy
       gamma ioctl goes through it) → the head OLUT, written into the slot not on screen (two slots) and switched
       with OCSC0 in one core update at vblank; CTM → OCSC0 (before the OLUT, DRM's order), S31.32 sign-magnitude

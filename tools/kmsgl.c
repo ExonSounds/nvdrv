@@ -5,7 +5,8 @@
  * front buffer, page flips. With nvdrv the flips are zero-copy (window points at the
  * buffer in VRAM). Draws moving colour bars for N seconds and reports the flip rate.
  *   cc -O2 -o kmsgl tools/kmsgl.c $(pkg-config --cflags --libs gbm egl glesv2 libdrm)
- *   [KMSGL_HZ=refresh] [KMSGL_BL=1] kmsgl [/dev/dri/card0] [seconds]
+ *   [KMSGL_HZ=refresh] [KMSGL_BL=1] [KMSGL_ASYNC=1 (tearing flips)] [KMSGL_ALT=1] kmsgl
+ *   KMSGL_ALT: frames alternate dim red / dim blue: even purple with vsync, bands when tearing [/dev/dri/card0] [seconds]
  */
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -25,6 +26,48 @@
 
 static int fd;
 static int pending;
+
+/*
+ * KMSGL_PROBE=1 (root, nvdrv debugfs): after each flip, poll window 0's ARMed offset
+ * (0x690000 user area + 0x800 armed copy + SET_OFFSET 0x260) until it changes and note the
+ * raster line (0x616330) at that moment. Vsync'd flips land in vblank; tearing flips anywhere.
+ */
+static int probe_fd = -1, probe_n, probe_active, probe_miss;
+static double probe_us;
+
+static uint32_t mmio(uint32_t reg)
+{
+	uint32_t v = 0;
+
+	if (pread(probe_fd, &v, 4, reg) != 4)
+		return 0;
+	return v;
+}
+
+static void probe_flip(unsigned int vdisplay)
+{
+	static uint32_t before;
+	struct timespec a, b;
+	uint32_t v, line;
+	int i;
+
+	clock_gettime(CLOCK_MONOTONIC, &a);
+	for (i = 0; i < 200000; i++) {
+		v = mmio(0x690a60);
+		if (v != before)
+			break;
+	}
+	line = mmio(0x616330) & 0xffff;
+	clock_gettime(CLOCK_MONOTONIC, &b);
+	if (v == before) {
+		probe_miss++;
+		return;
+	}
+	before = v;
+	probe_n++;
+	probe_active += line < vdisplay;
+	probe_us += (b.tv_sec - a.tv_sec) * 1e6 + (b.tv_nsec - a.tv_nsec) / 1e3;
+}
 
 static void flip_done(int fd, unsigned int seq, unsigned int s, unsigned int us, void *data)
 {
@@ -101,6 +144,8 @@ int main(int argc, char **argv)
 				break;
 			}
 	crtc = res->crtcs[0];
+	if (getenv("KMSGL_PROBE"))
+		probe_fd = open("/sys/kernel/debug/nvdrv/0000:01:00.0/mmio", O_RDONLY);
 	printf("%s: %ux%u@%u\n", path, mode.hdisplay, mode.vdisplay, mode.vrefresh);
 
 	struct gbm_device *gbm = gbm_create_device(fd);
@@ -151,6 +196,12 @@ int main(int argc, char **argv)
 	while ((t = now() - t0) < secs) {
 		int bars = 8, w = mode.hdisplay;
 
+		if (getenv("KMSGL_ALT")) {	/* tearing test: dim red / dim blue every other frame */
+			glScissor(0, 0, w, mode.vdisplay);
+			glClearColor(frames & 1 ? 0.25f : 0, 0, frames & 1 ? 0 : 0.25f, 1);
+			glClear(GL_COLOR_BUFFER_BIT);
+			bars = 0;
+		}
 		for (i = 0; i < bars; i++) {	/* moving colour bars */
 			float h = fmodf((float)t * 0.5f + i / (float)bars, 1.0f);
 
@@ -167,10 +218,13 @@ int main(int argc, char **argv)
 			}
 		} else {
 			pending = 1;
-			if (drmModePageFlip(fd, crtc, fb_for(bo), DRM_MODE_PAGE_FLIP_EVENT, NULL)) {
+			if (drmModePageFlip(fd, crtc, fb_for(bo), DRM_MODE_PAGE_FLIP_EVENT |
+					    (getenv("KMSGL_ASYNC") ? DRM_MODE_PAGE_FLIP_ASYNC : 0), NULL)) {
 				perror("PageFlip");
 				return 1;
 			}
+			if (probe_fd >= 0)
+				probe_flip(mode.vdisplay);
 			while (pending) {
 				struct pollfd p = { fd, POLLIN };
 
@@ -190,5 +244,8 @@ int main(int argc, char **argv)
 		}
 	}
 	printf("%d frames in %.1f s: %.1f fps\n", frames, t, frames / t);
+	if (probe_fd >= 0 && probe_n)
+		printf("probe: %d flips seen, %d not seen; %.0f %% took effect during active scanout, %.1f us after the ioctl\n",
+		       probe_n, probe_miss, 100.0 * probe_active / probe_n, probe_us / probe_n);
 	return 0;
 }
