@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "nir.h"
+#include "util/sparse_bitset.h"
 #include "nir_builder.h"
 #include "compiler/glsl_types.h"
 #include "spirv/nir_spirv.h"
@@ -28,7 +29,9 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "compile.h"
@@ -483,17 +486,86 @@ static void stats(nir_shader *nir, const char *stage)
 	}
 	fprintf(stderr, "nvcuda: %s: %s: %u blocks, %u instructions, scratch %u, shared %u\n", nir->info.name, stage,
 		blocks, instrs, nir->scratch_size, nir->info.shared_size);
+	if (getenv("NVCUDA_LIVESTATS") && !strcmp(stage, "optimized")) {
+		unsigned int maxl = 0, nd = impl->ssa_alloc;
+		uint64_t sum = 0;
+
+		nir_metadata_require(impl, nir_metadata_live_defs);
+		nir_foreach_block(block, impl) {
+			unsigned int n = u_sparse_bitset_count(&block->live_in);
+
+			sum += n;
+			if (n > maxl)
+				maxl = n;
+		}
+		fprintf(stderr, "nvcuda: %s: live defs per block: max %u, mean %llu (of %u defs)\n", nir->info.name, maxl,
+			(unsigned long long)(blocks ? sum / blocks : 0), nd);
+		/* which defs are live in most blocks? */
+		{
+			uint32_t *cnt = calloc(nd, 4);
+			nir_def **defs = calloc(nd, sizeof(*defs));
+			unsigned int i, k;
+
+			nir_foreach_block(block, impl) {
+				U_SPARSE_BITSET_FOREACH_SET(&block->live_in, d)
+					cnt[d]++;
+				nir_foreach_instr(instr, block) {
+					nir_def *def = nir_instr_def(instr);
+
+					if (def && def->index < nd)
+						defs[def->index] = def;
+				}
+			}
+			for (k = 0; k < 25; k++) {
+				unsigned int best = 0;
+
+				for (i = 1; i < nd; i++)
+					if (cnt[i] > cnt[best] && !(defs[i] && nir_def_instr(defs[i])->type == nir_instr_type_load_const))
+						best = i;
+				if (!cnt[best])
+					break;
+				fprintf(stderr, "  live in %u blocks: ", cnt[best]);
+				if (defs[best])
+					nir_print_instr(nir_def_instr(defs[best]), stderr);
+				fprintf(stderr, "\n");
+				cnt[best] = 0;
+			}
+			/* a histogram: how many defs are live in more than N blocks */
+			{
+				unsigned int h[6] = { 0 };
+
+				nir_foreach_block(block, impl) {
+					U_SPARSE_BITSET_FOREACH_SET(&block->live_in, d)
+						cnt[d]++;
+				}
+				for (i = 0; i < nd; i++) {
+					if (defs[i] && nir_def_instr(defs[i])->type == nir_instr_type_load_const)
+						continue;
+					if (cnt[i] > 10000) h[0]++;
+					else if (cnt[i] > 1000) h[1]++;
+					else if (cnt[i] > 100) h[2]++;
+					else if (cnt[i] > 10) h[3]++;
+					else if (cnt[i] > 0) h[4]++;
+				}
+				fprintf(stderr, "  non-constant defs live in >10000 blocks: %u, >1000: %u, >100: %u, >10: %u, >0: %u\n", h[0], h[1],
+					h[2], h[3], h[4]);
+			}
+			free(cnt);
+			free(defs);
+		}
+	}
 }
 
 /* PTX text -> NIR (ptx.c) -> the same tail as SPIR-V */
-static struct nvc_kernel_bin *compile_ptx(const char *ptx, const char *entry, uint64_t globals_va, char *err, size_t errlen)
+static struct nvc_kernel_bin *compile_ptx_once(const char *ptx, const char *entry, uint64_t globals_va,
+					       const struct nvc_ptx_opts *po, char *err, size_t errlen)
 {
 	struct nvc_kernel_bin *kb = calloc(1, sizeof(*kb));
 	nir_shader *nir;
 
 	if (!kb)
 		return NULL;
-	nir = nvc_ptx_build(ptx, entry, nak_nir_options(nak), kb, globals_va, err, errlen);
+	nir = nvc_ptx_build(ptx, entry, nak_nir_options(nak), kb, globals_va, po, err, errlen);
 	if (!nir) {
 		free(kb);
 		return NULL;
@@ -507,8 +579,34 @@ static struct nvc_kernel_bin *compile_ptx(const char *ptx, const char *entry, ui
 	kb->shared_hidden = NVC_DUMMY_BYTES;
 	nir_validate_shader(nir, "after the PTX front end");
 	stats(nir, "front end");
-	NIR_PASS(_, nir, nir_lower_goto_ifs);		/* PTX's branches -> structured control flow */
+	if (getenv("NVCUDA_FRONTEND_ONLY")) {
+		set_err(err, errlen, "stopped after the front end (NVCUDA_FRONTEND_ONLY)");
+		free(kb);
+		ralloc_free(nir);
+		return NULL;
+	}
+	if (!getenv("NVCUDA_NO_STRUCTURIZE"))	/* experiment: NAK's from_nir takes goto/goto_if itself */
+		NIR_PASS(_, nir, nir_lower_goto_ifs);		/* PTX's branches -> structured control flow */
 	stats(nir, "structured");
+	if (getenv("NVCUDA_STATS")) {	/* any goto left means a block the structurizer did not reach */
+		unsigned int left = 0, nulls = 0;
+
+		nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
+			nir_instr *last = nir_block_last_instr(block);
+
+			if (last && last->type == nir_instr_type_jump) {
+				nir_jump_instr *j = nir_instr_as_jump(last);
+
+				if (j->type == nir_jump_goto || j->type == nir_jump_goto_if) {
+					left++;
+					nulls += !j->target;
+				}
+			}
+		}
+		if (left)
+			fprintf(stderr, "nvcuda: %s: %u gotos left after structurizing (%u without target)\n", nir->info.name,
+				left, nulls);
+	}
 	NIR_PASS(_, nir, nir_opt_dead_cf);
 	NIR_PASS(_, nir, nir_lower_vars_to_ssa);	/* PTX registers -> SSA */
 	stats(nir, "ssa");
@@ -520,7 +618,148 @@ static struct nvc_kernel_bin *compile_ptx(const char *ptx, const char *entry, ui
 	}
 	optimize(nir);
 	stats(nir, "optimized");
+	if (getenv("NVCUDA_NO_NAK")) {
+		set_err(err, errlen, "stopped before NAK (NVCUDA_NO_NAK)");
+		free(kb);
+		ralloc_free(nir);
+		return NULL;
+	}
 	return finish(nir, kb, err, errlen);
+}
+
+/*
+ * Compile in a forked child and read the result back through a pipe. Mesa's structurizer
+ * crashes on some shapes of huge kernels (nondeterministically: its pointer sets follow ASLR),
+ * and a JIT inside an application must not take the process down. NVCUDA_NO_FORK=1 compiles
+ * in-process (debugging).
+ */
+static bool write_all(int fd, const void *p, size_t n)
+{
+	while (n) {
+		ssize_t w = write(fd, p, n);
+
+		if (w <= 0)
+			return false;
+		p = (const char *)p + w;
+		n -= w;
+	}
+	return true;
+}
+
+static bool read_all(int fd, void *p, size_t n)
+{
+	while (n) {
+		ssize_t r = read(fd, p, n);
+
+		if (r <= 0)
+			return false;
+		p = (char *)p + r;
+		n -= r;
+	}
+	return true;
+}
+
+static struct nvc_kernel_bin *compile_ptx_forked(const char *ptx, const char *entry, uint64_t globals_va,
+						 const struct nvc_ptx_opts *po, char *err, size_t errlen)
+{
+	struct nvc_kernel_bin *kb = NULL;
+	struct cache_hdr h;
+	int fds[2], status;
+	pid_t pid;
+
+	if (getenv("NVCUDA_NO_FORK"))
+		return compile_ptx_once(ptx, entry, globals_va, po, err, errlen);
+	if (pipe(fds))
+		return compile_ptx_once(ptx, entry, globals_va, po, err, errlen);
+	pid = fork();
+	if (pid < 0) {
+		close(fds[0]);
+		close(fds[1]);
+		return compile_ptx_once(ptx, entry, globals_va, po, err, errlen);
+	}
+	if (pid == 0) {	/* child: compile, write header + info + params + code (+ the error text on failure) */
+		char cerr[256] = "";
+		struct nvc_kernel_bin *ckb;
+
+		close(fds[0]);
+		signal(SIGPIPE, SIG_IGN);
+		ckb = compile_ptx_once(ptx, entry, globals_va, po, cerr, sizeof(cerr));
+		if (!ckb) {
+			memset(&h, 0, sizeof(h));
+			memcpy(h.magic, "NVCFAIL!", 8);
+			write_all(fds[1], &h, sizeof(h));
+			write_all(fds[1], cerr, sizeof(cerr));
+			_exit(1);
+		}
+		h = (struct cache_hdr){ CACHE_MAGIC, sizeof(struct nak_shader_info), ckb->code_size, ckb->shared_static,
+					ckb->shared_hidden, ckb->max_threads, ckb->nparams, ckb->param_bytes,
+					ckb->used_regmem };
+		write_all(fds[1], &h, sizeof(h));
+		write_all(fds[1], ckb->info, h.info_size);
+		write_all(fds[1], ckb->params, sizeof(ckb->params[0]) * ckb->nparams);
+		write_all(fds[1], ckb->code, ckb->code_size);
+		_exit(0);
+	}
+	close(fds[1]);
+	if (!read_all(fds[0], &h, sizeof(h))) {
+		set_err(err, errlen, "the compiler crashed");
+	} else if (!memcmp(h.magic, "NVCFAIL!", 8)) {
+		char cerr[256];
+
+		if (read_all(fds[0], cerr, sizeof(cerr)))
+			set_err(err, errlen, cerr);
+	} else if (!memcmp(h.magic, CACHE_MAGIC, 8) && h.info_size == sizeof(struct nak_shader_info) &&
+		   h.nparams <= NVC_MAX_PARAMS) {
+		kb = calloc(1, sizeof(*kb));
+		if (kb) {
+			kb->info = malloc(h.info_size);
+			kb->code = malloc(h.code_size ? h.code_size : 1);
+			if (!kb->info || !kb->code || !read_all(fds[0], kb->info, h.info_size) ||
+			    !read_all(fds[0], kb->params, sizeof(kb->params[0]) * h.nparams) ||
+			    (h.code_size && !read_all(fds[0], kb->code, h.code_size))) {
+				nvc_kernel_bin_free(kb);
+				kb = NULL;
+				set_err(err, errlen, "the compiler crashed while writing its result");
+			} else {
+				kb->code_size = h.code_size;
+				kb->shared_static = h.shared_static;
+				kb->shared_hidden = h.shared_hidden;
+				kb->max_threads = h.max_threads;
+				kb->nparams = h.nparams;
+				kb->param_bytes = h.param_bytes;
+				kb->used_regmem = h.pad;
+			}
+		}
+	} else {
+		set_err(err, errlen, "garbled compiler result");
+	}
+	close(fds[0]);
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+		;
+	return kb;
+}
+
+/*
+ * NAK does not survive every shape the structurizer makes of a huge kernel. Try the default
+ * build first; if it fails, registers in scratch (a different shape), then no outlining.
+ */
+static struct nvc_kernel_bin *compile_ptx(const char *ptx, const char *entry, uint64_t globals_va, char *err, size_t errlen)
+{
+	static const struct nvc_ptx_opts tries[] = { { -1, -1 }, { -1, 1 }, { 0, -1 }, { 0, 1 } };
+	struct nvc_kernel_bin *kb = NULL;
+	unsigned int i;
+
+	for (i = 0; i < sizeof(tries) / sizeof(tries[0]) && !kb; i++) {
+		if (i && getenv("NVCUDA_DEBUG"))
+			fprintf(stderr, "nvcuda: %s: retrying (outline %d, regmem %d): %s\n", entry, tries[i].outline,
+				tries[i].regmem, err);
+		if (i && strstr(err, "ptx line"))
+			break;	/* the PTX itself is the problem */
+		kb = compile_ptx_forked(ptx, entry, globals_va, &tries[i], err, errlen);
+		if (!kb && strstr(err, "crashed"))	/* the crash follows the address layout: once more as is */
+			kb = compile_ptx_forked(ptx, entry, globals_va, &tries[i], err, errlen);
+	}
+	return kb;
 }
 
 struct nvc_kernel_bin *nvc_compile_spirv(const uint32_t *words, size_t nwords, const char *entry, char *err,

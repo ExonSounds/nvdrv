@@ -887,10 +887,32 @@ not used.
         sparse per-block value set in NAK's liveness (in `cuda/mesa/nak-standalone.patch`). Generic memory
         accesses are now branch-free (three guarded accesses + select; dummy slots at NVC_DUMMY_VA, shared 0 and
         scratch 0 absorb the inactive ones) so they add no blocks.
-      - **Cycles 5.2.3: 72 of 75 kernels compile** (95 MB of code, up to 16 KB of local memory per thread,
-        35 min for all of them once). Left: `integrator_shade_shadow`, `integrator_shade_volume`,
-        `integrator_intersect_mnee`, which exceed 24 GB later in NAK after 5-14 minutes; shade_shadow is needed
-        for every render.
+      - **Huge kernels, second round (2026-11-10).** Cycles' shading kernels inline the SVM evaluator: with plain
+        inlining `integrator_shade_shadow` was 15.5M NIR instructions (one 39 KB noise function inlined 595
+        times; the evaluator 7 times). Three mechanisms in the front end (`src/ptx.c`):
+        1. **Outlining**: functions that full inlining would copy often or large (static instance counts over the
+           call graph: inst >= 2 and inst x size >= 256 KB, or inst >= 8 and size >= 8 KB) are emitted once.
+           A call copies its arguments into the function's fixed `.param` slots, sets a return-site id and
+           jumps; `ret` jumps to a dispatch that branches back to the site. shade_shadow: 1.2M instructions.
+           `NVCUDA_OUTLINE=0|all` overrides.
+        2. **Caller-save** at outlined calls (SSA mode): the caller's registers live after the call go to its
+           function's save area, from a real dataflow liveness over each function's PTX blocks
+           (`compute_liveness`; block boundaries where the emitter puts them: labels, branches, calls, predicated
+           statements, atomics). Without it the union of all sites' live values flowed through the shared body.
+        3. **Memory mode** (`regmem`, chosen when a kernel inlines > 4 MB of PTX; `NVCUDA_REGMEM=0|1`): PTX
+           registers that are live across blocks live in scratch, SSA only within a block (loaded at first use,
+           dirty values stored at the block's jump). Registers with disjoint block ranges share slots (greedy by
+           first block). nvcc defines ~1100 registers early that stay live to the end, which NAK's spiller cannot
+           take at 20K+ blocks; this is what a spiller would do, done up front. shade_shadow: 27 s, 5.1 MB of
+           code, 24 KB of local memory per thread (saxpy loses 30 % in this mode; small kernels never use it).
+        Plus: unreachable blocks (dead labels) are removed before structurizing; every compile runs in a forked
+        child with a retry ladder (default -> memory mode -> no outlining), because Mesa's `nir_lower_goto_ifs`
+        crashes on some shapes of these kernels (`loop_routing_end` -> `nir_handle_add_jump`, nondeterministic:
+        its pointer sets follow ASLR; the sanitizer build `build/asan/` showed it) and NAK's `from_nir` panics on
+        others. A JIT inside an application must not take it down.
+      - **Cycles 5.2.3: all 75 kernels compile** (631 s for all once, cached afterwards; 95 MB of code; up to
+        30 KB of local memory per thread, about 1.5 GB of VRAM for local memory at full occupancy). 10 kernels
+        use memory mode, 3 needed a retry. Not run on the GPU yet (needs Blender).
       - `tests/blender-cycles.sh <blender-dir>` renders the default scene with Cycles on nvcuda headless
         (sets the shipped sm_86 cubin aside so Cycles loads its PTX). Not run yet: Blender's binary is a
         downloaded executable.

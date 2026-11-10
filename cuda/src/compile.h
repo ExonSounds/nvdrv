@@ -27,6 +27,7 @@ struct nvc_kernel_bin {
 	uint32_t shared_static;		/* static shared memory the launch allocates */
 	uint32_t shared_hidden;		/* of which nvcuda's own (dummy slots), not the kernel's */
 	uint32_t max_threads;		/* .maxntid / .reqntid, 0 = none */
+	bool used_regmem;		/* PTX: registers were kept in scratch */
 	uint32_t nparams, param_bytes;
 	struct { uint32_t offset, size; } params[NVC_MAX_PARAMS];
 };

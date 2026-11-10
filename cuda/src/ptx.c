@@ -51,6 +51,7 @@ enum tok { T_EOF, T_ID, T_INT, T_FLT, T_HEXF, T_STR, T_P };
 
 struct lex {
 	const char *src, *p;
+	const char *tok;	/* start of the current token */
 	int line;
 	enum tok t;
 	char s[256];		/* identifier / directive / string text */
@@ -65,7 +66,11 @@ struct lex {
 /* one function being emitted: the entry, or an inlined callee */
 struct frame {
 	struct hash_table *regs, *labels, *syms;
+	uint32_t regbase;	/* memory mode: this frame's register area in scratch */
 	nir_block *ret;		/* where ret goes (the impl's end block for the entry) */
+	struct pfunc *fn;	/* whose body this frame emits */
+	bool boundary;		/* an outlined body or the entry: callers below are not part of it */
+	size_t call_pos;	/* position in fn's body of the call being inlined from this frame */
 };
 
 /* a .func of the module */
@@ -73,6 +78,40 @@ struct pfunc {
 	const char *hdr;	/* just after ".func" */
 	int line;
 	bool has_body;
+	const char *body_end;
+	uint32_t instances;	/* inlined copies emitted (NVCUDA_CALLSTATS) */
+	const char *name;
+	/* static call graph (prescan) and the outlining decision (decide_outlining) */
+	const char **calls;
+	int ncalls, maxcalls;
+	uint32_t inst;		/* how many copies full inlining would make */
+	bool reachable, visiting, visited, outlined;
+	/*
+	 * Outlined: the body is emitted once, at the first call. Parameters and return values live
+	 * at fixed scratch offsets; a call copies its arguments in, sets retid to its site number
+	 * and jumps to entry; ret jumps to the dispatch, which jumps back to the site.
+	 */
+	bool emitted;
+	struct psym **params, **rets;
+	int nparams, nrets;
+	nir_block *entry_blk, *ret_blk;
+	nir_variable *retid;
+	nir_block **sites;
+	int nsites, maxsites;
+	/* register liveness (compute_liveness), for caller-save at outlined calls */
+	bool liv_done;
+	struct hash_table *regidx;	/* register name -> index */
+	int nregs;
+	size_t *callpos;		/* its call statements, and the registers live after each */
+	uint64_t *call_live;
+	uint64_t *crossblock;		/* registers live into some block */
+	uint32_t *slot_off;		/* memory mode: scratch slot of each cross-block register (by index) */
+	uint8_t *regsize;		/* bytes per register index (0: not declared) */
+	uint32_t maxsizes;
+	uint32_t regs_bytes;		/* size of the register area a frame of this function needs */
+	int ncallpos;
+	uint32_t save_bytes, save_off;	/* this function's save area (one per function) */
+	bool save_alloc;
 };
 
 struct ctx {
@@ -86,6 +125,20 @@ struct ctx {
 	nir_builder b;
 	struct hash_table *modsyms;	/* module-scope variables */
 	struct hash_table *funcs;	/* name -> struct pfunc */
+	struct pfunc entry_fn;		/* the entry's call list */
+	struct pfunc *cur_fn;		/* whose body prescan_shared is scanning */
+	struct pfunc **outlined;	/* for the dispatch blocks at the end */
+	int noutlined, maxoutlined;
+	bool static_mode;		/* allocations are permanent (an outlined body's own) */
+	int static_depth;		/* the outlined body's frame; nested inlined frames use the stack */
+	size_t stmt_pos;		/* position of the statement being emitted in its body */
+	bool regmem;			/* registers crossing blocks live in scratch (big kernels) */
+	uint32_t cache_gen;		/* bumped at every block switch */
+	struct preg **dirty;		/* registers written in the current block */
+	int ndirty, maxdirty;
+	uint64_t est_bytes;		/* PTX text the kernel inlines (decide_outlining) */
+	struct nvc_ptx_opts po;
+	uint32_t floor;			/* scratch below this is permanent */
 	struct frame frames[MAX_DEPTH + 1];
 	int depth;
 	struct nvc_kernel_bin *kb;
@@ -102,6 +155,11 @@ struct ctx {
 
 static void inline_call(struct ctx *c, char rets[][256], int nrets, const char *fname, char args[][256], int nargs);
 static void parse_params(struct ctx *c);
+static uint32_t alloc_local(struct ctx *c, uint32_t size, uint32_t align);
+static void compute_liveness(struct ctx *c, struct pfunc *f);
+struct pfunc;
+struct psym;
+static void call_outlined(struct ctx *c, struct pfunc *f, struct psym **bind, int nrets, int nargs);
 
 static void __attribute__((noreturn, format(printf, 2, 3))) fail(struct ctx *c, const char *fmt, ...)
 {
@@ -147,6 +205,7 @@ static void next(struct ctx *c)
 		}
 		break;
 	}
+	l->tok = p;
 	if (!*p) {
 		l->t = T_EOF;
 		l->p = p;
@@ -318,8 +377,15 @@ static unsigned reg_bits(struct ptype t)
 /* ---- symbols: registers, labels, variables ---- */
 
 struct preg {
-	nir_variable *var;
+	nir_variable *var;	/* SSA mode: the register is a variable (vars_to_ssa) */
 	unsigned bits;		/* 1 for predicates */
+	/* memory mode (regmem): registers that cross blocks live in scratch; within a block the
+	 * value is cached in SSA and dirty values are stored at the block's jump */
+	bool in_mem;
+	uint32_t off;
+	nir_def *cached;
+	uint32_t cache_gen;
+	bool dirty;
 };
 
 enum space { SP_NONE, SP_PARAM, SP_SHARED, SP_LOCAL, SP_GLOBAL, SP_CONST };
@@ -358,10 +424,89 @@ static void declare_reg(struct ctx *c, const char *name, struct ptype t)
 			fail(c, "register %s redeclared with another size", name);
 		return;
 	}
-	r = ralloc(c->mem, struct preg);
+	r = rzalloc(c->mem, struct preg);
 	r->bits = bits;
-	r->var = nir_local_variable_create(c->impl, gt, name);
+	if (c->regmem) {
+		struct pfunc *f = frame(c)->fn;
+		struct hash_entry *e = f && f->regidx ? _mesa_hash_table_search(f->regidx, name) : NULL;
+
+		if (e) {
+			uint32_t idx = (uint32_t)(uintptr_t)e->data;
+
+			if (f->crossblock[idx / 64] & (1ull << (idx % 64)) && f->slot_off[idx] != ~0u) {
+				r->in_mem = true;
+				r->off = frame(c)->regbase + f->slot_off[idx];
+			}
+		}
+		/* registers used within single blocks only: SSA through the block cache, never stored */
+		r->var = NULL;
+		r->cache_gen = ~0u;
+	} else {
+		r->var = nir_local_variable_create(c->impl, gt, name);
+	}
 	_mesa_hash_table_insert(frame(c)->regs, ralloc_strdup(c->mem, name), r);
+}
+
+/* memory mode: the register's current value in this block */
+static nir_def *reg_get(struct ctx *c, struct preg *r)
+{
+	nir_builder *b = &c->b;
+	unsigned bits = r->bits == 1 ? 8 : r->bits;
+	nir_def *v;
+
+	if (r->cache_gen == c->cache_gen && r->cached)
+		return r->cached;
+	if (!r->in_mem)	/* read before any write in this block: undefined in PTX too */
+		v = nir_imm_intN_t(b, 0, bits);
+	else
+		v = nir_load_scratch(b, 1, bits, nir_imm_int(b, r->off), .align_mul = bits / 8);
+	if (r->bits == 1)
+		v = nir_ine_imm(b, v, 0);
+	r->cached = v;
+	r->cache_gen = c->cache_gen;
+	r->dirty = false;
+	return v;
+}
+
+static void reg_set(struct ctx *c, struct preg *r, nir_def *v)
+{
+	if (r->cache_gen != c->cache_gen || !r->dirty) {
+		if (c->ndirty == c->maxdirty) {
+			c->maxdirty = c->maxdirty ? c->maxdirty * 2 : 256;
+			c->dirty = reralloc(c->mem, c->dirty, struct preg *, c->maxdirty);
+		}
+		c->dirty[c->ndirty++] = r;
+	}
+	r->cached = v;
+	r->cache_gen = c->cache_gen;
+	r->dirty = true;
+}
+
+/* store the block's dirty registers (before its jump) and start a new block cache */
+static void flush_regs(struct ctx *c)
+{
+	nir_builder *b = &c->b;
+	int i;
+
+	for (i = 0; i < c->ndirty; i++) {
+		struct preg *r = c->dirty[i];
+
+		if (r->cache_gen == c->cache_gen && r->dirty && r->in_mem) {
+			nir_def *v = r->cached;
+
+			if (r->bits == 1)
+				v = nir_b2i8(b, v);
+			nir_store_scratch(b, v, nir_imm_int(b, r->off), .write_mask = 1, .align_mul = v->bit_size / 8);
+		}
+		r->dirty = false;
+	}
+	c->ndirty = 0;
+}
+
+static void new_block_cache(struct ctx *c)
+{
+	c->cache_gen++;
+	c->ndirty = 0;
 }
 
 /* the frame's own variables first, then the module's */
@@ -399,7 +544,14 @@ static uint32_t alloc_local(struct ctx *c, uint32_t size, uint32_t align)
 	c->local_top = off + size;
 	if (c->local_top > c->local_max)
 		c->local_max = c->local_top;
+	if (c->static_mode && c->depth == c->static_depth)
+		c->floor = c->local_top;
 	return off;
+}
+
+static uint32_t pop_local(struct ctx *c, uint32_t saved)
+{
+	return saved > c->floor ? saved : c->floor;
 }
 
 static uint32_t align_up(uint32_t v, uint32_t a)
@@ -430,10 +582,26 @@ static nir_block *label_block(struct ctx *c, const char *name)
 	return blk;
 }
 
+static void new_block_cache(struct ctx *c);
+static void flush_regs(struct ctx *c);
+
 static void switch_to(struct ctx *c, nir_block *blk)
 {
 	c->b.cursor = nir_after_block(blk);
 	c->terminated = false;
+	new_block_cache(c);
+}
+
+static void jump(struct ctx *c, nir_block *target)
+{
+	flush_regs(c);
+	nir_goto(&c->b, target);
+}
+
+static void jump_if(struct ctx *c, nir_block *target, nir_def *cond, nir_block *fall)
+{
+	flush_regs(c);
+	nir_goto_if(&c->b, target, cond, fall);
 }
 
 /* ---- operands ---- */
@@ -648,7 +816,7 @@ static nir_def *rd(struct ctx *c, const struct opnd *o, struct ptype t)
 	case O_REG: {
 		struct preg *r = find_reg(c, o->name);
 
-		v = nir_load_var(b, r->var);
+		v = c->regmem ? reg_get(c, r) : nir_load_var(b, r->var);
 		if (t.cls == TC_PRED) {
 			if (v->bit_size != 1)
 				v = nir_ine_imm(b, v, 0);
@@ -706,7 +874,10 @@ static void wr(struct ctx *c, const struct opnd *o, nir_def *v, struct ptype t)
 			v = nir_b2iN(b, v, r->bits);
 		v = convert_int(b, v, r->bits, t.cls == TC_S);
 	}
-	nir_store_var(b, r->var, v, 1);
+	if (c->regmem)
+		reg_set(c, r, v);
+	else
+		nir_store_var(b, r->var, v, 1);
 }
 
 /* ---- memory ---- */
@@ -738,7 +909,7 @@ static enum space resolve_mem(struct ctx *c, const struct opnd *m, enum space is
 	if (isp == SP_CONST)
 		isp = SP_GLOBAL;
 	if (m->mem_reg)
-		base = nir_load_var(b, find_reg(c, m->name)->var);
+		base = c->regmem ? reg_get(c, find_reg(c, m->name)) : nir_load_var(b, find_reg(c, m->name)->var);
 	if (isp == SP_GLOBAL || isp == SP_NONE)
 		*addr = base ? nir_iadd_imm(b, nir_u2u64(b, base), m->u) : nir_imm_int64(b, m->u);
 	else
@@ -832,13 +1003,13 @@ static nir_def *access_generic(struct ctx *c, nir_def *addr, const struct mop *m
 		nir_block *sh = new_block(c), *gl = new_block(c), *join = new_block(c);
 		nir_variable *res = nir_local_variable_create(c->impl, glsl_uintN_t_type(m->bits), "generic_atomic");
 
-		nir_goto_if(b, sh, is_sh, gl);
+		jump_if(c, sh, is_sh, gl);
 		b->cursor = nir_after_block(sh);
 		nir_store_var(b, res, access_space(c, SP_SHARED, off, m), 1);
-		nir_goto(b, join);
+		jump(c, join);
 		b->cursor = nir_after_block(gl);
 		nir_store_var(b, res, access_space(c, SP_GLOBAL, addr, m), 1);
-		nir_goto(b, join);
+		jump(c, join);
 		switch_to(c, join);
 		return nir_load_var(b, res);
 	}
@@ -1166,7 +1337,7 @@ static void emit_insn(struct ctx *c, struct insn *in)
 				wr(c, &o[0].vec[i], nir_imm_int(b, 0), dt);
 			return;
 		}
-		handle = nir_u2u32(b, nir_load_var(b, find_reg(c, mem->name)->var));
+		handle = nir_u2u32(b, c->regmem ? reg_get(c, find_reg(c, mem->name)) : nir_load_var(b, find_reg(c, mem->name)->var));
 		for (i = 0; i < ncoord; i++) {
 			comps[i] = rd(c, &mem->vec[i], ct);
 			if (fetch && ct.cls == TC_F)
@@ -1529,6 +1700,7 @@ static void emit_statement(struct ctx *c)
 	bool has_pred = false;
 	nir_block *then = NULL, *join = NULL;
 
+	c->stmt_pos = frame(c)->fn && frame(c)->fn->hdr ? (size_t)(c->lx.tok - frame(c)->fn->hdr) : 0;
 	if (accept(c, '@')) {
 		parse_operand(c, &pred);
 		has_pred = true;
@@ -1573,12 +1745,12 @@ static void emit_statement(struct ctx *c)
 		if (has_pred) {
 			then = new_block(c);
 			join = new_block(c);
-			nir_goto_if(&c->b, then, rd(c, &pred, (struct ptype){ TC_PRED, 1 }), join);
+			jump_if(c, then, rd(c, &pred, (struct ptype){ TC_PRED, 1 }), join);
 			switch_to(c, then);
 		}
 		inline_call(c, rets, nrets, fname, args, nargs);
 		if (has_pred) {
-			nir_goto(&c->b, join);
+			jump(c, join);
 			switch_to(c, join);
 		}
 		return;
@@ -1596,10 +1768,10 @@ static void emit_statement(struct ctx *c)
 		target = label_block(c, in.ops[0].name);
 		if (has_pred) {
 			fall = new_block(c);
-			nir_goto_if(&c->b, target, rd(c, &pred, (struct ptype){ TC_PRED, 1 }), fall);
+			jump_if(c, target, rd(c, &pred, (struct ptype){ TC_PRED, 1 }), fall);
 			switch_to(c, fall);
 		} else {
-			nir_goto(&c->b, target);
+			jump(c, target);
 			c->terminated = true;
 		}
 		return;
@@ -1612,10 +1784,10 @@ static void emit_statement(struct ctx *c)
 		if (has_pred) {
 			nir_block *fall = new_block(c);
 
-			nir_goto_if(&c->b, target, rd(c, &pred, (struct ptype){ TC_PRED, 1 }), fall);
+			jump_if(c, target, rd(c, &pred, (struct ptype){ TC_PRED, 1 }), fall);
 			switch_to(c, fall);
 		} else {
-			nir_goto(&c->b, target);
+			jump(c, target);
 			c->terminated = true;
 		}
 		return;
@@ -1623,12 +1795,12 @@ static void emit_statement(struct ctx *c)
 	if (has_pred) {
 		then = new_block(c);
 		join = new_block(c);
-		nir_goto_if(&c->b, then, rd(c, &pred, (struct ptype){ TC_PRED, 1 }), join);
+		jump_if(c, then, rd(c, &pred, (struct ptype){ TC_PRED, 1 }), join);
 		switch_to(c, then);
 	}
 	emit_insn(c, &in);
 	if (has_pred) {
-		nir_goto(&c->b, join);
+		jump(c, join);
 		switch_to(c, join);
 	}
 }
@@ -1727,7 +1899,7 @@ static void parse_body(struct ctx *c)
 		if (accept(c, '}')) {
 			if (!scope)
 				break;
-			c->local_top = scope_top[--scope];	/* the scope's .param/.local variables die */
+			c->local_top = pop_local(c, scope_top[--scope]);	/* the scope's .param/.local variables die */
 			continue;
 		}
 		if (accept(c, '{')) {	/* nested scope (nvcc: one per call); names stay visible */
@@ -1772,7 +1944,7 @@ static void parse_body(struct ctx *c)
 		}
 		/* label? */
 		if (c->lx.t == T_ID && c->lx.s[0] != '@') {
-			const char *save_p = c->lx.p;
+			const char *save_p = c->lx.p, *save_tok = c->lx.tok;
 			int save_line = c->lx.line;
 			char name[256];
 
@@ -1782,12 +1954,13 @@ static void parse_body(struct ctx *c)
 				nir_block *blk = label_block(c, name);
 
 				if (!c->terminated)
-					nir_goto(&c->b, blk);
+					jump(c, blk);
 				switch_to(c, blk);
 				continue;
 			}
 			/* not a label: rewind to the opcode */
 			c->lx.p = save_p;
+			c->lx.tok = save_tok;
 			c->lx.line = save_line;
 			c->lx.t = T_ID;
 			snprintf(c->lx.s, sizeof(c->lx.s), "%s", name);
@@ -1795,7 +1968,7 @@ static void parse_body(struct ctx *c)
 		emit_statement(c);
 	}
 	if (!c->terminated)
-		nir_goto(&c->b, frame(c)->ret);
+		jump(c, frame(c)->ret);
 }
 
 /*
@@ -1832,13 +2005,24 @@ static void inline_call(struct ctx *c, char rets[][256], int nrets, const char *
 			fail(c, "argument %s is not a .param variable (registers as arguments are not supported)", args[i]);
 		n++;
 	}
+	if (f->outlined) {
+		call_outlined(c, f, bind, nrets, nargs);
+		return;
+	}
 	ret = new_block(c);
+	f->instances++;
+	frame(c)->call_pos = c->stmt_pos;
+	if (c->regmem)
+		compute_liveness(c, f);
 	c->depth++;
 	fr = frame(c);
 	fr->regs = new_table(c);
 	fr->labels = new_table(c);
 	fr->syms = new_table(c);
 	fr->ret = ret;
+	fr->fn = f;
+	fr->boundary = false;
+	fr->regbase = c->regmem && f->regs_bytes ? alloc_local(c, f->regs_bytes, 8) : 0;
 	c->lx.p = f->hdr;
 	c->lx.line = f->line;
 	next(c);
@@ -1886,15 +2070,918 @@ static void inline_call(struct ctx *c, char rets[][256], int nrets, const char *
 		next(c);
 	parse_body(c);
 	c->depth--;
-	c->local_top = saved_top;
+	c->local_top = pop_local(c, saved_top);
 	c->lx = saved;
 	switch_to(c, ret);
+}
+
+/* ---- outlined functions ---- */
+
+/* scratch -> scratch copy of a .param value (32-bit words, then bytes) */
+static void copy_scratch(struct ctx *c, uint32_t dst, uint32_t src, uint32_t size)
+{
+	nir_builder *b = &c->b;
+	uint32_t off = 0;
+
+	for (; off + 4 <= size; off += 4) {
+		nir_def *v = nir_load_scratch(b, 1, 32, nir_imm_int(b, src + off), .align_mul = 4);
+
+		nir_store_scratch(b, v, nir_imm_int(b, dst + off), .write_mask = 1, .align_mul = 4);
+	}
+	for (; off < size; off++) {
+		nir_def *v = nir_load_scratch(b, 1, 8, nir_imm_int(b, src + off), .align_mul = 1);
+
+		nir_store_scratch(b, v, nir_imm_int(b, dst + off), .write_mask = 1, .align_mul = 1);
+	}
+}
+
+/* Parse the header once: fixed scratch slots for the return values and parameters. */
+static void outline_prepare(struct ctx *c, struct pfunc *f)
+{
+	struct lex saved = c->lx;
+	bool saved_static = c->static_mode;
+	char name[256];
+	uint32_t size, al;
+	bool unsized;
+
+	if (f->params)
+		return;
+	c->static_mode = true;
+	{
+		int sd = c->static_depth;
+
+		c->static_depth = c->depth;
+		c->local_top = c->local_top > c->floor ? c->local_top : c->floor;
+		(void)sd;
+	}
+	c->lx.p = f->hdr;
+	c->lx.line = f->line;
+	next(c);
+	f->rets = ralloc_array(c->mem, struct psym *, 8);
+	f->params = ralloc_array(c->mem, struct psym *, 40);
+	if (accept(c, '(')) {
+		do {
+			if (!is_id(c, ".param") || f->nrets == 8)
+				fail(c, "%s: return values", f->name);
+			next(c);
+			parse_var(c, name, sizeof(name), &size, &al, &unsized, NULL);
+			f->rets[f->nrets++] = add_sym_to(c, c->modsyms, "", SP_LOCAL, alloc_local(c, size, al), size);
+		} while (accept(c, ','));
+		expect(c, ')');
+	}
+	expect_id(c);
+	if (accept(c, '(') && !accept(c, ')')) {
+		do {
+			if (!is_id(c, ".param") || f->nparams == 40)
+				fail(c, "%s: parameters", f->name);
+			next(c);
+			parse_var(c, name, sizeof(name), &size, &al, &unsized, NULL);
+			f->params[f->nparams++] = add_sym_to(c, c->modsyms, "", SP_LOCAL, alloc_local(c, size, al), size);
+		} while (accept(c, ','));
+		expect(c, ')');
+	}
+	f->retid = nir_local_variable_create(c->impl, glsl_uint_type(), "retid");
+	f->entry_blk = new_block(c);
+	f->ret_blk = new_block(c);
+	c->floor = c->local_top;	/* the slots stay */
+	c->static_mode = saved_static;
+	c->lx = saved;
+	if (c->noutlined == c->maxoutlined) {
+		c->maxoutlined = c->maxoutlined ? c->maxoutlined * 2 : 32;
+		c->outlined = reralloc(c->mem, c->outlined, struct pfunc *, c->maxoutlined);
+	}
+	c->outlined[c->noutlined++] = f;
+}
+
+/* Emit the body once, in its own frame, with its .param names bound to the fixed slots. */
+static void outline_emit(struct ctx *c, struct pfunc *f)
+{
+	struct lex saved = c->lx;
+	nir_cursor saved_cursor = c->b.cursor;
+	bool saved_term = c->terminated, saved_static = c->static_mode;
+	uint32_t saved_top = c->local_top;
+	int saved_sdepth = c->static_depth;
+	struct frame *fr;
+	char name[256];
+	uint32_t size, al;
+	bool unsized;
+	int i;
+
+	if (c->depth == MAX_DEPTH)
+		fail(c, "calls nested deeper than %d (recursion?)", MAX_DEPTH);
+	f->emitted = true;
+	c->static_mode = true;
+	c->static_depth = c->depth + 1;	/* the body's frame; its inlined callees stack above it */
+	c->local_top = c->local_top > c->floor ? c->local_top : c->floor;
+	frame(c)->call_pos = c->stmt_pos;
+	if (c->regmem)
+		compute_liveness(c, f);
+	c->depth++;
+	fr = frame(c);
+	fr->regs = new_table(c);
+	fr->labels = new_table(c);
+	fr->syms = new_table(c);
+	fr->ret = f->ret_blk;
+	fr->fn = f;
+	fr->boundary = true;
+	fr->regbase = c->regmem && f->regs_bytes ? alloc_local(c, f->regs_bytes, 8) : 0;
+	c->lx.p = f->hdr;
+	c->lx.line = f->line;
+	next(c);
+	i = 0;
+	if (accept(c, '(')) {
+		do {
+			next(c);	/* .param */
+			parse_var(c, name, sizeof(name), &size, &al, &unsized, NULL);
+			_mesa_hash_table_insert(fr->syms, ralloc_strdup(c->mem, name), f->rets[i++]);
+		} while (accept(c, ','));
+		expect(c, ')');
+	}
+	expect_id(c);
+	i = 0;
+	if (accept(c, '(') && !accept(c, ')')) {
+		do {
+			next(c);
+			parse_var(c, name, sizeof(name), &size, &al, &unsized, NULL);
+			_mesa_hash_table_insert(fr->syms, ralloc_strdup(c->mem, name), f->params[i++]);
+		} while (accept(c, ','));
+		expect(c, ')');
+	}
+	while (!is_p(c, '{') && c->lx.t != T_EOF)
+		next(c);
+	switch_to(c, f->entry_blk);
+	parse_body(c);
+	c->depth--;
+	/* everything the body and its inlined callees used stays reserved (runs at any stack depth) */
+	c->floor = c->local_max;
+	c->static_mode = saved_static;
+	c->static_depth = saved_sdepth;
+	c->local_top = pop_local(c, saved_top);
+	c->lx = saved;
+	c->b.cursor = saved_cursor;
+	c->terminated = saved_term;
+}
+
+/*
+ * Register liveness of a function body: statements are classified (registers read and written,
+ * labels, branches, calls, returns), split into basic blocks, and a backward dataflow gives the
+ * registers live after each call statement. Registers are the '%' tokens; an instruction's
+ * destinations are the tokens before its first top-level comma (none for st, red, bar, ...).
+ */
+enum skind { S_OTHER, S_LABEL, S_BRA, S_RET, S_CALL };
+
+struct pstmt {
+	uint8_t kind;
+	bool pred;
+	bool split;		/* the emitter puts a block boundary before and after it (predicated non-branch, atomics) */
+	size_t pos;
+	int label;		/* S_LABEL: its index; S_BRA: the target's */
+	uint32_t *rd, *wr;
+	uint16_t nrd, nwr;
+};
+
+struct pblock {
+	int first, last;	/* statements */
+	int succ[2], nsucc;
+};
+
+static bool no_dest(const char *op)
+{
+	static const char *const ops[] = { "st", "red", "bar", "barrier", "bra", "brx", "call", "ret", "exit", "trap",
+					   "membar", "fence", "prefetch", "prefetchu", "discard", "applypriority",
+					   "setmaxnreg" };
+
+	for (unsigned i = 0; i < sizeof(ops) / sizeof(ops[0]); i++)
+		if (!strcmp(op, ops[i]))
+			return true;
+	return false;
+}
+
+static uint32_t name_index(struct ctx *c, struct hash_table *t, const char *name)
+{
+	struct hash_entry *e = _mesa_hash_table_search(t, name);
+
+	if (e)
+		return (uint32_t)(uintptr_t)e->data;
+	_mesa_hash_table_insert(t, ralloc_strdup(c->mem, name), (void *)(uintptr_t)t->entries);
+	return t->entries - 1;
+}
+
+#define BITS_WORDS(n)	(((n) + 63) / 64)
+
+/* register name -> size in bytes (from its .reg declaration), kept as the index table's twin */
+static void reg_size_set(struct ctx *c, struct pfunc *f, const char *name, unsigned bytes)
+{
+	uint32_t idx = name_index(c, f->regidx, name);
+
+	if (idx >= f->maxsizes) {
+		uint32_t n = f->maxsizes ? f->maxsizes * 2 : 1024;
+
+		while (n <= idx)
+			n *= 2;
+		f->regsize = reralloc(c->mem, f->regsize, uint8_t, n);
+		memset(f->regsize + f->maxsizes, 0, n - f->maxsizes);
+		f->maxsizes = n;
+	}
+	f->regsize[idx] = bytes;
+}
+
+static void compute_liveness(struct ctx *c, struct pfunc *f)
+{
+	struct lex saved = c->lx;
+	struct hash_table *labels = new_table(c);
+	struct pstmt *st = NULL;
+	struct pblock *bl = NULL;
+	int nst = 0, maxst = 0, nbl = 0, i, depth = 0, nregs, nw;
+	uint64_t *use, *def, *in, *out, *live;
+	int *label_block;
+
+	if (f->liv_done)
+		return;
+	f->liv_done = true;
+	f->regidx = new_table(c);
+	c->lx.p = f->hdr;
+	c->lx.line = f->line;
+	next(c);
+	while (!is_p(c, '{') && c->lx.t != T_EOF)
+		next(c);
+	/* 1. statements */
+	do {
+		uint32_t rd[64], wr[16];
+		int nrd = 0, nwr = 0, brace = 0;
+		struct pstmt *sp;
+		char op[64] = "";
+		bool dest_zone;
+
+		if (c->lx.t == T_EOF)
+			fail(c, "unterminated function");
+		if (is_p(c, '{')) {
+			depth++;
+			next(c);
+			continue;
+		}
+		if (is_p(c, '}')) {
+			depth--;
+			next(c);
+			continue;
+		}
+		if (c->lx.t == T_ID && c->lx.s[0] == '.') {	/* a directive: no register reads */
+			if (is_id(c, ".loc")) {
+				int line = c->lx.line;
+
+				while (c->lx.t != T_EOF && c->lx.line == line)
+					next(c);
+			} else if (is_id(c, ".reg")) {	/* register sizes, for the scratch slots */
+				struct ptype t = { TC_B, 32 };
+
+				next(c);
+				if (c->lx.t == T_ID && c->lx.s[0] == '.')
+					parse_type(c->lx.s + 1, &t);
+				while (!is_p(c, ';') && c->lx.t != T_EOF) {
+					if (c->lx.t == T_ID && c->lx.s[0] == '%') {
+						char base[256];
+						unsigned bytes = t.cls == TC_PRED ? 1 : (t.bits < 16 ? 16 : t.bits) / 8;
+
+						snprintf(base, sizeof(base), "%s", c->lx.s);
+						next(c);
+						if (accept(c, '<')) {
+							uint64_t n = expect_int(c), k;
+
+							expect(c, '>');
+							for (k = 0; k < n; k++) {
+								char full[300];
+
+								snprintf(full, sizeof(full), "%s%u", base, (unsigned)k);
+								reg_size_set(c, f, full, bytes);
+							}
+						} else {
+							reg_size_set(c, f, base, bytes);
+						}
+						continue;
+					}
+					next(c);
+				}
+				accept(c, ';');
+			} else {
+				while (!is_p(c, ';') && !is_p(c, '}') && c->lx.t != T_EOF)
+					next(c);
+				accept(c, ';');
+			}
+			continue;
+		}
+		if (nst == maxst) {
+			maxst = maxst ? maxst * 2 : 256;
+			st = reralloc(c->mem, st, struct pstmt, maxst);
+		}
+		sp = &st[nst];
+		memset(sp, 0, sizeof(*sp));
+		sp->pos = c->lx.tok - f->hdr;
+		if (accept(c, '@')) {
+			accept(c, '!');
+			if (c->lx.t == T_ID)
+				rd[nrd++] = name_index(c, f->regidx, c->lx.s);
+			next(c);
+			sp->pred = true;
+		}
+		if (c->lx.t != T_ID) {
+			next(c);
+			continue;
+		}
+		snprintf(op, sizeof(op), "%.63s", c->lx.s);
+		next(c);
+		if (accept(c, ':')) {
+			sp->kind = S_LABEL;
+			sp->label = name_index(c, labels, op);
+			nst++;
+			continue;
+		}
+		{
+			char *dot = strchr(op, '.');
+
+			if (dot)
+				*dot = 0;
+		}
+		if (!strcmp(op, "bra")) {
+			sp->kind = S_BRA;
+			if (c->lx.t == T_ID)
+				sp->label = name_index(c, labels, c->lx.s);
+		} else if (!strcmp(op, "ret") || !strcmp(op, "exit")) {
+			sp->kind = S_RET;
+		} else if (!strcmp(op, "call")) {
+			sp->kind = S_CALL;
+		}
+		sp->split = (sp->pred && sp->kind != S_BRA) || !strcmp(op, "atom") || !strcmp(op, "red");
+		dest_zone = !no_dest(op);
+		while (!is_p(c, ';') && c->lx.t != T_EOF) {
+			if (is_p(c, '{') || is_p(c, '['))
+				brace++;
+			else if (is_p(c, '}') || is_p(c, ']'))
+				brace--;
+			else if (is_p(c, ',') && brace == 0)
+				dest_zone = false;
+			else if (c->lx.t == T_ID && c->lx.s[0] == '%') {
+				uint32_t idx = name_index(c, f->regidx, c->lx.s);
+
+				if (dest_zone && nwr < 16)
+					wr[nwr++] = idx;
+				else if (!dest_zone && nrd < 64)
+					rd[nrd++] = idx;
+			}
+			next(c);
+		}
+		accept(c, ';');
+		if (nrd) {
+			sp->rd = ralloc_array(c->mem, uint32_t, nrd);
+			memcpy(sp->rd, rd, nrd * 4);
+			sp->nrd = nrd;
+		}
+		if (nwr) {
+			sp->wr = ralloc_array(c->mem, uint32_t, nwr);
+			memcpy(sp->wr, wr, nwr * 4);
+			sp->nwr = nwr;
+		}
+		nst++;
+	} while (depth);
+	c->lx = saved;
+	nregs = f->regidx->entries;
+	nw = BITS_WORDS(nregs);
+
+	/* 2. blocks: a new one at every label and after every branch or return */
+	bl = ralloc_array(c->mem, struct pblock, nst + 1);
+	label_block = ralloc_array(c->mem, int, labels->entries + 1);
+	for (i = 0; i <= (int)labels->entries; i++)
+		label_block[i] = -1;
+	for (i = 0; i < nst; i++) {
+		/* the emitter's block boundaries: labels, after branches/returns/calls, around split statements */
+		bool start = i == 0 || st[i].kind == S_LABEL || st[i - 1].kind == S_BRA || st[i - 1].kind == S_RET ||
+			     st[i - 1].kind == S_CALL || st[i - 1].split || st[i].split;
+
+		if (start) {
+			bl[nbl].first = i;
+			bl[nbl].nsucc = 0;
+			if (nbl)
+				bl[nbl - 1].last = i - 1;
+			nbl++;
+		}
+		if (st[i].kind == S_LABEL)
+			label_block[st[i].label] = nbl - 1;
+	}
+	if (nbl)
+		bl[nbl - 1].last = nst - 1;
+	for (i = 0; i < nbl; i++) {
+		struct pstmt *last = &st[bl[i].last];
+
+		if (last->kind == S_RET)
+			continue;
+		if (last->kind == S_BRA) {
+			if (label_block[last->label] >= 0)
+				bl[i].succ[bl[i].nsucc++] = label_block[last->label];
+			if (!last->pred)
+				continue;
+		}
+		if (i + 1 < nbl)
+			bl[i].succ[bl[i].nsucc++] = i + 1;
+	}
+
+	/* 3. use/def per block, then live-in/out to a fixpoint */
+	use = rzalloc_array(c->mem, uint64_t, (size_t)nbl * nw);
+	def = rzalloc_array(c->mem, uint64_t, (size_t)nbl * nw);
+	in = rzalloc_array(c->mem, uint64_t, (size_t)nbl * nw);
+	out = rzalloc_array(c->mem, uint64_t, (size_t)nbl * nw);
+	for (i = 0; i < nbl; i++) {
+		uint64_t *u = use + (size_t)i * nw, *d = def + (size_t)i * nw;
+		int k, j;
+
+		for (k = bl[i].first; k <= bl[i].last; k++) {
+			for (j = 0; j < st[k].nrd; j++) {
+				uint32_t r = st[k].rd[j];
+
+				if (!(d[r / 64] & (1ull << (r % 64))))
+					u[r / 64] |= 1ull << (r % 64);
+			}
+			for (j = 0; j < st[k].nwr; j++) {
+				uint32_t r = st[k].wr[j];
+
+				d[r / 64] |= 1ull << (r % 64);
+			}
+		}
+	}
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (i = nbl - 1; i >= 0; i--) {
+			uint64_t *o = out + (size_t)i * nw, *n = in + (size_t)i * nw;
+			int k, w;
+
+			for (k = 0; k < bl[i].nsucc; k++) {
+				uint64_t *si = in + (size_t)bl[i].succ[k] * nw;
+
+				for (w = 0; w < nw; w++)
+					o[w] |= si[w];
+			}
+			for (w = 0; w < nw; w++) {
+				uint64_t v = use[(size_t)i * nw + w] | (o[w] & ~def[(size_t)i * nw + w]);
+
+				if (v != n[w]) {
+					n[w] = v;
+					changed = true;
+				}
+			}
+		}
+	}
+
+	/* registers live into any block cross blocks (memory mode keeps them in scratch) */
+	f->crossblock = rzalloc_array(c->mem, uint64_t, nw);
+	for (i = 0; i < nbl; i++) {
+		int w;
+
+		for (w = 0; w < nw; w++)
+			f->crossblock[w] |= in[(size_t)i * nw + w];
+	}
+
+	/*
+	 * Scratch slots for them: a register's live range is the block range [lo, hi] over the
+	 * blocks where it is live-in, used or defined; registers with disjoint ranges share a
+	 * slot (greedy by lo, per size class).
+	 */
+	{
+		int *lo = ralloc_array(c->mem, int, nregs + 1), *hi = ralloc_array(c->mem, int, nregs + 1);
+		uint32_t *order = ralloc_array(c->mem, uint32_t, nregs + 1);
+		struct { uint32_t off; int busy_until; } *slots = NULL;
+		int nslots = 0, maxslots = 0, r, k, j, no = 0;
+		uint32_t top = 0;
+
+		f->slot_off = ralloc_array(c->mem, uint32_t, nregs + 1);
+		for (r = 0; r < nregs; r++) {
+			lo[r] = nbl;
+			hi[r] = -1;
+			f->slot_off[r] = ~0u;
+		}
+		for (i = 0; i < nbl; i++) {
+			uint64_t *n = in + (size_t)i * nw, *u = use + (size_t)i * nw, *d = def + (size_t)i * nw;
+			int w;
+
+			for (w = 0; w < nw; w++) {
+				uint64_t bits = n[w] | u[w] | d[w];
+
+				while (bits) {
+					int bit = __builtin_ctzll(bits);
+
+					r = w * 64 + bit;
+					bits &= bits - 1;
+					if (r >= nregs)
+						break;
+					if (i < lo[r])
+						lo[r] = i;
+					if (i > hi[r])
+						hi[r] = i;
+				}
+			}
+		}
+		/* sort cross-block registers by lo (counting sort over blocks) */
+		{
+			int *cnt = rzalloc_array(c->mem, int, nbl + 2);
+
+			for (r = 0; r < nregs; r++)
+				if ((f->crossblock[r / 64] & (1ull << (r % 64))) && hi[r] >= 0)
+					cnt[lo[r] + 1]++;
+			for (i = 0; i < nbl; i++)
+				cnt[i + 1] += cnt[i];
+			for (r = 0; r < nregs; r++)
+				if ((f->crossblock[r / 64] & (1ull << (r % 64))) && hi[r] >= 0)
+					order[cnt[lo[r]]++] = r, no++;
+			for (k = 0; k < no; k++) {
+				unsigned bytes;
+
+				r = order[k];
+				bytes = r < (int)f->maxsizes && f->regsize[r] ? f->regsize[r] : 8;
+				for (j = 0; j < nslots; j++)
+					if (slots[j].busy_until < lo[r] && (slots[j].off % bytes) == 0 &&
+					    (j + 1 == nslots || slots[j + 1].off - slots[j].off >= bytes))
+						break;
+				if (j == nslots) {
+					if (nslots == maxslots) {
+						maxslots = maxslots ? maxslots * 2 : 256;
+						slots = reralloc(c->mem, slots, __typeof__(*slots), maxslots);
+					}
+					top = (top + bytes - 1) / bytes * bytes;
+					slots[nslots].off = top;
+					top += bytes;
+					nslots++;
+				}
+				slots[j].busy_until = hi[r];
+				f->slot_off[r] = slots[j].off;
+			}
+		}
+		f->regs_bytes = (top + 7) & ~7u;
+		if (getenv("NVCUDA_REGSTATS"))
+			fprintf(stderr, "regstats %u blocks %u regs %u cross %u slots %u bytes %s\n", nbl, nregs, no, nslots,
+				f->regs_bytes, f->name ? f->name : "entry");
+	}
+
+	/* 4. live after each call: walk its block backwards from live-out */
+	f->ncallpos = 0;
+	for (i = 0; i < nst; i++)
+		f->ncallpos += st[i].kind == S_CALL;
+	f->callpos = ralloc_array(c->mem, size_t, f->ncallpos + 1);
+	f->call_live = rzalloc_array(c->mem, uint64_t, (size_t)(f->ncallpos + 1) * nw);
+	f->nregs = nregs;
+	live = ralloc_array(c->mem, uint64_t, nw);
+	{
+		int ci = 0;
+
+		for (i = 0; i < nbl; i++) {
+			int k, j, w;
+
+			memcpy(live, out + (size_t)i * nw, nw * 8);
+			for (k = bl[i].last; k >= bl[i].first; k--) {
+				if (st[k].kind == S_CALL) {	/* calls are numbered in text order: fill by position */
+					f->callpos[ci] = st[k].pos;
+					memcpy(f->call_live + (size_t)ci * nw, live, nw * 8);
+					ci++;
+				}
+				for (j = 0; j < st[k].nwr; j++)
+					live[st[k].wr[j] / 64] &= ~(1ull << (st[k].wr[j] % 64));
+				for (j = 0; j < st[k].nrd; j++)
+					live[st[k].rd[j] / 64] |= 1ull << (st[k].rd[j] % 64);
+			}
+			(void)w;
+		}
+		f->ncallpos = ci;
+	}
+}
+
+/* is register @name live after the call statement at @pos in f's body? */
+static bool reg_live_after(struct pfunc *f, const char *name, size_t pos)
+{
+	struct hash_entry *e = _mesa_hash_table_search(f->regidx, name);
+	uint32_t r;
+	int i;
+
+	if (!e)
+		return false;
+	r = (uint32_t)(uintptr_t)e->data;
+	for (i = 0; i < f->ncallpos; i++)
+		if (f->callpos[i] == pos)
+			return f->call_live[(size_t)i * BITS_WORDS(f->nregs) + r / 64] & (1ull << (r % 64));
+	if (getenv("NVCUDA_DEBUG")) {
+		fprintf(stderr, "nvcuda: liveness: no call at %zu in %s (%d calls:", pos, f->name ? f->name : "entry", f->ncallpos);
+		for (i = 0; i < f->ncallpos && i < 8; i++)
+			fprintf(stderr, " %zu", f->callpos[i]);
+		fprintf(stderr, ")\n");
+	}
+	return true;	/* not a call position we know: keep it (conservative) */
+}
+
+struct saved_reg {
+	nir_variable *var;
+	uint32_t off;
+	unsigned bits;
+};
+
+/*
+ * Caller-save around an outlined call: the registers of every frame down to the nearest
+ * boundary that are live after the call go to their function's save area (one area per
+ * function: a function runs one call at a time, and no recursion). Keeps callers' values out
+ * of the shared body, where the union over all sites would be live.
+ */
+static struct saved_reg *caller_save(struct ctx *c, int *count)
+{
+	nir_builder *b = &c->b;
+	struct saved_reg *list = NULL;
+	int n = 0, max = 0, k;
+
+	for (k = c->depth; k >= 0; k--) {
+		struct frame *fr = &c->frames[k];
+		struct pfunc *f = fr->fn;
+		size_t pos = k == c->depth ? c->stmt_pos : fr->call_pos;
+		uint32_t off = 0;
+
+		if (!f || !f->hdr)
+			break;
+		compute_liveness(c, f);
+		hash_table_foreach(fr->regs, e) {
+			struct preg *r = e->data;
+			unsigned bytes = r->bits == 1 ? 1 : r->bits / 8;
+
+			if (!reg_live_after(f, e->key, pos))
+				continue;
+			off = (off + bytes - 1) / bytes * bytes;
+			if (n == max) {
+				max = max ? max * 2 : 64;
+				list = reralloc(c->mem, list, struct saved_reg, max);
+			}
+			list[n].var = r->var;
+			list[n].off = off;
+			list[n].bits = r->bits;
+			n++;
+			off += bytes;
+		}
+		if (!f->save_alloc) {	/* size the area over every call in the body, plus slack */
+			int i;
+
+			for (i = 0; i < f->ncallpos; i++) {
+				uint32_t o = 0;
+
+				hash_table_foreach(fr->regs, e2) {
+					struct preg *r = e2->data;
+					unsigned bytes = r->bits == 1 ? 1 : r->bits / 8;
+
+					if (!reg_live_after(f, e2->key, f->callpos[i]))
+						continue;
+					o = (o + bytes - 1) / bytes * bytes + bytes;
+				}
+				if (o > f->save_bytes)
+					f->save_bytes = o;
+			}
+			f->save_bytes += 64;
+		}
+		if (off > f->save_bytes)
+			fail(c, "%s: save area too small (%u > %u)", f->name ? f->name : "entry", off, f->save_bytes);
+		if (fr->boundary)
+			break;
+	}
+	/* allocate the areas (permanent) and emit the stores */
+	for (k = 0; k < n; k++) {
+		struct frame *fr;
+		struct pfunc *f = NULL;
+		nir_def *v;
+		int d;
+
+		/* find the frame this variable belongs to: walk again (cheap enough) */
+		for (d = c->depth; d >= 0; d--) {
+			fr = &c->frames[d];
+			if (fr->regs && _mesa_hash_table_search(fr->regs, list[k].var->name) &&
+			    ((struct preg *)_mesa_hash_table_search(fr->regs, list[k].var->name)->data)->var == list[k].var) {
+				f = fr->fn;
+				break;
+			}
+			if (fr->boundary)
+				break;
+		}
+		if (!f)
+			fail(c, "caller-save: frame not found");
+		if (!f->save_alloc) {
+			c->local_top = c->local_top > c->floor ? c->local_top : c->floor;
+			f->save_off = alloc_local(c, f->save_bytes ? f->save_bytes : 1, 8);
+			c->floor = c->local_top;
+			f->save_alloc = true;
+		}
+		list[k].off += f->save_off;
+		v = nir_load_var(b, list[k].var);
+		if (list[k].bits == 1)
+			v = nir_b2i8(b, v);
+		nir_store_scratch(b, v, nir_imm_int(b, list[k].off), .write_mask = 1, .align_mul = v->bit_size / 8);
+	}
+	*count = n;
+	return list;
+}
+
+static void caller_restore(struct ctx *c, struct saved_reg *list, int n)
+{
+	nir_builder *b = &c->b;
+	int k;
+
+	for (k = 0; k < n; k++) {
+		unsigned bits = list[k].bits == 1 ? 8 : list[k].bits;
+		nir_def *v = nir_load_scratch(b, 1, bits, nir_imm_int(b, list[k].off), .align_mul = bits / 8);
+
+		if (list[k].bits == 1)
+			v = nir_ine_imm(b, v, 0);
+		nir_store_var(b, list[k].var, v, 1);
+	}
+}
+
+/* A call of an outlined function: arguments in, retid, jump; return values out at the site. */
+static void call_outlined(struct ctx *c, struct pfunc *f, struct psym **bind, int nrets, int nargs)
+{
+	nir_builder *b = &c->b;
+	nir_block *cont;
+	int i;
+
+	struct saved_reg *saved;
+	int nsaved;
+
+	outline_prepare(c, f);
+	if (nrets != f->nrets || nargs != f->nparams)
+		fail(c, "%s: %d/%d return values, %d/%d arguments", f->name, nrets, f->nrets, nargs, f->nparams);
+	if (!f->emitted) {
+		size_t pos = c->stmt_pos;	/* the body's statements overwrite it */
+
+		flush_regs(c);			/* the body's blocks start a new cache */
+		outline_emit(c, f);
+		c->stmt_pos = pos;
+	}
+	saved = c->regmem ? NULL : caller_save(c, &nsaved);
+	if (c->regmem)
+		nsaved = 0;
+	for (i = 0; i < nargs; i++)
+		copy_scratch(c, f->params[i]->offset, bind[nrets + i]->offset,
+			     bind[nrets + i]->size < f->params[i]->size ? bind[nrets + i]->size : f->params[i]->size);
+	cont = new_block(c);
+	if (f->nsites == f->maxsites) {
+		f->maxsites = f->maxsites ? f->maxsites * 2 : 16;
+		f->sites = reralloc(c->mem, f->sites, nir_block *, f->maxsites);
+	}
+	f->sites[f->nsites] = cont;
+	nir_store_var(b, f->retid, nir_imm_int(b, f->nsites), 1);
+	f->nsites++;
+	jump(c, f->entry_blk);
+	switch_to(c, cont);
+	caller_restore(c, saved, nsaved);
+	for (i = 0; i < nrets; i++)
+		copy_scratch(c, bind[i]->offset, f->rets[i]->offset,
+			     bind[i]->size < f->rets[i]->size ? bind[i]->size : f->rets[i]->size);
+}
+
+/*
+ * Blocks nothing jumps to (labels never branched to, outlined bodies whose calls were all in
+ * dead code) would keep a goto the structurizer never visits, and NAK then finds a jump with no
+ * target. Walk the gotos from the start block and unlink the rest.
+ */
+static void remove_unreachable_blocks(struct ctx *c)
+{
+	nir_function_impl *impl = c->impl;
+	unsigned int n = 0, i, top = 0;
+	nir_block **stack, **blocks;
+	bool *seen;
+
+	nir_foreach_block_unstructured(block, impl)
+		n++;
+	blocks = calloc(n, sizeof(*blocks));
+	stack = calloc(n + 1, sizeof(*stack));
+	seen = calloc(n, sizeof(*seen));
+	i = 0;
+	nir_foreach_block_unstructured(block, impl) {
+		block->index = i;
+		blocks[i++] = block;
+	}
+	seen[nir_start_block(impl)->index] = true;
+	stack[top++] = nir_start_block(impl);
+	while (top) {
+		nir_block *b = stack[--top];
+		nir_instr *last = nir_block_last_instr(b);
+		nir_jump_instr *j = last && last->type == nir_instr_type_jump ? nir_instr_as_jump(last) : NULL;
+		nir_block *t[2] = { NULL, NULL };
+		int k;
+
+		if (j && j->type == nir_jump_goto) {
+			t[0] = j->target;
+		} else if (j && j->type == nir_jump_goto_if) {
+			t[0] = j->target;
+			t[1] = j->else_target;
+		}
+		for (k = 0; k < 2; k++)
+			if (t[k] && !seen[t[k]->index]) {
+				seen[t[k]->index] = true;
+				stack[top++] = t[k];
+			}
+	}
+	for (i = 0; i < n; i++) {
+		if (seen[i] || blocks[i] == impl->end_block)
+			continue;
+		nir_foreach_instr_safe(instr, blocks[i])
+			nir_instr_remove(instr);
+		exec_node_remove(&blocks[i]->cf_node.node);
+	}
+	free(blocks);
+	free(stack);
+	free(seen);
+}
+
+/* After everything: each outlined function's ret dispatches on retid. */
+static void emit_dispatch(struct ctx *c)
+{
+	nir_builder *b = &c->b;
+	int i, k;
+
+	for (i = 0; i < c->noutlined; i++) {
+		struct pfunc *f = c->outlined[i];
+
+		if (!f->emitted)
+			continue;
+		switch_to(c, f->ret_blk);
+		for (k = 0; k < f->nsites; k++) {
+			nir_block *next = new_block(c);
+
+			jump_if(c, f->sites[k], nir_ieq_imm(b, nir_load_var(b, f->retid), k), next);
+			switch_to(c, next);
+		}
+		jump(c, c->impl->end_block);	/* not reached */
+	}
+}
+
+/*
+ * Which functions to emit once instead of inlining: those full inlining would copy often or
+ * large (a path tracer's noise functions: 39 KB of PTX x 595 copies). Static instance counts
+ * over the call graph in topological order; an outlined function counts as one copy for its
+ * callees. NVCUDA_OUTLINE=0 inlines everything, =all outlines every called function.
+ */
+static void topo_visit(struct ctx *c, struct pfunc *f, struct pfunc **order, int *n)
+{
+	int i;
+
+	if (f->visited)
+		return;
+	if (f->visiting)
+		fail(c, "recursion through %s", f->name ? f->name : "the entry");
+	f->visiting = true;
+	for (i = 0; i < f->ncalls; i++) {
+		struct hash_entry *e = _mesa_hash_table_search(c->funcs, f->calls[i]);
+
+		if (e)
+			topo_visit(c, e->data, order, n);
+	}
+	f->visiting = false;
+	f->visited = true;
+	order[(*n)++] = f;	/* callees first */
+}
+
+static void decide_outlining(struct ctx *c)
+{
+	const char *env = getenv("NVCUDA_OUTLINE");
+	struct pfunc **order = ralloc_array(c->mem, struct pfunc *, c->funcs->entries + 1);
+	int n = 0, i, k;
+	bool none = c->po.outline == 0 || (c->po.outline < 0 && env && !strcmp(env, "0"));
+	bool all = c->po.outline < 0 && env && !strcmp(env, "all");
+	topo_visit(c, &c->entry_fn, order, &n);
+	c->entry_fn.inst = 1;
+	for (i = n - 1; i >= 0; i--) {	/* callers first */
+		struct pfunc *f = order[i];
+		uint32_t eff;
+
+		if (f != &c->entry_fn && f->inst) {
+			size_t size = f->body_end ? (size_t)(f->body_end - f->hdr) : 0;
+
+			f->outlined = !none && (all || (f->inst >= 2 && ((uint64_t)f->inst * size >= 256 * 1024 ||
+									(f->inst >= 8 && size >= 8 * 1024))));
+		}
+		eff = f->outlined ? 1 : f->inst;
+		if (f != &c->entry_fn && f->body_end)
+			c->est_bytes += (uint64_t)eff * (size_t)(f->body_end - f->hdr);
+		for (k = 0; k < f->ncalls; k++) {
+			struct hash_entry *e = _mesa_hash_table_search(c->funcs, f->calls[k]);
+
+			if (e)
+				((struct pfunc *)e->data)->inst += eff;
+		}
+	}
 }
 
 /*
  * Static .shared variables of a body (cursor on its '{'), so dynamic (extern) shared memory can
  * start after all of them. Every function's body is scanned, whether or not it is called.
  */
+static void add_call(struct ctx *c, struct pfunc *f, const char *callee)
+{
+	if (!f)
+		return;
+	if (f->ncalls == f->maxcalls) {
+		f->maxcalls = f->maxcalls ? f->maxcalls * 2 : 16;
+		f->calls = reralloc(c->mem, f->calls, const char *, f->maxcalls);
+	}
+	f->calls[f->ncalls++] = ralloc_strdup(c->mem, callee);
+}
+
 static void prescan_shared(struct ctx *c)
 {
 	int depth = 0;
@@ -1906,6 +2993,18 @@ static void prescan_shared(struct ctx *c)
 			depth++;
 		} else if (is_p(c, '}')) {
 			depth--;
+		} else if (c->lx.t == T_ID && (!strcmp(c->lx.s, "call") || !strncmp(c->lx.s, "call.", 5))) {
+			/* call[.uni] [(rets),] name ...: the static call graph */
+			next(c);
+			if (accept(c, '(')) {
+				while (!is_p(c, ')') && c->lx.t != T_EOF)
+					next(c);
+				expect(c, ')');
+				accept(c, ',');
+			}
+			if (c->lx.t == T_ID)
+				add_call(c, c->cur_fn, c->lx.s);
+			continue;
 		} else if (is_id(c, ".shared")) {
 			char name[256];
 			uint32_t size, al;
@@ -2068,7 +3167,9 @@ static void scan_module(struct ctx *c, const char *entry, const char **body, int
 				}
 				*body = c->lx.p - 1;
 				*body_line = c->lx.line;
+				c->cur_fn = &c->entry_fn;
 				prescan_shared(c);
+				c->cur_fn = NULL;
 			} else {
 				while (!is_p(c, '{') && !is_p(c, ';') && c->lx.t != T_EOF)
 					next(c);
@@ -2102,15 +3203,20 @@ static void scan_module(struct ctx *c, const char *entry, const char **body, int
 			f = e ? e->data : NULL;
 			if (is_p(c, '{')) {	/* a definition replaces a declaration */
 				if (!f) {
-					f = ralloc(c->mem, struct pfunc);
+					f = rzalloc(c->mem, struct pfunc);
 					_mesa_hash_table_insert(c->funcs, ralloc_strdup(c->mem, name), f);
 				}
 				f->hdr = hdr;
 				f->line = line;
 				f->has_body = true;
+				f->name = ralloc_strdup(c->mem, name);
+				f->ncalls = 0;	/* a declaration may have been scanned first */
+				c->cur_fn = f;
 				prescan_shared(c);
+				c->cur_fn = NULL;
+				f->body_end = c->lx.p;
 			} else if (!f) {
-				f = ralloc(c->mem, struct pfunc);
+				f = rzalloc(c->mem, struct pfunc);
 				f->hdr = hdr;
 				f->line = line;
 				f->has_body = false;
@@ -2258,7 +3364,8 @@ static void parse_params(struct ctx *c)
 }
 
 nir_shader *nvc_ptx_build(const char *src, const char *entry, const nir_shader_compiler_options *opts,
-			  struct nvc_kernel_bin *kb, uint64_t globals_va, char *err, size_t errlen)
+			  struct nvc_kernel_bin *kb, uint64_t globals_va, const struct nvc_ptx_opts *po, char *err,
+			  size_t errlen)
 {
 	struct ctx *c = ctx_new(src, err, errlen);
 	nir_shader *nir = NULL;
@@ -2271,6 +3378,8 @@ nir_shader *nvc_ptx_build(const char *src, const char *entry, const nir_shader_c
 		return NULL;
 	c->kb = kb;
 	c->globals_va = globals_va;
+	c->po = *po;
+	kb->used_regmem = false;
 	if (setjmp(c->fail)) {
 		if (nir)
 			ralloc_free(nir);
@@ -2292,13 +3401,50 @@ nir_shader *nvc_ptx_build(const char *src, const char *entry, const nir_shader_c
 	c->nir = nir;
 	c->b = nir_builder_at(nir_after_block(nir_start_block(c->impl)));
 	c->frames[0].ret = c->impl->end_block;
+	c->frames[0].fn = &c->entry_fn;
+	c->frames[0].boundary = true;
+	c->entry_fn.hdr = body;
+	c->entry_fn.line = body_line;
+	decide_outlining(c);
+	{
+		/*
+		 * Memory mode for big kernels: NAK's spiller cannot handle ~1000 values live across
+		 * tens of thousands of blocks; 8 MB of inlined PTX is about where that starts.
+		 */
+		const char *rm = getenv("NVCUDA_REGMEM");
+
+		if (c->po.regmem >= 0)
+			c->regmem = c->po.regmem;
+		else
+			c->regmem = rm ? rm[0] != '0' : c->est_bytes > (4u << 20);
+		if (c->regmem) {
+			compute_liveness(c, &c->entry_fn);
+			c->frames[0].regbase = c->entry_fn.regs_bytes ? alloc_local(c, c->entry_fn.regs_bytes, 8) : 0;
+		}
+		kb->used_regmem = c->regmem;
+		if (getenv("NVCUDA_STATS"))
+			fprintf(stderr, "nvcuda: %s: inlines %llu KB of PTX, registers in %s\n", entry,
+				(unsigned long long)(c->est_bytes >> 10), c->regmem ? "scratch" : "SSA");
+	}
 	c->lx.p = body;
 	c->lx.line = body_line;
 	next(c);
 	parse_body(c);
+	emit_dispatch(c);
+	remove_unreachable_blocks(c);
 	nir->info.shared_size = c->shared_size;
 	nir->scratch_size = c->local_max;
 	nir->info.workgroup_size_variable = true;
+	if (getenv("NVCUDA_CALLSTATS")) {	/* inlining: instances x body size per function */
+		hash_table_foreach(c->funcs, e) {
+			struct pfunc *f = e->data;
+
+			if (f->instances || f->emitted)
+				fprintf(stderr, "callstats %u %zu %s%s\n", f->instances,
+					f->body_end ? (size_t)(f->body_end - f->hdr) : 0, f->name,
+					f->emitted ? " (outlined)" : "");
+		}
+	}
 out:
 	ctx_free(c);
 	return nir;
