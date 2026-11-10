@@ -278,8 +278,8 @@ Each phase has a test in `tests/` that runs over SSH and is safe to repeat (`pha
   renderer fails on `eglQueryDevicesEXT`). Hyprland then modesets DP-1 at 2560x1440@60 with three XR24 LINEAR
   buffers and page flips on the vblank timer. Missing gamma/HDR properties are logged and ignored. The user's
   monitor rule asks for @180 (AOC Q27G42XE), which nvdrv does not offer yet.
-  - **Pitfall:** after a DRM master (modetest) exits, the CRTC stays disabled and fbdev does not restore it on
-    its own; a VT switch does (`chvt`).
+  - **Pitfall (solved, see "fbdev restore" under Display):** after a DRM master (modetest) exited, the CRTC stayed
+    disabled until a VT switch.
   - GSP-RM's OS_ERROR_LOG explains the core exception: `CMDre ... 00002004 00000041 00000004` = method 0x2004
     HEAD_SET_CONTROL_OUTPUT_RESOURCE, data 0x41 (0x49 with -vsync), error 4. The modeset still applies; the field
     combination needs checking against what RM expects for DP (nvkms programs the same bits, so maybe it is
@@ -646,7 +646,11 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       ~3.5 s after the AOC entered real standby (retrain fails until the 4th attempt's full bring-up re-probes the
       sink). Not the driver: AUX answers at once and the first retrain succeeds, then the AOC drops off AUX
       during the first modeset while it re-identifies (as after mode changes); waiting for AUX first did not help.
-- [ ] fbdev restore after the last DRM master closes; mode changes through a real per-commit modeset path.
+- [x] **fbdev restore after the last DRM master closes; mode changes per commit** (checked 2026-11-10). With the
+      DRM client setup, lastclose restores the fbdev configuration. Mode changes are atomic commits through the
+      head modeset path (DP stream check, retries). Test: `modetest -M nouveau -s 41@39:2560x1440-60` switches
+      180 → 60 Hz, and on exit the console is back at 180 Hz on the fbdev framebuffer (CRTC active, plane-0 fb
+      44) without a VT switch.
 
 ### Power, thermals, stability
 - [x] **Sensors (public interfaces only)** (`src/sensors.c`, 2026-11-09): GPU temperature through hwmon
