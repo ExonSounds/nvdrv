@@ -740,6 +740,8 @@ int nv_fifo_init(struct nvdrv_dev *nv);
 int nv_ce_test(struct nvdrv_dev *nv);
 int nv_gr_test(struct nvdrv_dev *nv);
 int nv_ce_fault_test(struct nvdrv_dev *nv);
+int nv_fifo_engine_find(struct nvdrv_dev *nv, u32 rm_type, u32 *runlist, u32 *rl_base, u32 *desc);
+int nv_video_test(struct nvdrv_dev *nv);
 int nv_gr_chan_preempt(struct nvdrv_dev *nv, struct nv_chan *ch, u32 gfxp, u32 cilp);
 int nv_ce_recover(struct nvdrv_dev *nv, const char *why);
 void nv_uapi_device_lost(struct nvdrv_dev *nv, const char *why);

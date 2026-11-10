@@ -516,7 +516,11 @@ void nv_vmm_client_fini(struct nvdrv_dev *nv, struct nv_vmm *vm)
 int nv_chid_get(struct nvdrv_dev *nv)
 {
 	unsigned long *map = nv->fifo.chids;
-	int chid = find_next_zero_bit(map, 128, 1);
+	/*
+	 * Never CHID_CE/CHID_GR, even before the kernel channels exist (they come up on first
+	 * use and take their fixed chids then; the USERD slot is per chid).
+	 */
+	int chid = find_next_zero_bit(map, 128, CHID_GR + 1);
 
 	if (chid >= 128)
 		return -ENOSPC;
@@ -587,6 +591,40 @@ static int ce_pick(struct nvdrv_dev *nv, u32 *runlist, u32 *ce, u32 *rl_base)
 	}
 	if (!ret)
 		dev_info(&nv->pdev->dev, "fifo: using CE%u on runlist %u (GR runlist %u)\n", *ce, *runlist, gr_runlist);
+	kfree(t);
+	return ret;
+}
+
+/*
+ * The device info table entry of RM engine type @rm_type (rm_engine_type.h): its runlist,
+ * runlist PRI base and engine descriptor (ENGINE_INFO_TYPE_ENG_DESC, the key of the
+ * constructed-falcon table).
+ */
+int nv_fifo_engine_find(struct nvdrv_dev *nv, u32 rm_type, u32 *runlist, u32 *rl_base, u32 *desc)
+{
+	struct nv_gsp_static_info *si = &nv->gsp_info;
+	u8 *t;
+	u32 n, i;
+	int ret;
+
+	t = kzalloc(3212, GFP_KERNEL);
+	if (!t)
+		return -ENOMEM;
+	ret = nv_rm_control(nv, si->h_internal_client, si->h_internal_subdevice,
+			    NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE, t, 3212);
+	n = ret ? 0 : le32_to_cpu(*(__le32 *)(t + 4));
+	ret = ret ?: -ENODEV;
+	for (i = 0; i < n && i < 32; i++) {
+		const __le32 *data = (const __le32 *)(t + 12 + i * 100);
+
+		if (le32_to_cpu(data[ENGINE_INFO_TYPE_RM_ENGINE_TYPE]) != rm_type)
+			continue;
+		*runlist = le32_to_cpu(data[ENGINE_INFO_TYPE_RUNLIST]);
+		*rl_base = le32_to_cpu(data[ENGINE_INFO_TYPE_RUNLIST_PRI_BASE]);
+		*desc = le32_to_cpu(data[0]);	/* ENGINE_INFO_TYPE_ENG_DESC */
+		ret = 0;
+		break;
+	}
 	kfree(t);
 	return ret;
 }

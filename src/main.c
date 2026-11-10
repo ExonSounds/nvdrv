@@ -725,6 +725,20 @@ static ssize_t ce_fault_write(struct file *f, const char __user *buf, size_t cou
 	return ret ?: count;
 }
 
+/* debugfs video_test: an engine-executed semaphore through NVDEC0 and NVENC0 (src/video.c) */
+static ssize_t video_test_write(struct file *f, const char __user *buf, size_t count, loff_t *ppos)
+{
+	int ret = nv_video_test(f->private_data);
+
+	return ret ?: count;
+}
+
+static const struct file_operations video_test_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = video_test_write,
+};
+
 static int preempt_show(struct seq_file *m, void *v)
 {
 	nv_uapi_preempt_show(m->private, m);
@@ -840,6 +854,7 @@ static void nv_debugfs_init(struct nvdrv_dev *nv)
 		debugfs_create_file("ce_test", 0200, nv->dbg, nv, &ce_test_fops);
 		debugfs_create_file("gr_test", 0200, nv->dbg, nv, &gr_test_fops);
 		debugfs_create_file("ce_fault", 0200, nv->dbg, nv, &ce_fault_fops);
+		debugfs_create_file("video_test", 0200, nv->dbg, nv, &video_test_fops);
 		debugfs_create_file("gpu_lost", 0200, nv->dbg, nv, &gpu_lost_fops);
 		debugfs_create_file("pm_test", 0200, nv->dbg, nv, &pm_test_fops);
 		debugfs_create_file("gpu_reset", 0200, nv->dbg, nv, &gpu_reset_fops);

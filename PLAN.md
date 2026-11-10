@@ -384,7 +384,7 @@ contexts, nouveau uAPI subset for Mesa NVK (`nvk=1`), Zink GL, zero-copy scanout
 **Status (2026-11-09):** every to-do item that needs no display checking is done (per-object fences and async
 VM_BIND, 2 MiB pages, GPU recovery, sparse binding, preemption buffers, clean unload), and on the display side
 hardware vblank, hardware cursor, gamma/CTM, block-linear scanout, tearing flips, VRR, DPMS and hotplug. Left:
-multi-monitor, NVDEC/NVENC (items marked ▶ first). Switching between nvdrv
+multi-monitor, NVDEC/NVENC userspace (items marked ▶ first). Switching between nvdrv
 and NVIDIA's driver: "Switching drivers" under Hardware workflow.
 
 **Long-term goal (user, 2026-11-09): make the whole driver independent of nouveau.** Today nvdrv leans on it in
@@ -738,6 +738,21 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
 
 ### Hardware blocks not used yet
 - [ ] **NVDEC** (H.264/HEVC/VP9/AV1 decode) and **NVENC** channels for Vulkan Video / VA-API paths.
+      - [x] Kernel side (2026-11-10, `src/video.c`, following nouveau's MIT r535/r570 code):
+        - NVDEC0 (RM type 0x1d → NV2080 0x13, runlist 3, class NVC7B0) and NVENC0 (0x25 → 0x1b, runlist 6,
+          NVC7B7). Each test builds a channel in its own RM client and VM.
+        - The context size comes from `GPU_GET_CONSTRUCTED_FALCON_INFO` (r570 0x208001b0; the r535 INTERNAL
+          0x20800a42 returns INVALID_ARGUMENT) and is 4 KiB each. The buffer goes in VRAM, mapped **not
+          privileged**; a privileged PTE faults on the engine's first context access (RC 31, MMU fault at the
+          context VA, type 5).
+        - Then `GPU_PROMOTE_CTX` in the single-buffer form, and the class with {size, prohibit, instance 0}.
+        - Debugfs `video_test` does SET_OBJECT and an engine-executed semaphore release (SEMAPHORE_A..D). Both
+          PASS, 16/16 in a row, again after a GPU reset, and alongside nvktest. Video engines address **40-bit
+          VAs** (SEMAPHORE_A holds bits 39:32): a VM at 1 TiB faults at "address 0".
+        - `nv_chid_get` no longer hands out the kernel channels' chids 1/2 before those channels exist (shared
+          USERD slot per chid).
+      - [ ] Userspace: Mesa 26.2 NVK has no video queue, and Mesa has no VA-API driver for Ampere. The nouveau uAPI
+        has no NVDEC/NVENC engine bit (`NOUVEAU_FIFO_ENGINE_*` stops at CE). Expose it once a consumer exists.
 - [ ] OFA (optical flow).
 
 ### Platform
