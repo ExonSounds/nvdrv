@@ -15,6 +15,7 @@
 
 #include "internal.h"
 #include "nvdrv_drm.h"
+#include "compile.h"
 
 #define DRM_NOUVEAU_NVIF 0x07
 struct nvif_hdr { uint8_t version, type, pad02[4], owner, route; uint64_t token, object; };
@@ -158,7 +159,8 @@ CUresult nvc_ctx_init(struct CUctx_st *ctx, CUdevice dev, unsigned int flags)
 	if (nvc_bo_new(ctx, &ctx->push, NVC_PUSH_SIZE, NOUVEAU_GEM_DOMAIN_GART, true, 0) ||
 	    nvc_bo_new(ctx, &ctx->staging, NVC_STAGING_SIZE, NOUVEAU_GEM_DOMAIN_GART, true, 0) ||
 	    nvc_bo_new(ctx, &ctx->events, NVC_EVENT_SLOTS * 16, NOUVEAU_GEM_DOMAIN_GART, true, 0) ||
-	    stream_init(ctx, &ctx->null_stream, 0)) {
+	    nvc_bo_new(ctx, &ctx->dummy, 0x10000, NOUVEAU_GEM_DOMAIN_VRAM, false, NVC_DUMMY_VA) ||
+	    nvc_tex_pools_init(ctx) || stream_init(ctx, &ctx->null_stream, 0)) {
 		res = CUDA_ERROR_OUT_OF_MEMORY;
 		goto fail;
 	}
@@ -197,6 +199,8 @@ void nvc_ctx_fini(struct CUctx_st *ctx)
 	free(ctx->streams);
 	if (ctx->null_stream.tl)
 		drmSyncobjDestroy(ctx->fd, ctx->null_stream.tl);
+	nvc_tex_pools_fini(ctx);
+	nvc_bo_free(ctx, &ctx->dummy);
 	nvc_bo_free(ctx, &ctx->events);
 	nvc_bo_free(ctx, &ctx->staging);
 	nvc_bo_free(ctx, &ctx->push);

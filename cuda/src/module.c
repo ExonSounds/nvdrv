@@ -34,6 +34,10 @@ struct nvif_new { uint8_t version, pad01[6], route; uint64_t token, object; uint
 #define C7C0_SET_SHADER_LOCAL_MEMORY_A		0x0790
 #define C7C0_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_A 0x02e4
 #define C7C0_INVALIDATE_SKED_CACHES		0x0298
+#define C7C0_INVALIDATE_TEXTURE_HEADER_CACHE_NO_WFI 0x0244
+#define C7C0_INVALIDATE_SAMPLER_CACHE_NO_WFI	0x1424
+#define C7C0_SET_TEX_SAMPLER_POOL_A		0x155c
+#define C7C0_SET_TEX_HEADER_POOL_A		0x1574
 #define C7C0_SEND_PCAS_A			0x02b4
 #define C7C0_SEND_SIGNALING_PCAS2_B		0x02c0
 #define C7C0_INVALIDATE_SHADER_CACHES_NO_WFI	0x1698
@@ -120,11 +124,19 @@ static CUresult gr_init(struct CUctx_st *ctx)
 		return CUDA_ERROR_UNKNOWN;
 	}
 	ctx->gr_chan = ca.channel;
-	start = p = nvc_push_begin(ctx, 16);
+	start = p = nvc_push_begin(ctx, 32);
 	p = nvc_mthd1(p, SUBC_COMPUTE, 0x0000, 0xc7c0);	/* SET_OBJECT */
 	p = nvc_mthd(p, SUBC_COMPUTE, C7C0_SET_SHADER_SHARED_MEMORY_WINDOW_A, 2, (uint32_t[]){ 0, SHARED_WINDOW });
 	p = nvc_mthd(p, SUBC_COMPUTE, C7C0_SET_SHADER_LOCAL_MEMORY_WINDOW_A, 2, (uint32_t[]){ 0, LOCAL_WINDOW });
 	p = nvc_mthd1(p, SUBC_COMPUTE, C7C0_INVALIDATE_SKED_CACHES, 0);
+	{
+		uint32_t ntsc, ntic = nvc_tex_pool_counts(&ntsc);
+
+		p = nvc_mthd(p, SUBC_COMPUTE, C7C0_SET_TEX_HEADER_POOL_A, 3,
+			     (uint32_t[]){ (uint32_t)(ctx->tic_pool.va >> 32), (uint32_t)ctx->tic_pool.va, ntic - 1 });
+		p = nvc_mthd(p, SUBC_COMPUTE, C7C0_SET_TEX_SAMPLER_POOL_A, 3,
+			     (uint32_t[]){ (uint32_t)(ctx->tsc_pool.va >> 32), (uint32_t)ctx->tsc_pool.va, ntsc - 1 });
+	}
 	r = nvc_push_submit(ctx, &ctx->null_stream, ctx->gr_chan, start, p);
 	if (r == CUDA_SUCCESS)
 		ctx->gr_ready = true;
@@ -464,9 +476,9 @@ CUAPI CUresult cuFuncGetAttribute(int *value, CUfunction_attribute attrib, CUfun
 		return CUDA_ERROR_INVALID_HANDLE;
 	switch ((int)attrib) {
 	case CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK:	*value = max_threads(func->kb); break;
-	case CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES:	*value = func->kb->shared_static; break;
+	case CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES:	*value = func->kb->shared_static - func->kb->shared_hidden; break;
 	case CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES:	*value = 0; break;
-	case CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES:	*value = nvc_kernel_slm(func->kb); break;
+	case CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES:	*value = nvc_kernel_slm(func->kb); break;	/* includes the dummy slot */
 	case CU_FUNC_ATTRIBUTE_NUM_REGS:		*value = nvc_kernel_gprs(func->kb); break;
 	case CU_FUNC_ATTRIBUTE_PTX_VERSION:		*value = 86; break;
 	case CU_FUNC_ATTRIBUTE_BINARY_VERSION:		*value = 86; break;
@@ -572,7 +584,7 @@ CUAPI CUresult cuLaunchKernel(CUfunction f, unsigned int gx, unsigned int gy, un
 	qmd_size = nvc_qmd_size();
 	pthread_mutex_lock(&ctx->lock);
 	/* constant buffer and QMD go into the push ring (256-byte aligned), the methods after them */
-	ring = (char *)nvc_push_begin(ctx, (256 + cb_size + 256 + qmd_size) / 4 + 32);
+	ring = (char *)nvc_push_begin(ctx, (256 + cb_size + 256 + qmd_size) / 4 + 40);
 	cb = (uint32_t *)(((uintptr_t)ring + 255) & ~(uintptr_t)255);
 	qmd = (uint32_t *)((char *)cb + cb_size);
 	cb_va = ctx->push.va + ((char *)cb - (char *)ctx->push.map);
@@ -600,6 +612,11 @@ CUAPI CUresult cuLaunchKernel(CUfunction f, unsigned int gx, unsigned int gy, un
 	nvc_fill_qmd(kb, f->code.va, cb_va, cb_size, grid, block, shared_bytes, qmd, qmd_size);
 	start = p = (uint32_t *)((char *)qmd + ((qmd_size + 63) & ~63u));
 	p = nvc_mthd1(p, SUBC_COMPUTE, C7C0_INVALIDATE_SHADER_CACHES_NO_WFI, INVALIDATE_INSTRUCTION_GLOBAL_CONSTANT);
+	if (ctx->tex_dirty) {
+		p = nvc_mthd1(p, SUBC_COMPUTE, C7C0_INVALIDATE_TEXTURE_HEADER_CACHE_NO_WFI, 0);	/* all lines */
+		p = nvc_mthd1(p, SUBC_COMPUTE, C7C0_INVALIDATE_SAMPLER_CACHE_NO_WFI, 0);
+		ctx->tex_dirty = false;
+	}
 	p = nvc_mthd1(p, SUBC_COMPUTE, C7C0_SEND_PCAS_A, (uint32_t)(qmd_va >> 8));
 	p = nvc_mthd1(p, SUBC_COMPUTE, C7C0_SEND_SIGNALING_PCAS2_B, PCAS_ACTION_INVALIDATE_COPY_SCHEDULE);
 	r = nvc_push_submit(ctx, s, ctx->gr_chan, start, p);

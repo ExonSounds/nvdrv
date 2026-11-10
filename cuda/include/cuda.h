@@ -142,6 +142,111 @@ CUresult cuEventSynchronize(CUevent event);
 CUresult cuEventQuery(CUevent event);
 CUresult cuEventElapsedTime(float *ms, CUevent start, CUevent end);
 
+/* Textures: objects on linear or pitched device memory (CUDA_RESOURCE_DESC / CUDA_TEXTURE_DESC) */
+typedef unsigned long long CUtexObject;
+typedef struct CUarray_st *CUarray;
+typedef struct CUmipmappedArray_st *CUmipmappedArray;
+
+typedef enum CUarray_format_enum {
+	CU_AD_FORMAT_UNSIGNED_INT8 = 0x01,
+	CU_AD_FORMAT_UNSIGNED_INT16 = 0x02,
+	CU_AD_FORMAT_UNSIGNED_INT32 = 0x03,
+	CU_AD_FORMAT_SIGNED_INT8 = 0x08,
+	CU_AD_FORMAT_SIGNED_INT16 = 0x09,
+	CU_AD_FORMAT_SIGNED_INT32 = 0x0a,
+	CU_AD_FORMAT_HALF = 0x10,
+	CU_AD_FORMAT_FLOAT = 0x20,
+} CUarray_format;
+
+typedef enum CUaddress_mode_enum {
+	CU_TR_ADDRESS_MODE_WRAP = 0,
+	CU_TR_ADDRESS_MODE_CLAMP = 1,
+	CU_TR_ADDRESS_MODE_MIRROR = 2,
+	CU_TR_ADDRESS_MODE_BORDER = 3,
+} CUaddress_mode;
+
+typedef enum CUfilter_mode_enum {
+	CU_TR_FILTER_MODE_POINT = 0,
+	CU_TR_FILTER_MODE_LINEAR = 1,
+} CUfilter_mode;
+
+typedef enum CUresourcetype_enum {
+	CU_RESOURCE_TYPE_ARRAY = 0x00,
+	CU_RESOURCE_TYPE_MIPMAPPED_ARRAY = 0x01,
+	CU_RESOURCE_TYPE_LINEAR = 0x02,
+	CU_RESOURCE_TYPE_PITCH2D = 0x03,
+} CUresourcetype;
+
+#define CU_TRSF_READ_AS_INTEGER		0x01
+#define CU_TRSF_NORMALIZED_COORDINATES	0x02
+#define CU_TRSF_SRGB			0x10
+
+typedef struct CUDA_RESOURCE_DESC_st {
+	CUresourcetype resType;
+	union {
+		struct { CUarray hArray; } array;
+		struct { CUmipmappedArray hMipmappedArray; } mipmap;
+		struct { CUdeviceptr devPtr; CUarray_format format; unsigned int numChannels; size_t sizeInBytes; } linear;
+		struct { CUdeviceptr devPtr; CUarray_format format; unsigned int numChannels; size_t width;
+			 size_t height; size_t pitchInBytes; } pitch2D;
+		struct { int reserved[32]; } reserved;
+	} res;
+	unsigned int flags;
+} CUDA_RESOURCE_DESC;
+
+typedef struct CUDA_TEXTURE_DESC_st {
+	CUaddress_mode addressMode[3];
+	CUfilter_mode filterMode;
+	unsigned int flags;
+	unsigned int maxAnisotropy;
+	CUfilter_mode mipmapFilterMode;
+	float mipmapLevelBias;
+	float minMipmapLevelClamp;
+	float maxMipmapLevelClamp;
+	float borderColor[4];
+	int reserved[12];
+} CUDA_TEXTURE_DESC;
+
+typedef struct CUDA_RESOURCE_VIEW_DESC_st {
+	int format;
+	size_t width, height, depth;
+	unsigned int firstMipmapLevel, lastMipmapLevel, firstLayer, lastLayer;
+	unsigned int reserved[16];
+} CUDA_RESOURCE_VIEW_DESC;
+
+CUresult cuTexObjectCreate(CUtexObject *tex, const CUDA_RESOURCE_DESC *res, const CUDA_TEXTURE_DESC *desc,
+			   const CUDA_RESOURCE_VIEW_DESC *view);
+CUresult cuTexObjectDestroy(CUtexObject tex);
+CUresult cuTexObjectGetResourceDesc(CUDA_RESOURCE_DESC *res, CUtexObject tex);
+CUresult cuTexObjectGetTextureDesc(CUDA_TEXTURE_DESC *desc, CUtexObject tex);
+
+/* 2D copies */
+typedef struct CUDA_MEMCPY2D_st {
+	size_t srcXInBytes, srcY;
+	CUmemorytype srcMemoryType;
+	const void *srcHost;
+	CUdeviceptr srcDevice;
+	CUarray srcArray;
+	size_t srcPitch;
+	size_t dstXInBytes, dstY;
+	CUmemorytype dstMemoryType;
+	void *dstHost;
+	CUdeviceptr dstDevice;
+	CUarray dstArray;
+	size_t dstPitch;
+	size_t WidthInBytes, Height;
+} CUDA_MEMCPY2D;
+
+#define cuMemcpy2D		cuMemcpy2D_v2
+#define cuMemcpy2DUnaligned	cuMemcpy2DUnaligned_v2
+#define cuMemcpy2DAsync		cuMemcpy2DAsync_v2
+#define cuMemAllocPitch		cuMemAllocPitch_v2
+CUresult cuMemcpy2D_v2(const CUDA_MEMCPY2D *copy);
+CUresult cuMemcpy2DUnaligned_v2(const CUDA_MEMCPY2D *copy);
+CUresult cuMemcpy2DAsync_v2(const CUDA_MEMCPY2D *copy, CUstream stream);
+CUresult cuMemAllocPitch_v2(CUdeviceptr *dptr, size_t *pitch, size_t width_bytes, size_t height,
+			    unsigned int element_bytes);
+
 /* Modules and launches (milestone 2: PTX through an open compiler) */
 CUresult cuModuleLoadData(CUmodule *module, const void *image);
 CUresult cuModuleLoadDataEx(CUmodule *module, const void *image, unsigned int n, CUjit_option *options,

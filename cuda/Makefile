@@ -11,7 +11,7 @@ ifeq ($(MESA_LIBS),)
 $(error Mesa's NAK is not built: run mesa/build-nak.sh first)
 endif
 
-MESA_SRCS = src/compile.c src/ptx.c
+MESA_SRCS = src/compile.c src/ptx.c src/texture.c
 SRCS = $(filter-out $(MESA_SRCS),$(wildcard src/*.c))
 OBJS = $(SRCS:src/%.c=build/%.o) $(MESA_SRCS:src/%.c=build/%.o)
 
@@ -22,11 +22,11 @@ build/%.o: src/%.c src/internal.h src/compile.h include/cuda.h include/cuda_enum
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # the compiler and the PTX front end see Mesa's headers (its own defines first, then nvcuda's)
-build/compile.o build/ptx.o: build/%.o: src/%.c src/compile.h src/ptx.h
+build/compile.o build/ptx.o build/texture.o: build/%.o: src/%.c src/compile.h src/ptx.h
 	@mkdir -p build
 	$(CC) -O2 -g -std=gnu11 -fPIC -fvisibility=hidden -Wall $(MESA_CFLAGS) -Iinclude -c -o $@ $<
 
-build/libcuda.so.1: $(OBJS) src/exports.map
+build/libcuda.so.1: $(OBJS) src/exports.map $(MESA_LIBS)
 	$(CC) -shared -Wl,-soname,libcuda.so.1 -Wl,--no-undefined -Wl,--version-script=src/exports.map \
 		-Wl,--exclude-libs,ALL -Wl,--gc-sections -o $@ $(OBJS) \
 		-Wl,--start-group $(MESA_LIBS) -Wl,--end-group $(MESA_SYSLIBS) $(LIBS)
@@ -37,7 +37,7 @@ build/cudatest: tests/cudatest.c build/libcuda.so.1
 	$(CC) -O2 -g -Wall -Iinclude -o $@ $< -Lbuild -lcuda
 
 # offline compiler check: build/nakc file.spv entry...
-build/nakc: tests/nakc.c build/compile.o build/ptx.o
+build/nakc: tests/nakc.c build/compile.o build/ptx.o $(MESA_LIBS)
 	$(CC) -O2 -g -o $@ $< build/compile.o build/ptx.o -Wl,--start-group $(MESA_LIBS) -Wl,--end-group $(MESA_SYSLIBS)
 
 # CUDA C++ -> SPIR-V with clang (no NVIDIA SDK): include/nvcuda/device.h supplies threadIdx & co.

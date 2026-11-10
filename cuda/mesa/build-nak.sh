@@ -18,6 +18,7 @@ git apply --check "$HERE/nak-standalone.patch" 2>/dev/null && git apply "$HERE/n
 	-Dplatforms= -Dglx=disabled -Degl=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled \
 	-Dllvm=disabled -Dbuildtype=release -Dvideo-codecs=
 ninja -C build-nak src/nouveau/compiler/libnak.a src/nouveau/compiler/libnak_rs.a \
+	src/nouveau/nil/libnil.a src/nouveau/nil/liblibnil_format_table.a \
 	src/compiler/libcompiler.a src/compiler/rust/libcompiler_bindings.a src/compiler/rust/libcompiler_c_helpers.a \
 	src/util/libmesa_util.a src/c11/impl/libmesa_util_c11.a src/util/blake3/libblake3.a \
 	src/compiler/spirv/libvtn.a src/compiler/nir/libnir.a
@@ -38,6 +39,7 @@ for e in json.load(open(os.path.join(b, 'compile_commands.json'))):
                 fl.append(t)
         break
 libs = ['src/nouveau/compiler/libnak.a', 'src/nouveau/compiler/libnak_rs.a', 'src/compiler/spirv/libvtn.a',
+        'src/nouveau/nil/libnil.a', 'src/nouveau/nil/liblibnil_format_table.a',
         'src/compiler/nir/libnir.a', 'src/compiler/libcompiler.a', 'src/compiler/rust/libcompiler_bindings.a',
         'src/compiler/rust/libcompiler_c_helpers.a', 'src/util/libmesa_util.a', 'src/util/libmesa_util_simd.a',
         'src/util/libmesa_util_clflush.a', 'src/util/libmesa_util_clflushopt.a',

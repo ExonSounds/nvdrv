@@ -346,6 +346,167 @@ done:
 		free(iout);
 	}
 
+	/* 2D copies with pitches, cuMemAllocPitch */
+	{
+		const int W = 100, H = 37;
+		size_t pitch;
+		CUdeviceptr d;
+		float *src = malloc(W * H * 4), *dst = calloc(W * H, 4);
+		CUDA_MEMCPY2D cp = { 0 };
+		int bad = 0;
+
+		for (int i = 0; i < W * H; i++)
+			src[i] = i * 0.5f;
+		CK(cuMemAllocPitch(&d, &pitch, W * 4, H, 4));
+		TEST(pitch >= W * 4 && pitch % 32 == 0, "cuMemAllocPitch: pitch %zu for %d-byte rows", pitch, W * 4);
+		cp.srcMemoryType = CU_MEMORYTYPE_HOST;
+		cp.srcHost = src;
+		cp.srcPitch = W * 4;
+		cp.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+		cp.dstDevice = d;
+		cp.dstPitch = pitch;
+		cp.WidthInBytes = W * 4;
+		cp.Height = H;
+		CK(cuMemcpy2DUnaligned(&cp));
+		cp.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+		cp.srcDevice = d;
+		cp.srcPitch = pitch;
+		cp.dstMemoryType = CU_MEMORYTYPE_HOST;
+		cp.dstHost = dst;
+		cp.dstPitch = W * 4;
+		CK(cuMemcpy2D(&cp));
+		for (int i = 0; i < W * H; i++)
+			bad += dst[i] != src[i];
+		TEST(!bad, "cuMemcpy2D host -> pitched device -> host, %dx%d floats (%d wrong)", W, H, bad);
+		/* a sub-rectangle: columns 10..29 of rows 5..14, into a pinned host buffer */
+		float *pin;
+		CK(cuMemHostAlloc((void **)&pin, 20 * 10 * 4, 0));
+		memset(pin, 0, 20 * 10 * 4);
+		cp.srcXInBytes = 10 * 4;
+		cp.srcY = 5;
+		cp.dstHost = pin;
+		cp.dstPitch = 20 * 4;
+		cp.WidthInBytes = 20 * 4;
+		cp.Height = 10;
+		CK(cuMemcpy2D(&cp));
+		bad = 0;
+		for (int y = 0; y < 10; y++)
+			for (int x = 0; x < 20; x++)
+				bad += pin[y * 20 + x] != src[(y + 5) * W + x + 10];
+		TEST(!bad, "cuMemcpy2D sub-rectangle into pinned memory (%d wrong)", bad);
+		CK(cuMemFreeHost(pin));
+		/* keep d for the texture tests */
+
+		/* textures on that pitched image: R32F, point and linear filtering, clamping */
+		CUDA_RESOURCE_DESC rd = { 0 };
+		CUDA_TEXTURE_DESC td = { 0 };
+		CUtexObject tex;
+		float *out = malloc(W * H * 16);
+		rd.resType = CU_RESOURCE_TYPE_PITCH2D;
+		rd.res.pitch2D.devPtr = d;
+		rd.res.pitch2D.format = CU_AD_FORMAT_FLOAT;
+		rd.res.pitch2D.numChannels = 1;
+		rd.res.pitch2D.width = W;
+		rd.res.pitch2D.height = H;
+		rd.res.pitch2D.pitchInBytes = pitch;
+		td.addressMode[0] = td.addressMode[1] = CU_TR_ADDRESS_MODE_CLAMP;
+		td.filterMode = CU_TR_FILTER_MODE_POINT;
+		CK(cuTexObjectCreate(&tex, &rd, &td, NULL));
+		CUdeviceptr dout = dalloc(W * H * 16, NULL);
+		float x0 = 0.5f, y0 = 0.5f, one = 1.0f;
+		int w = W, h = H;
+		void *args[] = { &dout, &tex, &x0, &y0, &one, &one, &w, &h };
+		CK(cuLaunchKernel(fn("tex2d"), (W * H + 127) / 128, 1, 1, 128, 1, 1, 0, NULL, args, NULL));
+		CK(cuMemcpyDtoH(out, dout, W * H * 16));
+		bad = 0;
+		for (int i = 0; i < W * H; i++)
+			bad += out[i * 4] != src[i] || out[i * 4 + 1] != 0.0f || out[i * 4 + 3] != 1.0f;
+		TEST(!bad, "tex.2d point sampling at texel centres, R32F pitch2D (%d wrong)", bad);
+		CK(cuTexObjectDestroy(tex));
+		td.filterMode = CU_TR_FILTER_MODE_LINEAR;
+		CK(cuTexObjectCreate(&tex, &rd, &td, NULL));
+		x0 = 1.0f;	/* between texels: the mean of two neighbours */
+		CK(cuLaunchKernel(fn("tex2d"), (W * H + 127) / 128, 1, 1, 128, 1, 1, 0, NULL, args, NULL));
+		CK(cuMemcpyDtoH(out, dout, W * H * 16));
+		bad = 0;
+		for (int y = 0; y < H; y++)
+			for (int x = 0; x < W; x++) {
+				float want = x + 1 < W ? 0.5f * (src[y * W + x] + src[y * W + x + 1]) : src[y * W + x];
+
+				bad += !close_f(out[(y * W + x) * 4], want, 1e-5);
+			}
+		TEST(!bad, "tex.2d linear filtering between texels, clamp at the right edge (%d wrong)", bad);
+		CK(cuTexObjectDestroy(tex));
+		CK(cuMemFree(d));
+		free(src);
+		free(dst);
+
+		/* uchar4, normalized reads and normalized coordinates */
+		const int W2 = 64, H2 = 16;
+		unsigned char *px = malloc(W2 * H2 * 4);
+		for (int i = 0; i < W2 * H2 * 4; i++)
+			px[i] = (unsigned char)(i * 7);
+		CK(cuMemAllocPitch(&d, &pitch, W2 * 4, H2, 4));
+		cp = (CUDA_MEMCPY2D){ .srcMemoryType = CU_MEMORYTYPE_HOST, .srcHost = px, .srcPitch = W2 * 4,
+				      .dstMemoryType = CU_MEMORYTYPE_DEVICE, .dstDevice = d, .dstPitch = pitch,
+				      .WidthInBytes = W2 * 4, .Height = H2 };
+		CK(cuMemcpy2D(&cp));
+		rd.res.pitch2D.devPtr = d;
+		rd.res.pitch2D.format = CU_AD_FORMAT_UNSIGNED_INT8;
+		rd.res.pitch2D.numChannels = 4;
+		rd.res.pitch2D.width = W2;
+		rd.res.pitch2D.height = H2;
+		rd.res.pitch2D.pitchInBytes = pitch;
+		td.filterMode = CU_TR_FILTER_MODE_POINT;
+		td.flags = CU_TRSF_NORMALIZED_COORDINATES;
+		CK(cuTexObjectCreate(&tex, &rd, &td, NULL));
+		x0 = 0.5f / W2;
+		y0 = 0.5f / H2;
+		float dx = 1.0f / W2, dy = 1.0f / H2;
+		w = W2;
+		h = H2;
+		void *args2[] = { &dout, &tex, &x0, &y0, &dx, &dy, &w, &h };
+		CK(cuLaunchKernel(fn("tex2d"), (W2 * H2 + 127) / 128, 1, 1, 128, 1, 1, 0, NULL, args2, NULL));
+		CK(cuMemcpyDtoH(out, dout, W2 * H2 * 16));
+		bad = 0;
+		for (int i = 0; i < W2 * H2 * 4; i++)
+			bad += !close_f(out[i], px[i] / 255.0f, 1e-6);
+		TEST(!bad, "tex.2d uchar4 as normalized floats, normalized coordinates (%d wrong)", bad);
+		CK(cuTexObjectDestroy(tex));
+		CK(cuMemFree(d));
+		free(px);
+
+		/* 1-D linear memory: tex1Dfetch */
+		const int N1 = 5000;
+		float *lin = malloc(N1 * 8);
+		for (int i = 0; i < N1; i++) {
+			lin[i * 2] = i * 0.25f;
+			lin[i * 2 + 1] = (float)(i % 7);
+		}
+		CUdeviceptr dl = dalloc(N1 * 8, lin);
+		rd = (CUDA_RESOURCE_DESC){ .resType = CU_RESOURCE_TYPE_LINEAR };
+		rd.res.linear.devPtr = dl;
+		rd.res.linear.format = CU_AD_FORMAT_FLOAT;
+		rd.res.linear.numChannels = 2;
+		rd.res.linear.sizeInBytes = N1 * 8;
+		td = (CUDA_TEXTURE_DESC){ 0 };
+		CK(cuTexObjectCreate(&tex, &rd, &td, NULL));
+		int n1 = N1;
+		void *args3[] = { &dout, &tex, &n1 };
+		CK(cuLaunchKernel(fn("tex1dfetch"), (N1 + 127) / 128, 1, 1, 128, 1, 1, 0, NULL, args3, NULL));
+		CK(cuMemcpyDtoH(out, dout, N1 * 4));
+		bad = 0;
+		for (int i = 0; i < N1; i++)
+			bad += out[i] != i * 0.25f + (i % 7) * 1000.0f;
+		TEST(!bad, "tex.1d fetch from linear float2 memory (%d wrong)", bad);
+		CK(cuTexObjectDestroy(tex));
+		TEST(cuTexObjectDestroy(tex) == CUDA_ERROR_INVALID_HANDLE, "destroyed texture objects are invalid");
+		CK(cuMemFree(dl));
+		CK(cuMemFree(dout));
+		free(lin);
+		free(out);
+	}
+
 	CK(cuModuleUnload(mod));
 	CK(cuCtxDestroy(ctx));
 	printf("%d/%d passed\n", total - fails, total);

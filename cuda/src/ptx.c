@@ -515,6 +515,19 @@ static void parse_operand(struct ctx *c, struct opnd *o)
 		} else {
 			fail(c, "bad address");
 		}
+		if (accept(c, ',')) {	/* tex: [texobj, {coords}] */
+			struct opnd co;
+
+			parse_operand(c, &co);
+			if (co.kind == O_VEC) {
+				o->vec = co.vec;
+				o->nvec = co.nvec;
+			} else {
+				o->vec = ralloc(c->mem, struct opnd);
+				*o->vec = co;
+				o->nvec = 1;
+			}
+		}
 		while (is_p(c, '+') || is_p(c, '-')) {
 			bool minus = is_p(c, '-');
 
@@ -803,45 +816,41 @@ static nir_def *access_space(struct ctx *c, enum space sp, nir_def *addr, const 
 }
 
 /*
- * A generic address: shared window, local window, or global. Three blocks and a join, the
- * loaded value passes through a variable.
+ * A generic address: shared window, local window, or global. Loads and stores are branch-free:
+ * all three spaces are accessed, the inactive ones at their dummy slot (NVC_DUMMY_*), and the
+ * result selected. That keeps the block count flat: the shading kernels of a path tracer inline
+ * thousands of these, and the compiler's memory use grows with blocks x values. Atomics branch.
  */
 static nir_def *access_generic(struct ctx *c, nir_def *addr, const struct mop *m)
 {
 	nir_builder *b = &c->b;
-	nir_block *sh = new_block(c), *rest = new_block(c), *lo = new_block(c), *gl = new_block(c);
-	nir_block *join = new_block(c);
-	nir_variable *res = NULL;
-	nir_def *v, *win = nir_ushr_imm(b, addr, 24);
-	bool has_result = m->kind != M_STORE;
-	bool local_ok = m->kind == M_LOAD || m->kind == M_STORE;
+	nir_def *hi = nir_ushr_imm(b, addr, 24), *off = nir_iand_imm(b, nir_u2u32(b, addr), WINDOW_SIZE - 1);
+	nir_def *is_sh = nir_ieq_imm(b, hi, SHARED_WINDOW >> 24), *is_lo = nir_ieq_imm(b, hi, LOCAL_WINDOW >> 24);
+	nir_def *sh_off, *lo_off, *g_addr, *vs, *vl, *vg;
 
-	if (has_result)
-		res = nir_local_variable_create(c->impl, m->comps == 1 ? glsl_uintN_t_type(m->bits) :
-						glsl_vector_type(glsl_get_base_type(glsl_uintN_t_type(m->bits)),
-								 m->comps), "generic");
-	nir_goto_if(b, sh, nir_ieq_imm(b, win, SHARED_WINDOW >> 24), rest);
-	b->cursor = nir_after_block(sh);
-	v = access_space(c, SP_SHARED, nir_iand_imm(b, addr, WINDOW_SIZE - 1), m);
-	if (res)
-		nir_store_var(b, res, v, BITFIELD_MASK(m->comps));
-	nir_goto(b, join);
-	b->cursor = nir_after_block(rest);
-	nir_goto_if(b, lo, nir_ieq_imm(b, win, LOCAL_WINDOW >> 24), gl);
-	b->cursor = nir_after_block(lo);
-	if (local_ok) {
-		v = access_space(c, SP_LOCAL, nir_iand_imm(b, addr, WINDOW_SIZE - 1), m);
-		if (res)
-			nir_store_var(b, res, v, BITFIELD_MASK(m->comps));
+	if (m->kind == M_ATOMIC || m->kind == M_CAS) {
+		nir_block *sh = new_block(c), *gl = new_block(c), *join = new_block(c);
+		nir_variable *res = nir_local_variable_create(c->impl, glsl_uintN_t_type(m->bits), "generic_atomic");
+
+		nir_goto_if(b, sh, is_sh, gl);
+		b->cursor = nir_after_block(sh);
+		nir_store_var(b, res, access_space(c, SP_SHARED, off, m), 1);
+		nir_goto(b, join);
+		b->cursor = nir_after_block(gl);
+		nir_store_var(b, res, access_space(c, SP_GLOBAL, addr, m), 1);
+		nir_goto(b, join);
+		switch_to(c, join);
+		return nir_load_var(b, res);
 	}
-	nir_goto(b, join);
-	b->cursor = nir_after_block(gl);
-	v = access_space(c, SP_GLOBAL, addr, m);
-	if (res)
-		nir_store_var(b, res, v, BITFIELD_MASK(m->comps));
-	nir_goto(b, join);
-	switch_to(c, join);
-	return res ? nir_load_var(b, res) : NULL;
+	sh_off = nir_bcsel(b, is_sh, off, nir_imm_int(b, 0));
+	lo_off = nir_bcsel(b, is_lo, off, nir_imm_int(b, 0));
+	g_addr = nir_bcsel(b, nir_ior(b, is_sh, is_lo), nir_imm_int64(b, NVC_DUMMY_VA), addr);
+	vs = access_space(c, SP_SHARED, sh_off, m);
+	vl = access_space(c, SP_LOCAL, lo_off, m);
+	vg = access_space(c, SP_GLOBAL, g_addr, m);
+	if (m->kind == M_STORE)
+		return NULL;
+	return nir_bcsel(b, is_sh, vs, nir_bcsel(b, is_lo, vl, vg));
 }
 
 static enum space space_of(const char *s)
@@ -1119,6 +1128,66 @@ static void emit_insn(struct ctx *c, struct insn *in)
 			emit_barrier(b, SCOPE_NONE, SCOPE_DEVICE);
 		if (!red)
 			wr(c, &o[0], r, t);
+		return;
+	}
+
+	/* --- textures: tex.geom.v4.dtype.ctype {d0..d3}, [texobj, {coords}] --- */
+	if (!strcmp(op, "tex")) {
+		struct opnd *mem = &o[1];
+		struct ptype dt = in->types[0], ct = in->ntypes > 1 ? in->types[1] : (struct ptype){ TC_F, 32 };
+		nir_tex_instr *tex;
+		nir_def *handle, *coord, *comps[4], *lod;
+		enum glsl_sampler_dim dim;
+		unsigned int ncoord, i;
+		bool fetch = ct.cls != TC_F;
+
+		if (mem->kind != O_MEM || !mem->mem_reg || !mem->vec || o[0].kind != O_VEC || o[0].nvec != 4)
+			fail(c, "tex needs [texobj, {coords}] and a 4-vector destination");
+		if (has_mod(in, "level") || has_mod(in, "grad") || has_mod(in, "a1d") || has_mod(in, "a2d") ||
+		    has_mod(in, "cube") || has_mod(in, "acube"))
+			fail(c, "tex: explicit LOD, gradients and array/cube textures are not supported yet");
+		if (has_mod(in, "1d")) {
+			dim = GLSL_SAMPLER_DIM_BUF;	/* CUDA 1-D textures are linear memory: integer fetch */
+			ncoord = 1;
+			fetch = true;
+		} else if (has_mod(in, "2d")) {
+			dim = GLSL_SAMPLER_DIM_2D;
+			ncoord = 2;
+		} else if (has_mod(in, "3d")) {
+			dim = GLSL_SAMPLER_DIM_3D;
+			ncoord = 3;
+		} else {
+			fail(c, "tex geometry");
+		}
+		if (mem->nvec < (int)ncoord)
+			fail(c, "tex: %u coordinates needed", ncoord);
+		if (getenv("NVCUDA_NO_TEX")) {	/* diagnosis: a texture read as zero */
+			for (i = 0; i < 4; i++)
+				wr(c, &o[0].vec[i], nir_imm_int(b, 0), dt);
+			return;
+		}
+		handle = nir_u2u32(b, nir_load_var(b, find_reg(c, mem->name)->var));
+		for (i = 0; i < ncoord; i++) {
+			comps[i] = rd(c, &mem->vec[i], ct);
+			if (fetch && ct.cls == TC_F)
+				comps[i] = nir_f2i32(b, nir_ffloor(b, comps[i]));
+		}
+		coord = nir_vec(b, comps, ncoord);
+		tex = nir_tex_instr_create(c->nir, 4);
+		tex->op = fetch ? nir_texop_txf : nir_texop_txl;
+		tex->sampler_dim = dim;
+		tex->dest_type = dt.cls == TC_F ? nir_type_float32 : dt.cls == TC_S ? nir_type_int32 : nir_type_uint32;
+		tex->coord_components = ncoord;
+		tex->is_array = false;
+		lod = fetch ? nir_imm_int(b, 0) : nir_imm_float(b, 0.0f);
+		tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_handle, handle);
+		tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_sampler_handle, handle);
+		tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+		tex->src[3] = nir_tex_src_for_ssa(nir_tex_src_lod, lod);
+		nir_def_init(&tex->instr, &tex->def, 4, 32);
+		nir_builder_instr_insert(b, &tex->instr);
+		for (i = 0; i < 4; i++)
+			wr(c, &o[0].vec[i], nir_channel(b, &tex->def, i), dt);
 		return;
 	}
 
@@ -1466,9 +1535,9 @@ static void emit_statement(struct ctx *c)
 	}
 	if (c->lx.t != T_ID)
 		fail(c, "expected an instruction");
-	if (!strncmp(c->lx.s, "tex.", 4) || !strncmp(c->lx.s, "tld4.", 5) || !strncmp(c->lx.s, "suld.", 5) ||
-	    !strncmp(c->lx.s, "sust.", 5) || !strncmp(c->lx.s, "txq.", 4) || !strncmp(c->lx.s, "suq.", 4))
-		fail(c, "textures and surfaces (%s) are not supported yet", c->lx.s);
+	if (!strncmp(c->lx.s, "tld4.", 5) || !strncmp(c->lx.s, "suld.", 5) || !strncmp(c->lx.s, "sust.", 5) ||
+	    !strncmp(c->lx.s, "txq.", 4) || !strncmp(c->lx.s, "suq.", 4))
+		fail(c, "%s is not supported yet (surfaces, gathers, queries)", c->lx.s);
 	if (!strcmp(c->lx.s, "call") || !strncmp(c->lx.s, "call.", 5)) {
 		/* call[.uni] [(ret, ...),] name[, (arg, ...)]; -- inlined */
 		char rets[8][256], args[32][256], fname[256];
@@ -1944,7 +2013,7 @@ static void module_global(struct ctx *c, enum space sp)
 		if (!c->globals)
 			fail(c, "out of memory");
 	}
-	snprintf(c->globals[c->nglobals].name, sizeof(c->globals[0].name), "%s", name);
+	snprintf(c->globals[c->nglobals].name, sizeof(c->globals[0].name), "%.127s", name);
 	c->globals[c->nglobals].offset = off;
 	c->globals[c->nglobals].size = size;
 	c->nglobals++;
@@ -2107,6 +2176,8 @@ static struct ctx *ctx_new(const char *src, char *err, size_t errlen)
 
 	if (!c)
 		return NULL;
+	c->shared_size = NVC_DUMMY_BYTES;	/* dummy slots for generic accesses (access_generic) */
+	c->local_top = c->local_max = NVC_DUMMY_BYTES;
 	c->mem = ralloc_context(NULL);
 	c->err = err;
 	c->errlen = errlen;

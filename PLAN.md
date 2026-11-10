@@ -867,9 +867,35 @@ not used.
       - **Blender's own PTX** (Cycles 5.2.3, `kernel_compute_75.ptx`, nvcc 11.4, 12 MB, 75 kernels, 1611 calls):
         **62 of 75 kernels compile through NAK** (3 s for all); the largest is 750 KB of code at 168
         registers. The 13 that fail all use `tex.2d` (image textures).
-      - [ ] Textures and surfaces (`tex`, `suld`/`sust` with texture objects) for Cycles' images.
+      - [x] Textures (2026-11-10): `cuTexObjectCreate` for LINEAR (1-D buffer, integer fetch) and PITCH2D (pitch-
+        linear 2-D) memory, formats U8/U16/S8/S16/HALF/FLOAT/U32/S32 x 1/2/4 (normalized or READ_AS_INTEGER).
+        The TIC comes from Mesa's nil (`nil_image_view_descriptor` / `nil_buffer_descriptor`), the TSC from
+        NVIDIA's open cl9097tex.h fields as NVK builds it (FORCE_UNNORMALIZED_COORDS for unnormalized
+        coordinates). Each context has a 4096-entry header pool and a 1024-entry sampler pool in GART, bound
+        to the compute channel (SET_TEX_HEADER/SAMPLER_POOL); the texture object is `slot << 32 | handle`,
+        the handle (sampler << 20 | header) is what `tex` passes to NAK (txl, lod 0; txf for buffers and
+        integer coordinates). Caches are invalidated at the next launch after a change. Also
+        `cuMemcpy2D(Unaligned/Async)` on the copy engine's multi-line mode and `cuMemAllocPitch`.
+        ptxtest: point and linear filtering, clamping, uchar4 normalized, 1-D fetch: 28/28.
+      - [x] Compile cache: `~/.cache/nvcuda/<fnv64>.bin` keyed on the image, entry, globals address and a
+        version string (`NVCUDA_CACHE=0` disables). Cycles loads ~50 kernels at startup; the big ones take
+        40-85 s each to compile the first time.
+      - **NAK on huge kernels.** Cycles' shading kernels inline the whole SVM evaluator: 240K-520K NIR
+        instructions in 16K-30K blocks after optimisation (5.9-13.6 MB of code each). NAK's `SimpleLiveness`
+        kept four dense bitsets per block sized to the function's value count and ran out of memory (>16 GB).
+        Two changes: `nir_opt_if` + `nir_opt_peephole_select` in nvcuda's optimiser (25K -> 16K blocks), and a
+        sparse per-block value set in NAK's liveness (in `cuda/mesa/nak-standalone.patch`). Generic memory
+        accesses are now branch-free (three guarded accesses + select; dummy slots at NVC_DUMMY_VA, shared 0 and
+        scratch 0 absorb the inactive ones) so they add no blocks.
+      - **Cycles 5.2.3: 72 of 75 kernels compile** (95 MB of code, up to 16 KB of local memory per thread,
+        35 min for all of them once). Left: `integrator_shade_shadow`, `integrator_shade_volume`,
+        `integrator_intersect_mnee`, which exceed 24 GB later in NAK after 5-14 minutes; shade_shadow is needed
+        for every render.
+      - `tests/blender-cycles.sh <blender-dir>` renders the default scene with Cycles on nvcuda headless
+        (sets the shipped sm_86 cubin aside so Cycles loads its PTX). Not run yet: Blender's binary is a
+        downloaded executable.
+      - [ ] Surfaces (`suld`/`sust`), `tld4`, `txq`, CUDA arrays and mipmaps; array/cube textures.
       - [ ] f16/bf16 (`.f16`, `.f16x2`), carry chains (add.cc/addc), `match`, `redux`, `cp.async`, `mma`/`wmma`.
-      - [ ] Real nvcc output: test against Blender's shipped `kernel_compute_75.ptx`.
 - [ ] **Milestone 4: Blender Cycles.** Needs textures (`cuTexObjectCreate` for PITCH2D/LINEAR), `cuMemcpy2DUnaligned`,
       `cuModuleGetGlobal` (the `kernel_params` constant), `cuOccupancyMaxPotentialBlockSize`, dynamic shared
       memory, and about 50 kernels. Official builds ship `lib/kernel_sm_86.cubin.zst`, which Cycles picks first

@@ -12,12 +12,20 @@
 #define NVC_CB_PARAMS	0x20	/* kernel parameters */
 #define NVC_CB_SIZE	0x1000
 #define NVC_MAX_PARAMS	128
+/*
+ * Generic memory accesses are branch-free: shared, local and global are all accessed and the
+ * right result selected. The inactive accesses go to a dummy slot: the first NVC_DUMMY_BYTES of
+ * shared memory and of each thread's scratch, and a dummy page every context maps at this VA.
+ */
+#define NVC_DUMMY_VA	0x1f00000000ull
+#define NVC_DUMMY_BYTES	64
 
 struct nvc_kernel_bin {
 	void *info;			/* struct nak_shader_info, owned by compile.c */
 	void *code;
 	uint32_t code_size;
-	uint32_t shared_static;		/* bytes of __shared__ the kernel declares */
+	uint32_t shared_static;		/* static shared memory the launch allocates */
+	uint32_t shared_hidden;		/* of which nvcuda's own (dummy slots), not the kernel's */
 	uint32_t max_threads;		/* .maxntid / .reqntid, 0 = none */
 	uint32_t nparams, param_bytes;
 	struct { uint32_t offset, size; } params[NVC_MAX_PARAMS];
@@ -33,6 +41,13 @@ struct nvc_global {
 	char name[128];
 	uint32_t offset, size;
 };
+/* texture.c: TIC and TSC for a CUDA texture object (32 bytes each) */
+struct CUDA_RESOURCE_DESC_st;
+struct CUDA_TEXTURE_DESC_st;
+int nvc_tex_headers(const struct CUDA_RESOURCE_DESC_st *res, const struct CUDA_TEXTURE_DESC_st *desc, uint32_t tic[8],
+		    uint32_t tsc[8], char *err, size_t errlen);
+const struct nv_device_info *nvc_compiler_devinfo(void);
+
 int nvc_ptx_globals(const char *ptx, struct nvc_global **globals, uint32_t *count, void **image, uint32_t *size,
 		    char *err, size_t errlen);
 void nvc_kernel_bin_free(struct nvc_kernel_bin *kb);

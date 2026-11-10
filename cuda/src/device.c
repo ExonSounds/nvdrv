@@ -223,7 +223,7 @@ CUAPI CUresult cuDeviceGetAttribute(int *value, CUdevice_attribute attrib, CUdev
 	case 16 /* MULTIPROCESSOR_COUNT */:			v = d->sm_count; break;
 	case 17 /* KERNEL_EXEC_TIMEOUT */:			v = 1; break;
 	case 18 /* INTEGRATED */:				v = 0; break;
-	case 19 /* CAN_MAP_HOST_MEMORY */:			v = 1; break;
+	case 19 /* CAN_MAP_HOST_MEMORY: cuMemHostRegister needs a userptr uAPI first */: v = 0; break;
 	case 20 /* COMPUTE_MODE: default */:			v = 0; break;
 	case CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE1D_WIDTH:	v = 131072; break;
 	case CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE2D_WIDTH:	v = 131072; break;

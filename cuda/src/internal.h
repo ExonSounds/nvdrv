@@ -39,6 +39,13 @@ struct nvc_device {
 	unsigned int primary_flags;
 };
 
+struct nvc_texobj {
+	bool used;
+	uint32_t tic, tsc;
+	CUDA_RESOURCE_DESC res;
+	CUDA_TEXTURE_DESC desc;
+};
+
 /* a GEM object mapped into the context's GPU VM (and maybe the CPU) */
 struct nvc_bo {
 	uint32_t handle;
@@ -77,10 +84,17 @@ struct CUctx_st {
 	struct nvc_bo slm;		/* shader local memory for all TPCs */
 	uint32_t slm_per_thread;
 	struct CUmod_st *modules;
+	/* textures (texobj.c): header and sampler pools, bound to the compute channel */
+	struct nvc_bo tic_pool, tsc_pool;
+	uint64_t tic_used[64], tsc_used[16];
+	struct nvc_texobj *texobjs;
+	int ntexobjs;
+	bool tex_dirty;			/* headers changed: invalidate the caches at the next launch */
 	struct nvc_bo push;		/* push ring */
 	uint32_t push_off;
 	struct nvc_bo staging;		/* pageable copies */
 	struct nvc_bo events;		/* event timestamps */
+	struct nvc_bo dummy;		/* NVC_DUMMY_VA: absorbs inactive generic accesses */
 	uint64_t event_used[NVC_EVENT_SLOTS / 64];
 	struct CUstream_st null_stream;	/* stream 0 / legacy */
 	struct CUstream_st **streams;	/* user streams, for cuCtxSynchronize */
@@ -132,6 +146,11 @@ uint32_t *nvc_mthd(uint32_t *p, int subc, uint32_t mthd, int n, const uint32_t *
 CUresult nvc_upload(struct CUctx_st *ctx, uint64_t va, const void *data, size_t bytes);
 CUresult nvc_mem_alloc_device(struct CUctx_st *ctx, size_t bytes, uint64_t *va);
 void nvc_mem_free_device(struct CUctx_st *ctx, uint64_t va);
+
+/* texobj.c */
+int nvc_tex_pools_init(struct CUctx_st *ctx);
+void nvc_tex_pools_fini(struct CUctx_st *ctx);
+uint32_t nvc_tex_pool_counts(uint32_t *tsc);
 
 /* module.c */
 void nvc_modules_drop(struct CUctx_st *ctx);

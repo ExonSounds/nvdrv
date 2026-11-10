@@ -26,8 +26,110 @@
 #include "nak.h"
 #include "nv_device_info.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "compile.h"
 #include "ptx.h"
+
+/* ---- on-disk cache of compiled kernels: $XDG_CACHE_HOME/nvcuda (NVCUDA_CACHE=0 disables) ---- */
+
+#define CACHE_MAGIC	"NVCUDAK2"
+#define CACHE_VERSION	"nvcuda-2026-11-10b"	/* bump when the compiler or the ABI changes */
+
+struct cache_hdr {
+	char magic[8];
+	uint32_t info_size, code_size, shared_static, shared_hidden, max_threads, nparams, param_bytes, pad;
+};
+
+static uint64_t fnv(uint64_t h, const void *data, size_t len)
+{
+	const uint8_t *p = data;
+
+	while (len--)
+		h = (h ^ *p++) * 0x100000001b3ull;
+	return h;
+}
+
+static bool cache_path(uint64_t key, char *path, size_t len, bool create)
+{
+	const char *e = getenv("NVCUDA_CACHE"), *x = getenv("XDG_CACHE_HOME"), *home = getenv("HOME");
+	char dir[512];
+
+	if (e && e[0] == '0')
+		return false;
+	if (x && x[0])
+		snprintf(dir, sizeof(dir), "%s/nvcuda", x);
+	else if (home && home[0])
+		snprintf(dir, sizeof(dir), "%s/.cache/nvcuda", home);
+	else
+		return false;
+	if (create && mkdir(dir, 0700) && errno != EEXIST)
+		return false;
+	snprintf(path, len, "%s/%016llx.bin", dir, (unsigned long long)key);
+	return true;
+}
+
+static struct nvc_kernel_bin *cache_load(uint64_t key)
+{
+	char path[600];
+	struct cache_hdr h;
+	struct nvc_kernel_bin *kb = NULL;
+	FILE *f;
+
+	if (!cache_path(key, path, sizeof(path), false) || !(f = fopen(path, "rb")))
+		return NULL;
+	if (fread(&h, sizeof(h), 1, f) != 1 || memcmp(h.magic, CACHE_MAGIC, 8) ||
+	    h.info_size != sizeof(struct nak_shader_info) || h.nparams > NVC_MAX_PARAMS)
+		goto out;
+	kb = calloc(1, sizeof(*kb));
+	if (!kb)
+		goto out;
+	kb->info = malloc(h.info_size);
+	kb->code = malloc(h.code_size);
+	if (!kb->info || !kb->code || fread(kb->info, h.info_size, 1, f) != 1 ||
+	    fread(kb->params, sizeof(kb->params[0]), h.nparams, f) != h.nparams ||
+	    (h.code_size && fread(kb->code, h.code_size, 1, f) != 1)) {
+		nvc_kernel_bin_free(kb);
+		kb = NULL;
+		goto out;
+	}
+	kb->code_size = h.code_size;
+	kb->shared_static = h.shared_static;
+	kb->shared_hidden = h.shared_hidden;
+	kb->max_threads = h.max_threads;
+	kb->nparams = h.nparams;
+	kb->param_bytes = h.param_bytes;
+out:
+	fclose(f);
+	return kb;
+}
+
+static void cache_store(uint64_t key, const struct nvc_kernel_bin *kb)
+{
+	char path[600], tmp[620];
+	struct cache_hdr h = { CACHE_MAGIC, sizeof(struct nak_shader_info), kb->code_size, kb->shared_static,
+			       kb->shared_hidden, kb->max_threads, kb->nparams, kb->param_bytes, 0 };
+	FILE *f;
+
+	if (!cache_path(key, path, sizeof(path), true))
+		return;
+	snprintf(tmp, sizeof(tmp), "%s.%d", path, getpid());
+	f = fopen(tmp, "wb");
+	if (!f)
+		return;
+	if (fwrite(&h, sizeof(h), 1, f) == 1 && fwrite(kb->info, h.info_size, 1, f) == 1 &&
+	    fwrite(kb->params, sizeof(kb->params[0]), kb->nparams, f) == kb->nparams &&
+	    (!kb->code_size || fwrite(kb->code, kb->code_size, 1, f) == 1) && !fclose(f)) {
+		if (rename(tmp, path))
+			unlink(tmp);
+	} else {
+		fclose(f);
+		unlink(tmp);
+	}
+}
 
 static struct nak_compiler *nak;
 static struct nv_device_info devinfo;
@@ -108,6 +210,14 @@ static void optimize(nir_shader *nir)
 		NIR_PASS(progress, nir, nir_opt_constant_folding);
 		NIR_PASS(progress, nir, nir_opt_algebraic);
 		NIR_PASS(progress, nir, nir_opt_undef);
+		NIR_PASS(progress, nir, nir_opt_if, nir_opt_if_optimize_phi_true_false);
+		{
+			/* small branches become selects: fewer blocks (NAK's memory grows with blocks x values) */
+			nir_opt_peephole_select_options sel = { .limit = 16, .indirect_load_ok = true,
+								.expensive_alu_ok = true };
+
+			NIR_PASS(progress, nir, nir_opt_peephole_select, &sel);
+		}
 	} while (progress);
 }
 
@@ -191,6 +301,8 @@ static struct nvc_kernel_bin *finish(nir_shader *nir, struct nvc_kernel_bin *kb,
 	nak_lower_nir_before_linking(nir, nak);
 	nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 	kb->shared_static = nir->info.shared_size;
+	if (kb->shared_hidden > kb->shared_static)
+		kb->shared_hidden = kb->shared_static;
 	if (getenv("NVCUDA_DUMP_NIR"))
 		nir_print_shader(nir, stderr);
 
@@ -219,8 +331,8 @@ static struct nvc_kernel_bin *finish(nir_shader *nir, struct nvc_kernel_bin *kb,
 	return kb;
 }
 
-struct nvc_kernel_bin *nvc_compile_spirv(const uint32_t *words, size_t nwords, const char *entry, char *err,
-					 size_t errlen)
+static struct nvc_kernel_bin *compile_spirv(const uint32_t *words, size_t nwords, const char *entry, char *err,
+					    size_t errlen)
 {
 	const nir_shader_compiler_options *nir_opts = nak_nir_options(nak);
 	struct nvc_kernel_bin *kb = NULL;
@@ -356,8 +468,25 @@ const struct nak_constant_offset_info nak_const_offsets_turing_graphics = {
 	.printf_buffer_offset = 0x18,
 };
 
+/* NVCUDA_STATS=1: instruction and block counts per stage (compile-time problems on big kernels) */
+static void stats(nir_shader *nir, const char *stage)
+{
+	nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+	unsigned int blocks = 0, instrs = 0;
+
+	if (!getenv("NVCUDA_STATS"))
+		return;
+	nir_foreach_block(block, impl) {
+		blocks++;
+		nir_foreach_instr(instr, block)
+			instrs++;
+	}
+	fprintf(stderr, "nvcuda: %s: %s: %u blocks, %u instructions, scratch %u, shared %u\n", nir->info.name, stage,
+		blocks, instrs, nir->scratch_size, nir->info.shared_size);
+}
+
 /* PTX text -> NIR (ptx.c) -> the same tail as SPIR-V */
-struct nvc_kernel_bin *nvc_compile_ptx(const char *ptx, const char *entry, uint64_t globals_va, char *err, size_t errlen)
+static struct nvc_kernel_bin *compile_ptx(const char *ptx, const char *entry, uint64_t globals_va, char *err, size_t errlen)
 {
 	struct nvc_kernel_bin *kb = calloc(1, sizeof(*kb));
 	nir_shader *nir;
@@ -375,10 +504,14 @@ struct nvc_kernel_bin *nvc_compile_ptx(const char *ptx, const char *entry, uint6
 		ralloc_free(nir);
 		return NULL;
 	}
+	kb->shared_hidden = NVC_DUMMY_BYTES;
 	nir_validate_shader(nir, "after the PTX front end");
+	stats(nir, "front end");
 	NIR_PASS(_, nir, nir_lower_goto_ifs);		/* PTX's branches -> structured control flow */
+	stats(nir, "structured");
 	NIR_PASS(_, nir, nir_opt_dead_cf);
 	NIR_PASS(_, nir, nir_lower_vars_to_ssa);	/* PTX registers -> SSA */
+	stats(nir, "ssa");
 	NIR_PASS(_, nir, nir_lower_system_values);
 	{
 		nir_lower_compute_system_values_options cs = { 0 };
@@ -386,5 +519,45 @@ struct nvc_kernel_bin *nvc_compile_ptx(const char *ptx, const char *entry, uint6
 		NIR_PASS(_, nir, nir_lower_compute_system_values, &cs);
 	}
 	optimize(nir);
+	stats(nir, "optimized");
 	return finish(nir, kb, err, errlen);
+}
+
+struct nvc_kernel_bin *nvc_compile_spirv(const uint32_t *words, size_t nwords, const char *entry, char *err,
+					 size_t errlen)
+{
+	uint64_t key = 0xcbf29ce484222325ull;
+	struct nvc_kernel_bin *kb;
+
+	key = fnv(key, CACHE_VERSION, strlen(CACHE_VERSION));
+	key = fnv(key, "spirv", 5);
+	key = fnv(key, entry, strlen(entry) + 1);
+	key = fnv(key, words, nwords * 4);
+	kb = cache_load(key);
+	if (kb)
+		return kb;
+	kb = compile_spirv(words, nwords, entry, err, errlen);
+	if (kb)
+		cache_store(key, kb);
+	return kb;
+}
+
+struct nvc_kernel_bin *nvc_compile_ptx(const char *ptx, const char *entry, uint64_t globals_va, char *err, size_t errlen)
+{
+	uint64_t key = 0xcbf29ce484222325ull;
+	struct nvc_kernel_bin *kb;
+
+	/* the globals address is an immediate in the code */
+	key = fnv(key, CACHE_VERSION, strlen(CACHE_VERSION));
+	key = fnv(key, "ptx", 3);
+	key = fnv(key, entry, strlen(entry) + 1);
+	key = fnv(key, &globals_va, sizeof(globals_va));
+	key = fnv(key, ptx, strlen(ptx));
+	kb = cache_load(key);
+	if (kb)
+		return kb;
+	kb = compile_ptx(ptx, entry, globals_va, err, errlen);
+	if (kb)
+		cache_store(key, kb);
+	return kb;
 }

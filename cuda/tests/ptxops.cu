@@ -200,3 +200,31 @@ extern "C" __global__ void calls(float *out, unsigned int *iout, int n)
 	if (i % 97 == 0)
 		__atomic_fetch_add(&hits, 1ull, __ATOMIC_RELAXED);
 }
+
+/* ---- textures: inline PTX, the forms nvcc emits for tex2D / tex1Dfetch on texture objects ---- */
+
+extern "C" __global__ void tex2d(float *out, unsigned long long tex, float x0, float y0, float dx, float dy,
+				 int w, int h)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= w * h)
+		return;
+	float x = x0 + (i % w) * dx, y = y0 + (i / w) * dy, r, g, b, a;
+	asm volatile("tex.2d.v4.f32.f32 {%0, %1, %2, %3}, [%4, {%5, %6}];"
+		     : "=f"(r), "=f"(g), "=f"(b), "=f"(a) : "l"(tex), "f"(x), "f"(y));
+	out[i * 4 + 0] = r;
+	out[i * 4 + 1] = g;
+	out[i * 4 + 2] = b;
+	out[i * 4 + 3] = a;
+}
+
+extern "C" __global__ void tex1dfetch(float *out, unsigned long long tex, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n)
+		return;
+	float r, g, b, a;
+	asm volatile("tex.1d.v4.f32.s32 {%0, %1, %2, %3}, [%4, {%5}];"
+		     : "=f"(r), "=f"(g), "=f"(b), "=f"(a) : "l"(tex), "r"(i));
+	out[i] = r + g * 1000.0f;
+}

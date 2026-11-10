@@ -20,7 +20,10 @@
 #define C7B5_LAUNCH_DMA			0x300
 #define C7B5_OFFSET_IN_UPPER		0x400
 #define C7B5_OFFSET_OUT_UPPER		0x408
+#define C7B5_PITCH_IN			0x410
 #define C7B5_LINE_LENGTH_IN		0x418
+#define C7B5_LINE_COUNT			0x41c
+#define LAUNCH_MULTI_LINE		(1u << 9)
 #define C7B5_SET_REMAP_CONST_A		0x700
 #define C7B5_SET_REMAP_COMPONENTS	0x708
 /* non-pipelined, flush, pitch -> pitch, virtual addresses, no semaphore (EXEC signals) */
@@ -206,6 +209,22 @@ static CUresult ce_copy(struct CUctx_st *ctx, struct CUstream_st *s, uint64_t ds
 		bytes -= n;
 	}
 	return CUDA_SUCCESS;
+}
+
+/* lines rows of width bytes: dst (pitch dp) <- src (pitch sp), GPU VAs. Caller holds ctx->lock. */
+static CUresult ce_copy2d(struct CUctx_st *ctx, struct CUstream_st *s, uint64_t dst, uint32_t dp, uint64_t src,
+			  uint32_t sp, uint32_t width, uint32_t lines)
+{
+	uint32_t io[4] = { (uint32_t)(src >> 32), (uint32_t)src, (uint32_t)(dst >> 32), (uint32_t)dst };
+	uint32_t pitches[2] = { sp, dp };
+	uint32_t *start = nvc_push_begin(ctx, 12), *p = start;
+
+	p = nvc_mthd(p, NVC_SUBC_CE, C7B5_OFFSET_IN_UPPER, 4, io);
+	p = nvc_mthd(p, NVC_SUBC_CE, C7B5_PITCH_IN, 2, pitches);
+	p = nvc_mthd1(p, NVC_SUBC_CE, C7B5_LINE_LENGTH_IN, width);
+	p = nvc_mthd1(p, NVC_SUBC_CE, C7B5_LINE_COUNT, lines);
+	p = nvc_mthd1(p, NVC_SUBC_CE, C7B5_LAUNCH_DMA, LAUNCH_COPY | LAUNCH_MULTI_LINE);
+	return nvc_push_submit(ctx, s, ctx->ce_chan, start, p);
 }
 
 /* dst <- value, count elements of 1, 2 or 4 bytes (remap: DST_X = CONST_A). */
@@ -455,4 +474,135 @@ CUAPI CUresult cuMemsetD16Async(CUdeviceptr dst, unsigned short value, size_t co
 CUAPI CUresult cuMemsetD16Async(CUdeviceptr dst, unsigned short value, size_t count, CUstream stream)
 {
 	return memset_d(dst, value, 2, count, stream, true);
+}
+
+/* ---- 2D copies (CUDA_MEMCPY2D): rows of WidthInBytes, pitched on either side ---- */
+
+static CUresult memcpy2d(const CUDA_MEMCPY2D *m, CUstream stream, bool async)
+{
+	struct CUctx_st *ctx = NULL;
+	struct CUstream_st *s;
+	uint64_t dsrc = 0, ddst = 0, half = NVC_STAGING_SIZE / 2;
+	const char *hsrc = NULL;
+	char *hdst = NULL;
+	uint32_t w, h, sp, dp, y, rows;
+	CUresult r = CUDA_SUCCESS;
+	int hh = 0;
+
+	if (!m)
+		return CUDA_ERROR_INVALID_VALUE;
+	w = (uint32_t)m->WidthInBytes;
+	h = (uint32_t)m->Height;
+	sp = (uint32_t)m->srcPitch;
+	dp = (uint32_t)m->dstPitch;
+	if (!w || !h)
+		return CUDA_SUCCESS;
+	if (m->srcMemoryType == CU_MEMORYTYPE_ARRAY || m->dstMemoryType == CU_MEMORYTYPE_ARRAY)
+		return CUDA_ERROR_NOT_SUPPORTED;
+	if (sp < w || dp < w)
+		return CUDA_ERROR_INVALID_VALUE;
+	/* sides: a device pointer (device or unified memory) or a host pointer (pinned or pageable) */
+	if (m->srcMemoryType == CU_MEMORYTYPE_HOST || (m->srcMemoryType == CU_MEMORYTYPE_UNIFIED && m->srcHost &&
+						      !nvc_alloc_find_va((uint64_t)(uintptr_t)m->srcHost, 0)))
+		hsrc = (const char *)m->srcHost + m->srcY * sp + m->srcXInBytes;
+	else
+		dsrc = (m->srcMemoryType == CU_MEMORYTYPE_UNIFIED ? (uint64_t)(uintptr_t)m->srcHost : m->srcDevice) +
+		       m->srcY * sp + m->srcXInBytes;
+	if (m->dstMemoryType == CU_MEMORYTYPE_HOST || (m->dstMemoryType == CU_MEMORYTYPE_UNIFIED && m->dstHost &&
+						      !nvc_alloc_find_va((uint64_t)(uintptr_t)m->dstHost, 0)))
+		hdst = (char *)m->dstHost + m->dstY * dp + m->dstXInBytes;
+	else
+		ddst = (m->dstMemoryType == CU_MEMORYTYPE_UNIFIED ? (uint64_t)(uintptr_t)m->dstHost : m->dstDevice) +
+		       m->dstY * dp + m->dstXInBytes;
+	if (hsrc && hdst) {
+		for (y = 0; y < h; y++)
+			memcpy(hdst + (size_t)y * dp, hsrc + (size_t)y * sp, w);
+		return CUDA_SUCCESS;
+	}
+	if (dsrc && !(ctx = dev_range(dsrc, (uint64_t)(h - 1) * sp + w)))
+		return CUDA_ERROR_INVALID_VALUE;
+	if (ddst && !(ctx = dev_range(ddst, (uint64_t)(h - 1) * dp + w)))
+		return CUDA_ERROR_INVALID_VALUE;
+	s = nvc_stream(ctx, stream);
+	if (!s)
+		return CUDA_ERROR_INVALID_HANDLE;
+	if (hsrc) {
+		uint64_t pin = pinned_va(ctx, hsrc, (uint64_t)(h - 1) * sp + w);
+
+		if (pin) {
+			pthread_mutex_lock(&ctx->lock);
+			r = ce_copy2d(ctx, s, ddst, dp, pin, sp, w, h);
+			pthread_mutex_unlock(&ctx->lock);
+			return r || async ? r : nvc_stream_wait_idle(s);
+		}
+		if (w > half)
+			return CUDA_ERROR_INVALID_VALUE;	/* rows wider than the staging half */
+		rows = (uint32_t)(half / w);
+		{
+			uint64_t half_point[2] = { 0, 0 };
+
+			for (y = 0; y < h && r == CUDA_SUCCESS; y += rows) {
+				uint32_t n = h - y < rows ? h - y : rows, i;
+				char *stage = (char *)ctx->staging.map + hh * half;
+
+				if (half_point[hh])
+					nvc_stream_wait_idle(&(struct CUstream_st){ .ctx = ctx, .tl = s->tl, .point = half_point[hh] });
+				for (i = 0; i < n; i++)
+					memcpy(stage + (size_t)i * w, hsrc + (size_t)(y + i) * sp, w);
+				pthread_mutex_lock(&ctx->lock);
+				r = ce_copy2d(ctx, s, ddst + (uint64_t)y * dp, dp, ctx->staging.va + hh * half, w, w, n);
+				half_point[hh] = s->point;
+				pthread_mutex_unlock(&ctx->lock);
+				hh ^= 1;
+			}
+		}
+		return r ? r : nvc_stream_wait_idle(s);
+	}
+	if (hdst) {
+		uint64_t pin = pinned_va(ctx, hdst, (uint64_t)(h - 1) * dp + w);
+
+		if (pin) {
+			pthread_mutex_lock(&ctx->lock);
+			r = ce_copy2d(ctx, s, pin, dp, dsrc, sp, w, h);
+			pthread_mutex_unlock(&ctx->lock);
+			return r || async ? r : nvc_stream_wait_idle(s);
+		}
+		if (w > half)
+			return CUDA_ERROR_INVALID_VALUE;
+		rows = (uint32_t)(half / w);
+		for (y = 0; y < h && r == CUDA_SUCCESS; y += rows) {
+			uint32_t n = h - y < rows ? h - y : rows, i;
+			uint64_t point;
+
+			pthread_mutex_lock(&ctx->lock);
+			r = ce_copy2d(ctx, s, ctx->staging.va, w, dsrc + (uint64_t)y * sp, sp, w, n);
+			point = s->point;
+			pthread_mutex_unlock(&ctx->lock);
+			if (r)
+				break;
+			r = nvc_stream_wait_idle(&(struct CUstream_st){ .ctx = ctx, .tl = s->tl, .point = point });
+			for (i = 0; i < n; i++)
+				memcpy(hdst + (size_t)(y + i) * dp, (char *)ctx->staging.map + (size_t)i * w, w);
+		}
+		return r;
+	}
+	pthread_mutex_lock(&ctx->lock);
+	r = ce_copy2d(ctx, s, ddst, dp, dsrc, sp, w, h);
+	pthread_mutex_unlock(&ctx->lock);
+	return r || async ? r : nvc_stream_wait_idle(s);
+}
+
+CUAPI CUresult cuMemcpy2D_v2(const CUDA_MEMCPY2D *copy)
+{
+	return memcpy2d(copy, NULL, false);
+}
+
+CUAPI CUresult cuMemcpy2DUnaligned_v2(const CUDA_MEMCPY2D *copy)
+{
+	return memcpy2d(copy, NULL, false);
+}
+
+CUAPI CUresult cuMemcpy2DAsync_v2(const CUDA_MEMCPY2D *copy, CUstream stream)
+{
+	return memcpy2d(copy, stream, true);
 }
