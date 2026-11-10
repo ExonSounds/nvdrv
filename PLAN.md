@@ -753,7 +753,9 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
           USERD slot per chid).
       - [ ] Userspace: Mesa 26.2 NVK has no video queue, and Mesa has no VA-API driver for Ampere. The nouveau uAPI
         has no NVDEC/NVENC engine bit (`NOUVEAU_FIFO_ENGINE_*` stops at CE). Expose it once a consumer exists.
-- [ ] OFA (optical flow).
+- [ ] OFA (optical flow): set up like NVDEC (RM type 0x3d, NV2080 0x33, class NVC7FA, nouveau r570/ofa.c). No
+      public method header (`clc7fa.h` has only the class number, open-gpu-doc has no OFA methods), so there is no
+      documented engine test; left until a consumer or documentation exists.
 
 ### Platform
 - [ ] Firmware versions other than 570.144 (the RPC ABI changes per release).
