@@ -4,6 +4,7 @@
 #define NVCUDA_COMPILE_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 /* nvcuda's constant buffer 0 */

@@ -11,3 +11,4 @@ modules.order
 __pycache__/
 cuda/build/
 cuda/mesa/mesa.mk
+cuda/mesa/mesa-debug.mk

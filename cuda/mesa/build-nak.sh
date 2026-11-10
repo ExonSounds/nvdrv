@@ -4,31 +4,38 @@
 # Needs: rust >= 1.85, rust-bindgen, cbindgen, meson >= 1.7, python-mako, python-yaml, libelf, libdrm.
 # No LLVM, libclc or SPIRV-LLVM-Translator: nak-standalone.patch adds -Dnak-standalone=true, which
 # builds src/nouveau/{rust,nil,compiler} without NVK and so without NVK's CLC dependency.
+# DEBUG=1 builds a second tree, build-nak-debug (asserts and NIR validation on), and writes
+# mesa-debug.mk for `make build/nakc-dbg build/cfgtest MESA_MK=mesa/mesa-debug.mk`.
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 MESA=${1:-$HERE/../../ref/mesa-src}
 COMMIT=06dce0e7778c349aad0bd7a18f8356cd61654fb0
+if [ -n "$DEBUG" ]; then
+	BUILD=build-nak-debug; TYPE="-Dbuildtype=debugoptimized -Db_ndebug=false"; MK=mesa-debug.mk
+else
+	BUILD=build-nak; TYPE="-Dbuildtype=release"; MK=mesa.mk
+fi
 if [ ! -d "$MESA/.git" ]; then
 	git clone https://gitlab.freedesktop.org/mesa/mesa.git "$MESA"
 	git -C "$MESA" checkout $COMMIT
 fi
 cd "$MESA"
 git apply --check "$HERE/nak-standalone.patch" 2>/dev/null && git apply "$HERE/nak-standalone.patch"
-[ -d build-nak ] || meson setup build-nak -Dnak-standalone=true -Dvulkan-drivers= -Dgallium-drivers= \
+[ -d $BUILD ] || meson setup $BUILD -Dnak-standalone=true -Dvulkan-drivers= -Dgallium-drivers= \
 	-Dplatforms= -Dglx=disabled -Degl=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled \
-	-Dllvm=disabled -Dbuildtype=release -Dvideo-codecs=
-ninja -C build-nak src/nouveau/compiler/libnak.a src/nouveau/compiler/libnak_rs.a \
+	-Dllvm=disabled $TYPE -Dvideo-codecs=
+ninja -C $BUILD src/nouveau/compiler/libnak.a src/nouveau/compiler/libnak_rs.a \
 	src/nouveau/nil/libnil.a src/nouveau/nil/liblibnil_format_table.a \
 	src/compiler/libcompiler.a src/compiler/rust/libcompiler_bindings.a src/compiler/rust/libcompiler_c_helpers.a \
 	src/util/libmesa_util.a src/c11/impl/libmesa_util_c11.a src/util/blake3/libblake3.a \
 	src/compiler/spirv/libvtn.a src/compiler/nir/libnir.a
-echo "NAK built in $MESA/build-nak"
+echo "NAK built in $MESA/$BUILD"
 
 # flags and libraries for cuda/Makefile (generated, not committed)
-python3 - "$MESA" "$HERE/mesa.mk" <<'PY'
+python3 - "$MESA" "$HERE/$MK" "$BUILD" <<'PY'
 import json, os, sys
-mesa, out = sys.argv[1], sys.argv[2]
-b = os.path.join(mesa, 'build-nak')
+mesa, out, build = sys.argv[1], sys.argv[2], sys.argv[3]
+b = os.path.join(mesa, build)
 for e in json.load(open(os.path.join(b, 'compile_commands.json'))):
     if e['file'].endswith('nak_nir.c'):
         fl = []
@@ -50,4 +57,4 @@ with open(out, 'w') as f:
     f.write('MESA_LIBS = ' + ' '.join(os.path.join(b, l) for l in libs) + '\n')
     f.write('MESA_SYSLIBS = -lSPIRV-Tools-opt -lSPIRV-Tools -lzstd -lz -lm -lpthread -ldl -lelf -lunwind\n')
 PY
-echo "wrote $HERE/mesa.mk"
+echo "wrote $HERE/$MK"

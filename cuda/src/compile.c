@@ -40,7 +40,7 @@
 /* ---- on-disk cache of compiled kernels: $XDG_CACHE_HOME/nvcuda (NVCUDA_CACHE=0 disables) ---- */
 
 #define CACHE_MAGIC	"NVCUDAK2"
-#define CACHE_VERSION	"nvcuda-2026-11-10c"	/* bump when the compiler or the ABI changes */
+#define CACHE_VERSION	"nvcuda-2026-11-10f"	/* bump when the compiler or the ABI changes */
 
 struct cache_hdr {
 	char magic[8];
@@ -298,6 +298,7 @@ static struct nvc_kernel_bin *finish(nir_shader *nir, struct nvc_kernel_bin *kb,
 	 */
 	nir->info.workgroup_size[0] = kb->max_threads ? kb->max_threads : 1;	/* .maxntid: nvcc's cap too */
 	nir->info.workgroup_size[1] = nir->info.workgroup_size[2] = 1;
+	nir->info.io_lowered = true;	/* kernels have no shader IO; NAK asserts the flag */
 	nak_preprocess_nir(nir, nak);
 	NIR_PASS(_, nir, nir_lower_int64);
 	optimize(nir);
@@ -479,7 +480,7 @@ static void stats(nir_shader *nir, const char *stage)
 
 	if (!getenv("NVCUDA_STATS"))
 		return;
-	nir_foreach_block(block, impl) {
+	nir_foreach_block_unstructured(block, impl) {
 		blocks++;
 		nir_foreach_instr(instr, block)
 			instrs++;
@@ -557,6 +558,37 @@ static void stats(nir_shader *nir, const char *stage)
 }
 
 /* PTX text -> NIR (ptx.c) -> the same tail as SPIR-V */
+/*
+ * nir_lower_goto_ifs emits a bare return for a branch target it could not route (release builds
+ * assert nothing). The front end funnels every exit through a block holding a nop marker, so a
+ * return not preceded by the marker is a miscompile in the making. The markers are removed here.
+ */
+static bool structurized_ok(nir_shader *nir)
+{
+	nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+	bool ok = true;
+
+	nir_foreach_block(block, impl) {
+		nir_foreach_instr(instr, block) {
+			nir_instr *prev;
+
+			if (instr->type != nir_instr_type_jump || nir_instr_as_jump(instr)->type != nir_jump_return)
+				continue;
+			prev = nir_instr_prev(instr);
+			if (!prev || prev->type != nir_instr_type_intrinsic ||
+			    nir_instr_as_intrinsic(prev)->intrinsic != nir_intrinsic_nop)
+				ok = false;
+		}
+	}
+	nir_foreach_block(block, impl) {
+		nir_foreach_instr_safe(instr, block) {
+			if (instr->type == nir_instr_type_intrinsic && nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_nop)
+				nir_instr_remove(instr);
+		}
+	}
+	return ok;
+}
+
 static struct nvc_kernel_bin *compile_ptx_once(const char *ptx, const char *entry,
 					       const struct nvc_ptx_opts *po, char *err, size_t errlen)
 {
@@ -579,6 +611,20 @@ static struct nvc_kernel_bin *compile_ptx_once(const char *ptx, const char *entr
 	kb->shared_hidden = NVC_DUMMY_BYTES;
 	nir_validate_shader(nir, "after the PTX front end");
 	stats(nir, "front end");
+	if (getenv("NVCUDA_DUMP_CFG")) {	/* the unstructured CFG, one block per line, for offline analysis */
+		nir_foreach_block_unstructured(block, nir_shader_get_entrypoint(nir)) {
+			nir_instr *last = nir_block_last_instr(block);
+			nir_jump_instr *j = last && last->type == nir_instr_type_jump ? nir_instr_as_jump(last) : NULL;
+
+			if (j && j->type == nir_jump_goto_if)
+				fprintf(stderr, "cfg %u: goto_if %u %u\n", block->index, j->target->index, j->else_target->index);
+			else if (j && j->type == nir_jump_goto)
+				fprintf(stderr, "cfg %u: goto %u\n", block->index, j->target->index);
+			else
+				fprintf(stderr, "cfg %u: none\n", block->index);
+		}
+		fprintf(stderr, "cfg end %u\n", nir_shader_get_entrypoint(nir)->end_block->index);
+	}
 	if (getenv("NVCUDA_FRONTEND_ONLY")) {
 		set_err(err, errlen, "stopped after the front end (NVCUDA_FRONTEND_ONLY)");
 		free(kb);
@@ -587,6 +633,12 @@ static struct nvc_kernel_bin *compile_ptx_once(const char *ptx, const char *entr
 	}
 	if (!getenv("NVCUDA_NO_STRUCTURIZE"))	/* experiment: NAK's from_nir takes goto/goto_if itself */
 		NIR_PASS(_, nir, nir_lower_goto_ifs);		/* PTX's branches -> structured control flow */
+	if (!structurized_ok(nir)) {
+		set_err(err, errlen, "unroutable branch: the structurizer gave up on this control flow (irreducible)");
+		free(kb);
+		ralloc_free(nir);
+		return NULL;
+	}
 	stats(nir, "structured");
 	if (getenv("NVCUDA_STATS")) {	/* any goto left means a block the structurizer did not reach */
 		unsigned int left = 0, nulls = 0;
@@ -736,6 +788,13 @@ static struct nvc_kernel_bin *compile_ptx_forked(const char *ptx, const char *en
 	close(fds[0]);
 	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
 		;
+	if (!kb && WIFSIGNALED(status)) {	/* SIGKILL is the OOM killer in practice */
+		char why[128];
+
+		snprintf(why, sizeof(why), "the compiler was killed by signal %d%s", WTERMSIG(status),
+			 WTERMSIG(status) == SIGKILL ? " (out of memory?)" : "");
+		set_err(err, errlen, why);
+	}
 	return kb;
 }
 
@@ -750,13 +809,15 @@ static struct nvc_kernel_bin *compile_ptx(const char *ptx, const char *entry, ch
 	unsigned int i;
 
 	for (i = 0; i < sizeof(tries) / sizeof(tries[0]) && !kb; i++) {
+		if (i && strstr(err, "ptx line"))
+			break;	/* the PTX itself is the problem */
+		if (i == 1 && (strstr(err, "unroutable") || strstr(err, "irreducible")))
+			i = 2;	/* the outlined calls' control flow is what it cannot route: straight to inlining */
 		if (i && getenv("NVCUDA_DEBUG"))
 			fprintf(stderr, "nvcuda: %s: retrying (outline %d, regmem %d): %s\n", entry, tries[i].outline,
 				tries[i].regmem, err);
-		if (i && strstr(err, "ptx line"))
-			break;	/* the PTX itself is the problem */
 		kb = compile_ptx_forked(ptx, entry, &tries[i], err, errlen);
-		if (!kb && strstr(err, "crashed"))	/* the crash follows the address layout: once more as is */
+		if (!kb && (strstr(err, "crashed") || strstr(err, "killed by signal")))	/* the crash follows the address layout: once more as is */
 			kb = compile_ptx_forked(ptx, entry, &tries[i], err, errlen);
 	}
 	return kb;

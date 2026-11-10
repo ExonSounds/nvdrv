@@ -6,7 +6,9 @@ CFLAGS += -std=gnu11 -D_GNU_SOURCE -fPIC -fvisibility=hidden -Wall -Wextra -Wno-
 	  -Iinclude -I../uapi $(shell pkg-config --cflags libdrm)
 LIBS = $(shell pkg-config --libs libdrm) -lpthread
 
--include mesa/mesa.mk
+# mesa/mesa-debug.mk (from mesa/build-nak.sh DEBUG=1) for the validating targets nakc-dbg and cfgtest
+MESA_MK ?= mesa/mesa.mk
+-include $(MESA_MK)
 ifeq ($(MESA_LIBS),)
 $(error Mesa's NAK is not built: run mesa/build-nak.sh first)
 endif
@@ -39,6 +41,15 @@ build/cudatest: tests/cudatest.c build/libcuda.so.1
 # offline compiler check: build/nakc file.spv entry...
 build/nakc: tests/nakc.c build/compile.o build/ptx.o $(MESA_LIBS)
 	$(CC) -O2 -g -o $@ $< build/compile.o build/ptx.o -Wl,--start-group $(MESA_LIBS) -Wl,--end-group $(MESA_SYSLIBS)
+
+# Diagnosis against an asserts-on Mesa (mesa/build-nak.sh DEBUG=1; then MESA_MK=mesa/mesa-debug.mk):
+# nakc-dbg validates the NIR after every pass; cfgtest runs the structurizer on a dumped CFG shape.
+build/nakc-dbg: tests/nakc.c src/compile.c src/ptx.c src/compile.h src/ptx.h $(MESA_LIBS)
+	$(CC) -O1 -g -std=gnu11 -D_GNU_SOURCE -Wall -Iinclude -I../uapi -I/usr/include/libdrm $(MESA_CFLAGS) \
+		-o $@ tests/nakc.c src/compile.c src/ptx.c -Wl,--start-group $(MESA_LIBS) -Wl,--end-group $(MESA_SYSLIBS)
+
+build/cfgtest: tests/cfgtest.c $(MESA_LIBS)
+	$(CC) -O1 -g $(MESA_CFLAGS) -o $@ $< -Wl,--start-group $(MESA_LIBS) -Wl,--end-group $(MESA_SYSLIBS)
 
 # CUDA C++ -> SPIR-V with clang (no NVIDIA SDK): include/nvcuda/device.h supplies threadIdx & co.
 build/kernels.spv: tests/kernels.cu include/nvcuda/device.h

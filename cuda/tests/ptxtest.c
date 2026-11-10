@@ -576,6 +576,51 @@ done:
 		free(out);
 	}
 
+	/* irreducible control flow: a clean refusal is fine, a wrong result is not */
+	{
+		CUmodule m2;
+		CUfunction f2;
+		CUresult r = cuModuleLoad(&m2, "tests/irreducible.ptx");
+
+		if (r == CUDA_SUCCESS)
+			r = cuModuleGetFunction(&f2, m2, "irr");
+		if (r != CUDA_SUCCESS) {
+			TEST(1, "irreducible PTX refused cleanly (%d)", r);
+		} else {
+			uint32_t *out = malloc(N * 4), limit = N + 50;
+			int bad = 0, n = N;
+			CUdeviceptr dout = dalloc(N * 4, NULL);
+			void *args[] = { &dout, &limit };
+
+			CK(cuLaunchKernel(f2, N / 128, 1, 1, 128, 1, 1, 0, NULL, args, NULL));
+			CK(cuMemcpyDtoH(out, dout, N * 4));
+			for (int t = 0; t < n; t++) {
+				uint32_t i = t, acc = 0;
+				int at_b = t & 1;
+
+				for (;;) {
+					if (!at_b) {
+						acc += 3;
+						i += 1;
+						if (i >= limit)
+							break;
+						at_b = 1;
+					} else {
+						acc ^= i;
+						i += 2;
+						if (i >= limit)
+							break;
+						at_b = 0;
+					}
+				}
+				bad += out[t] != acc;
+			}
+			TEST(!bad, "irreducible loop (two entries) computed correctly (%d wrong)", bad);
+			free(out);
+			CK(cuModuleUnload(m2));
+		}
+	}
+
 	CK(cuModuleUnload(mod));
 	CK(cuCtxDestroy(ctx));
 	printf("%d/%d passed\n", total - fails, total);

@@ -907,11 +907,10 @@ not used.
            first block). nvcc defines ~1100 registers early that stay live to the end, which NAK's spiller cannot
            take at 20K+ blocks; this is what a spiller would do, done up front. shade_shadow: 27 s, 5.1 MB of
            code, 24 KB of local memory per thread (saxpy loses 30 % in this mode; small kernels never use it).
-        Plus: unreachable blocks (dead labels) are removed before structurizing; every compile runs in a forked
-        child with a retry ladder (default -> memory mode -> no outlining), because Mesa's `nir_lower_goto_ifs`
-        crashes on some shapes of these kernels (`loop_routing_end` -> `nir_handle_add_jump`, nondeterministic:
-        its pointer sets follow ASLR; the sanitizer build `build/asan/` showed it) and NAK's `from_nir` panics on
-        others. A JIT inside an application must not take it down.
+        Plus: every compile runs in a forked child with a retry ladder (default -> memory mode -> no
+        outlining); a crash in Mesa's `nir_lower_goto_ifs` or NAK must not take the application down. (The
+        crashes and the NAK `from_nir` panics were the irreducible-control-flow problem described under
+        milestone 4; fixed at the source, the ladder stays as the net.)
       - **Cycles 5.2.3: all 75 kernels compile** (631 s for all once, cached afterwards; 95 MB of code; up to
         30 KB of local memory per thread, about 1.5 GB of VRAM for local memory at full occupancy). 10 kernels
         use memory mode, 3 needed a retry.
@@ -938,10 +937,33 @@ not used.
         queue) or rendered the cube black (SSA mode); after the globals-through-cbuf0 change and a clean
         cache the default mode is right every time. Whether the earlier code was wrong or the structurizer's
         nondeterminism picked a bad shape is not settled (see below); the compile is now checked for it.
-      - [ ] **Open: SSA mode of `shade_surface` faults on the GPU** (`NVCUDA_REGMEM=0`, 38 KB local/thread, MMU
-        fault, also at 10 %), while memory mode is correct. Diagnosis in progress: a validating (asserts on)
-        build of NIR/NAK in `ref/mesa-src/build-nak-debug` to check the front end's NIR, and a determinism check
-        (three compiles of the same kernel compared). Only diagnostic modes are affected; the default is right.
+      - **Root cause of the loops, the black cube and the SSA-mode faults (2026-11-10)**, found with an
+        asserts-on build of Mesa (`mesa/build-nak.sh DEBUG=1`, then `make build/nakc-dbg build/cfgtest
+        MESA_MK=mesa/mesa-debug.mk`: NIR validation after every pass, NAK's debug asserts):
+        1. NIR requires unstructured blocks in reverse post-order (dominance is computed over that order and
+           `nir_lower_goto_ifs` sorts its sets by block index); the front end emitted them in parse order.
+           `nir_sort_unstructured_blocks` now runs before structurizing (it also drops unreachable blocks).
+        2. **Mesa's structurizer cannot do irreducible control flow** (a loop entered at two places), although
+           it has code for it: `set_path_vars` overwrites a path selection (`fork->path_ssa == NULL` assert) and
+           `route_to` turns a branch it cannot route into a bare `return` (`!target->successors[0]` assert). In
+           release builds both are silent, so the kernel exits early or runs the wrong block, and which branch is
+           hit follows pointer-hash order, which is why results differed run to run. Outlined calls are exactly
+           that shape: a shared body entered from call sites that do not dominate each other (30 such back
+           edges in `shade_dedicated_light`; `tests/cfgtest.c` + `tests/reduce_cfg.py` shrink a dumped CFG,
+           `NVCUDA_DUMP_CFG=1`, to a minimal failing one). The front end now checks reducibility after the sort
+           (a back edge whose target does not dominate its source) and refuses; the retry ladder then inlines
+           everything (14 of the 75 Cycles kernels). As a second net, every kernel exit passes a marker block,
+           and a `return` without the marker after structurizing fails the compile (`structurized_ok`). PTX
+           that is irreducible by itself is refused (`tests/irreducible.ptx`; a clean error, never a wrong
+           result).
+        3. 64-bit `bfi` built shifts with a 64-bit shift amount (NIR's is always 32-bit; an assertion in
+           debug builds, garbage otherwise): fixed.
+        4. Compile children killed by the OOM killer were reported as "crashed"; the signal is named now.
+        Outlining is therefore only used where it does not create irreducible flow (callees whose sites are
+        all dominated by the first); the big kernels go back to full inlining plus memory mode. Compile times
+        with 3 parallel `nakc`: the whole set in about 10 min, the worst kernel 142 s.
+      - [ ] Outlining without irreducible flow: either hardware CALL/RET in NAK (src/nouveau, not touched) or
+        a structurizer that handles multi-entry loops (a local Mesa patch, src/compiler/nir).
       - [ ] Denoising: Cycles' OptiX denoiser is unavailable (no OptiX), OIDN runs on the CPU; GPU OIDN would need
         SYCL/CUDA OIDN kernels (not shipped as PTX).
       - [ ] Interactive viewport rendering (needs a Blender session on the Hyprland desktop; the GL/Vulkan interop

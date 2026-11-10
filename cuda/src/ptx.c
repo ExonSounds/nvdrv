@@ -115,6 +115,7 @@ struct pfunc {
 };
 
 struct ctx {
+	nir_block *exit_blk;		/* every kernel exit goes through here (a marker, then end_block) */
 	struct lex lx;
 	jmp_buf fail;
 	char *err;
@@ -1607,13 +1608,14 @@ static void emit_insn(struct ctx *c, struct insn *in)
 			if (t.bits == 32) {
 				r = nir_bitfield_insert(b, bb, a, pos, len);
 			} else {
-				nir_def *one = nir_imm_intN_t(b, 1, t.bits), *mask, *p64 = nir_u2uN(b, pos, t.bits);
+				/* NIR shift amounts are always 32-bit (and masked to the width by NAK) */
+				nir_def *one = nir_imm_intN_t(b, 1, t.bits), *mask;
 
-				mask = nir_iadd_imm(b, nir_ishl(b, one, nir_u2uN(b, len, t.bits)), -1);
+				mask = nir_iadd_imm(b, nir_ishl(b, one, len), -1);
 				mask = nir_bcsel(b, nir_uge_imm(b, len, t.bits), nir_imm_intN_t(b, ~0ull, t.bits), mask);
-				mask = nir_ishl(b, mask, p64);
+				mask = nir_ishl(b, mask, pos);
 				mask = nir_bcsel(b, nir_uge_imm(b, pos, t.bits), nir_imm_intN_t(b, 0, t.bits), mask);
-				r = nir_ior(b, nir_iand(b, bb, nir_inot(b, mask)), nir_iand(b, nir_ishl(b, a, p64), mask));
+				r = nir_ior(b, nir_iand(b, bb, nir_inot(b, mask)), nir_iand(b, nir_ishl(b, a, pos), mask));
 			}
 		} else if (!strcmp(op, "shf")) {
 			/* funnel shift of {b:a} by c: shf.l d = high word of (b:a) << n, shf.r d = low word of >> n */
@@ -1787,7 +1789,7 @@ static void emit_statement(struct ctx *c)
 		return;
 	}
 	if (!strcmp(in.op, "ret") || !strcmp(in.op, "exit") || !strcmp(in.op, "trap")) {
-		nir_block *target = !strcmp(in.op, "ret") ? frame(c)->ret : c->impl->end_block;
+		nir_block *target = !strcmp(in.op, "ret") ? frame(c)->ret : c->exit_blk;
 
 		if (!strcmp(in.op, "trap") && !has_pred)
 			fail(c, "trap");
@@ -2843,61 +2845,6 @@ static void call_outlined(struct ctx *c, struct pfunc *f, struct psym **bind, in
 			     bind[i]->size < f->rets[i]->size ? bind[i]->size : f->rets[i]->size);
 }
 
-/*
- * Blocks nothing jumps to (labels never branched to, outlined bodies whose calls were all in
- * dead code) would keep a goto the structurizer never visits, and NAK then finds a jump with no
- * target. Walk the gotos from the start block and unlink the rest.
- */
-static void remove_unreachable_blocks(struct ctx *c)
-{
-	nir_function_impl *impl = c->impl;
-	unsigned int n = 0, i, top = 0;
-	nir_block **stack, **blocks;
-	bool *seen;
-
-	nir_foreach_block_unstructured(block, impl)
-		n++;
-	blocks = calloc(n, sizeof(*blocks));
-	stack = calloc(n + 1, sizeof(*stack));
-	seen = calloc(n, sizeof(*seen));
-	i = 0;
-	nir_foreach_block_unstructured(block, impl) {
-		block->index = i;
-		blocks[i++] = block;
-	}
-	seen[nir_start_block(impl)->index] = true;
-	stack[top++] = nir_start_block(impl);
-	while (top) {
-		nir_block *b = stack[--top];
-		nir_instr *last = nir_block_last_instr(b);
-		nir_jump_instr *j = last && last->type == nir_instr_type_jump ? nir_instr_as_jump(last) : NULL;
-		nir_block *t[2] = { NULL, NULL };
-		int k;
-
-		if (j && j->type == nir_jump_goto) {
-			t[0] = j->target;
-		} else if (j && j->type == nir_jump_goto_if) {
-			t[0] = j->target;
-			t[1] = j->else_target;
-		}
-		for (k = 0; k < 2; k++)
-			if (t[k] && !seen[t[k]->index]) {
-				seen[t[k]->index] = true;
-				stack[top++] = t[k];
-			}
-	}
-	for (i = 0; i < n; i++) {
-		if (seen[i] || blocks[i] == impl->end_block)
-			continue;
-		nir_foreach_instr_safe(instr, blocks[i])
-			nir_instr_remove(instr);
-		exec_node_remove(&blocks[i]->cf_node.node);
-	}
-	free(blocks);
-	free(stack);
-	free(seen);
-}
-
 /* After everything: each outlined function's ret dispatches on retid. */
 static void emit_dispatch(struct ctx *c)
 {
@@ -2916,7 +2863,7 @@ static void emit_dispatch(struct ctx *c)
 			jump_if(c, f->sites[k], nir_ieq_imm(b, nir_load_var(b, f->retid), k), next);
 			switch_to(c, next);
 		}
-		jump(c, c->impl->end_block);	/* not reached */
+		jump(c, c->exit_blk);	/* not reached */
 	}
 }
 
@@ -3427,7 +3374,8 @@ nir_shader *nvc_ptx_build(const char *src, const char *entry, const nir_shader_c
 	c->impl->structured = false;
 	c->nir = nir;
 	c->b = nir_builder_at(nir_after_block(nir_start_block(c->impl)));
-	c->frames[0].ret = c->impl->end_block;
+	c->exit_blk = new_block(c);
+	c->frames[0].ret = c->exit_blk;
 	c->frames[0].fn = &c->entry_fn;
 	c->frames[0].boundary = true;
 	c->entry_fn.hdr = body;
@@ -3462,7 +3410,41 @@ nir_shader *nvc_ptx_build(const char *src, const char *entry, const nir_shader_c
 	next(c);
 	parse_body(c);
 	emit_dispatch(c);
-	remove_unreachable_blocks(c);
+	/*
+	 * The one legitimate way out: a marker, then end_block. Mesa's structurizer turns a branch it
+	 * cannot route into a plain return (an assertion in debug builds, silent otherwise), so after
+	 * it every return must follow the marker; compile.c checks (structurized_ok) and removes it.
+	 */
+	switch_to(c, c->exit_blk);
+	nir_nop(&c->b);
+	nir_goto(&c->b, c->impl->end_block);
+	/*
+	 * NIR requires unstructured blocks in reverse post-DFS order (dominance is computed over
+	 * that order; nir_lower_goto_ifs sorts its block sets by index). Emission order is not it:
+	 * without this the structurizer's result depended on pointer-hash order, and some of those
+	 * results were wrong code. Unreachable blocks (dead labels, outlined bodies whose calls were
+	 * all in dead code) are dropped by the same pass.
+	 */
+	nir_sort_unstructured_blocks(c->impl);
+	/*
+	 * Mesa's structurizer mishandles loops with more than one entry (irreducible control flow):
+	 * its path selection gets overwritten and a branch it cannot route becomes a return (both
+	 * assertions in debug builds, silent otherwise). Refuse such a CFG here. Outlined calls make
+	 * these loops (a shared body entered from sites that do not dominate each other), so
+	 * compile.c's retry ladder then inlines everything; PTX that is irreducible by itself fails.
+	 */
+	nir_metadata_require(c->impl, nir_metadata_dominance);
+	nir_foreach_block_unstructured(block, c->impl) {
+		for (int k = 0; k < 2; k++) {
+			nir_block *t = block->successors[k];
+
+			if (t && t != c->impl->end_block && t->index <= block->index && !nir_block_dominates(t, block)) {
+				snprintf(c->err, c->errlen, "irreducible control flow (a loop entered at two places)%s",
+					 c->noutlined ? " from outlined calls" : "");
+				longjmp(c->fail, 1);
+			}
+		}
+	}
 	nir->info.shared_size = c->shared_size;
 	nir->scratch_size = c->local_max;
 	nir->info.workgroup_size_variable = true;
