@@ -1,0 +1,107 @@
+diff --git a/meson.build b/meson.build
+index 24c3dc5..64a6f17 100644
+--- a/meson.build
++++ b/meson.build
+@@ -312,6 +312,7 @@ with_imagination_vk = _vulkan_drivers.contains('imagination')
+ with_imagination_srv = get_option('imagination-srv')
+ with_microsoft_vk = _vulkan_drivers.contains('microsoft-experimental')
+ with_nouveau_vk = _vulkan_drivers.contains('nouveau')
++with_nak = with_nouveau_vk or get_option('nak-standalone')
+ with_asahi_vk = _vulkan_drivers.contains('asahi')
+ with_gfxstream_vk = _vulkan_drivers.contains('gfxstream')
+ with_kosmickrisp_vk = _vulkan_drivers.contains('kosmickrisp')
+@@ -398,7 +399,7 @@ with_any_intel = [
+   with_intel_tools,
+   with_intel_vk,
+ ].contains(true)
+-with_any_nouveau = with_gallium_nouveau or with_nouveau_vk
++with_any_nouveau = with_gallium_nouveau or with_nak
+ with_any_panfrost = [
+   with_gallium_panfrost,
+   with_panfrost_vk,
+@@ -933,7 +934,7 @@ with_virtgpu_kumquat = get_option('virtgpu_kumquat') and with_gfxstream_vk
+ 
+ with_any_rust = [
+   with_gallium_rusticl,
+-  with_nouveau_vk,
++  with_nak,
+   with_panfrost_rust,
+   with_tools.contains('etnaviv'),
+   with_virtgpu_kumquat,
+@@ -1064,6 +1065,7 @@ endif
+ with_gfx_compute = [
+   with_any_opengl,
+   with_any_vk,
++  with_nak,
+   with_clc,
+   with_gallium_va and with_video_encode,
+   with_gallium_mediafoundation and with_video_encode,
+@@ -2184,8 +2186,8 @@ if dep_elf.found()
+   pre_args += '-DUSE_LIBELF'
+ elif with_gallium_radeonsi and with_gfx_compute
+   error('Gallium driver radeonsi requires libelf')
+-elif with_nouveau_vk
+-  error('NVK requires libelf')
++elif with_nak
++  error('NVK and NAK require libelf')
+ endif
+ 
+ dep_valgrind = dependency('valgrind', required : get_option('valgrind'))
+diff --git a/meson.options b/meson.options
+index 281b043..a6f27f8 100644
+--- a/meson.options
++++ b/meson.options
+@@ -188,6 +188,13 @@ option(
+   description : 'Link libclc SPIR-V statically.',
+ )
+ 
++option(
++  'nak-standalone',
++  type : 'boolean',
++  value : false,
++  description : 'Build the NAK compiler (libnak) without NVK, and so without NVK\'s CLC dependency'
++)
++
+ option(
+   'vulkan-drivers',
+   type : 'array',
+diff --git a/src/compiler/meson.build b/src/compiler/meson.build
+index 68f0832..437e81b 100644
+--- a/src/compiler/meson.build
++++ b/src/compiler/meson.build
+@@ -73,6 +73,6 @@ if with_gallium
+ endif
+ subdir('isaspec')
+ 
+-if with_nouveau_vk or with_tools.contains('etnaviv') or with_panfrost_rust
++if with_nak or with_tools.contains('etnaviv') or with_panfrost_rust
+   subdir('rust')
+ endif
+diff --git a/src/nouveau/headers/meson.build b/src/nouveau/headers/meson.build
+index b3a0273..ae846b1 100644
+--- a/src/nouveau/headers/meson.build
++++ b/src/nouveau/headers/meson.build
+@@ -132,8 +132,8 @@ executable(
+ nouveau_util_py = files('util.py')
+ nouveau_util_py_path = meson.current_source_dir()
+ 
+-# Only generate Rust bindings for NVK
+-if with_nouveau_vk
++# Only generate Rust bindings for NVK and NAK
++if with_nak
+   cl_rs_generated = []
+   foreach cl : nv_classes
+     cl_rs_generated += custom_target(
+diff --git a/src/nouveau/meson.build b/src/nouveau/meson.build
+index de6d458..6ab9d04 100644
+--- a/src/nouveau/meson.build
++++ b/src/nouveau/meson.build
+@@ -4,7 +4,7 @@
+ subdir('headers')
+ subdir('drm')
+ subdir('winsys')
+-if with_nouveau_vk
++if with_nak
+   subdir('rust')
+   subdir('nil')
+   subdir('compiler')

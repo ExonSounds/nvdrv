@@ -176,7 +176,9 @@ void nvc_ctx_fini(struct CUctx_st *ctx)
 		return;
 	if (ctx->null_stream.tl)
 		nvc_ctx_idle(ctx);
+	nvc_modules_drop(ctx);
 	nvc_alloc_drop_ctx(ctx);	/* allocations the program did not free */
+	nvc_bo_free(ctx, &ctx->slm);
 	for (i = 0; i < ctx->nstreams; i++) {
 		drmSyncobjDestroy(ctx->fd, ctx->streams[i]->tl);
 		free(ctx->streams[i]);

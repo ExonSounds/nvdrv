@@ -229,13 +229,40 @@ static uint64_t pinned_va(struct CUctx_st *ctx, const void *p, size_t bytes)
 	return a && a->ctx == ctx ? a->bo.va + ((uintptr_t)p - (uintptr_t)a->bo.map) : 0;
 }
 
+/* pageable host memory -> GPU VA through the staging halves; returns with the copy done */
+static CUresult htod_staged(struct CUctx_st *ctx, struct CUstream_st *s, uint64_t dst, const void *src, size_t bytes)
+{
+	uint64_t half = NVC_STAGING_SIZE / 2, done = 0, half_point[2] = { 0, 0 };
+	CUresult r = CUDA_SUCCESS;
+	int h = 0;
+
+	while (done < bytes && r == CUDA_SUCCESS) {
+		uint64_t n = bytes - done < half ? bytes - done : half;
+
+		if (half_point[h])
+			nvc_stream_wait_idle(&(struct CUstream_st){ .ctx = ctx, .tl = s->tl, .point = half_point[h] });
+		memcpy((char *)ctx->staging.map + h * half, (const char *)src + done, n);
+		pthread_mutex_lock(&ctx->lock);
+		r = ce_copy(ctx, s, dst + done, ctx->staging.va + h * half, n);
+		half_point[h] = s->point;
+		pthread_mutex_unlock(&ctx->lock);
+		done += n;
+		h ^= 1;
+	}
+	return r ? r : nvc_stream_wait_idle(s);
+}
+
+CUresult nvc_upload(struct CUctx_st *ctx, uint64_t va, const void *data, size_t bytes)
+{
+	return htod_staged(ctx, &ctx->null_stream, va, data, bytes);
+}
+
 static CUresult memcpy_htod(CUdeviceptr dst, const void *src, size_t bytes, CUstream stream, bool async)
 {
 	struct CUctx_st *ctx;
 	struct CUstream_st *s;
-	uint64_t pin, half = NVC_STAGING_SIZE / 2, done = 0, half_point[2] = { 0, 0 };
-	CUresult r = CUDA_SUCCESS;
-	int h = 0;
+	uint64_t pin;
+	CUresult r;
 
 	if (!bytes)
 		return CUDA_SUCCESS;
@@ -251,21 +278,7 @@ static CUresult memcpy_htod(CUdeviceptr dst, const void *src, size_t bytes, CUst
 		pthread_mutex_unlock(&ctx->lock);
 		return r || async ? r : nvc_stream_wait_idle(s);
 	}
-	/* pageable: through the staging halves; a half is refilled once its copy has finished */
-	while (done < bytes && r == CUDA_SUCCESS) {
-		uint64_t n = bytes - done < half ? bytes - done : half;
-
-		if (half_point[h])
-			nvc_stream_wait_idle(&(struct CUstream_st){ .ctx = ctx, .tl = s->tl, .point = half_point[h] });
-		memcpy((char *)ctx->staging.map + h * half, (const char *)src + done, n);
-		pthread_mutex_lock(&ctx->lock);
-		r = ce_copy(ctx, s, dst + done, ctx->staging.va + h * half, n);
-		half_point[h] = s->point;
-		pthread_mutex_unlock(&ctx->lock);
-		done += n;
-		h ^= 1;
-	}
-	return r ? r : nvc_stream_wait_idle(s);
+	return htod_staged(ctx, s, dst, src, bytes);
 }
 
 static CUresult memcpy_dtoh(void *dst, CUdeviceptr src, size_t bytes, CUstream stream, bool async)

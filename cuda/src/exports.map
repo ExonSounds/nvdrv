@@ -1,0 +1,6 @@
+/* Only the CUDA Driver API leaves libcuda.so.1: the Mesa compiler linked into it stays private,
+ * so it cannot clash with a Mesa the application loads itself (OpenGL, Vulkan). */
+{
+	global: cu*;
+	local: *;
+};

@@ -30,7 +30,7 @@ struct nvc_device {
 	char name[64];
 	uint16_t chipset;
 	uint64_t vram, vram_user;
-	uint32_t sm_count;
+	uint32_t sm_count, gpc_count, tpc_count;
 	uint16_t pci_domain;
 	uint8_t pci_bus, pci_dev, pci_func;
 	uint16_t pci_device_id;
@@ -72,6 +72,11 @@ struct CUctx_st {
 	int fd;
 	pthread_mutex_t lock;
 	uint32_t ce_chan;		/* copy channel (AMPERE_DMA_COPY_B) */
+	uint32_t gr_chan;		/* compute channel (AMPERE_COMPUTE_B), created on first launch */
+	bool gr_ready;
+	struct nvc_bo slm;		/* shader local memory for all TPCs */
+	uint32_t slm_per_thread;
+	struct CUmod_st *modules;
 	struct nvc_bo push;		/* push ring */
 	uint32_t push_off;
 	struct nvc_bo staging;		/* pageable copies */
@@ -122,6 +127,12 @@ CUresult nvc_push_submit(struct CUctx_st *ctx, struct CUstream_st *s, uint32_t c
 CUresult nvc_stream_wait_idle(struct CUstream_st *s);
 CUresult nvc_ctx_idle(struct CUctx_st *ctx);
 uint32_t *nvc_mthd(uint32_t *p, int subc, uint32_t mthd, int n, const uint32_t *data);
+
+/* memory.c: pageable host -> GPU VA, synchronous (code upload) */
+CUresult nvc_upload(struct CUctx_st *ctx, uint64_t va, const void *data, size_t bytes);
+
+/* module.c */
+void nvc_modules_drop(struct CUctx_st *ctx);
 
 /* copy engine helpers (memory.c) */
 #define NVC_SUBC_CE	4

@@ -792,19 +792,43 @@ not used.
       - Bandwidth: 3-4 GB/s by default, because copy-only work leaves the GPU at P8 / PCIe Gen1. With nvdrv
         `exec_boost=1`: 12.5 GB/s pinned, 13.3 GB/s async, 7.3 GB/s pageable (full Gen3 x16). → nvcuda should ask
         for P0 while work is queued (a uAPI hint, or exec_boost per channel).
-- [ ] **Milestone 2: kernel launch from CUDA source.** Route: clang `-x cuda --offload=spirv64` → `llc` → SPIR-V
-      (works with the installed LLVM 23: `spirv-val` clean, OpenCL Kernel module) → Mesa `spirv_to_nir` → NAK →
-      QMD launch.
-      - NAK needs Mesa built with `-Dvulkan-drivers=nouveau`, plus rustc ≥ 1.85, bindgen, meson ≥ 1.7, mako and
-        PyYAML. None of these are installed (installing needs the user's OK). NVK's CLC dependency needs
-        LLVMSPIRVLib and libclc, or a small meson patch.
-      - Launch: QMD V03_00 (clc6c0qmd.h layout; NAK's `nak_fill_qmd`), `SEND_PCAS_A` = qmd >> 8,
-        `SEND_SIGNALING_PCAS2_B` = 3. One-time setup: shared/local memory windows 0xfe000000 / 0xff000000 (keep that
-        VA free) and SET_SHADER_LOCAL_MEMORY(_NON_THROTTLED). SLM sized like NVK (per TPC × 19 TPCs).
-      - cbuf0 layout like NVK's cubin launcher: block_dim at 0x0, grid_dim at 0xc, kernel params after them. Our
-        own NIR pass maps load_kernel_input / workgroup size / num_workgroups to `ldc_nv`.
-      - NAK has no generic loads: generic pointers must be resolved to global/shared/local in NIR.
-      - Mesa's `nak/hw_runner.rs` is a complete uAPI compute runner to follow.
+- [x] **Milestone 2: kernel launch from CUDA source** (2026-11-10). `cuda/build/kerneltest`: 10/10 on the GPU.
+      - Toolchain (user OK): rust 1.99, rust-bindgen, cbindgen, meson, python-mako, python-yaml.
+      - Mesa (pinned commit, `cuda/mesa/`): `nak-standalone.patch` adds `-Dnak-standalone=true`. NAK, nil and NIR
+        are built without NVK, so no LLVM, libclc or SPIRV-LLVM-Translator is needed, and NIR is fully built (not
+        the headers-only stub). NAK also expects NVK's `nak_const_offsets_*` tables; nvcuda defines them.
+        `build-nak.sh` clones, patches, builds (about 2 min) and writes `mesa.mk`.
+      - CUDA C++ → SPIR-V: clang `-x cuda --offload=spirv64 -nocudainc`, then `llc`. `include/nvcuda/device.h`
+        maps threadIdx, blockIdx, blockDim and gridDim to the SPIR-V builtins (via `__declspec(property)`) and
+        `__syncthreads` to OpControlBarrier. No NVIDIA SDK is involved.
+      - Compiler (`src/compile.c`): spirv_to_nir (OpenCL) → inline → all pointers 62-bit generic. clang reaches
+        kernel arguments through ptrtoint/inttoptr, so LLVM cannot infer address spaces; NAK then gets
+        global/shared/local accesses behind run-time mode checks.
+      - Kernel arguments → `load_kernel_input` → `ldc_nv` from cbuf 0. Layout: block at 0x0, grid at 0xc, params
+        at 0x20 in natural C layout (as cuLaunchKernel packs them); printf would use 0x18.
+      - The workgroup size is variable but set to 1x1x1 for NAK, so the register limit stays at 255 (CUDA's
+        default). cuLaunchKernel checks registers × threads against the SM.
+      - Atomics on generic pointers are narrowed to global|shared first. With NDEBUG, NIR's lowering otherwise
+        reaches an UNREACHABLE and emitted `task_payload_atomic`.
+      - `libcuda.so.1` links Mesa statically but exports only `cu*` (version script + `--exclude-libs`), so it
+        cannot clash with a Mesa the application loads.
+      - Launch: the compute channel is created on first launch: SET_OBJECT 0xc7c0, shared/local windows
+        0xfe000000 / 0xff000000. Local memory is sized like NVK (per TPC, grows on demand). Per launch, cbuf 0
+        and the QMD (NAK's `nak_fill_qmd`, V03_00, per-launch block size) go into the push ring, then
+        INVALIDATE_SHADER_CACHES_NO_WFI (instruction | global | constant), SEND_PCAS_A and
+        SEND_SIGNALING_PCAS2_B = 3. Code lives in VRAM with 2 KiB of prefetch padding.
+      - Verified: saxpy over 16M floats; shared memory + `__syncthreads` (4096 blocks); 2D grid; a per-thread
+        array in local memory (256 B/thread); 64-bit global atomics from 1M threads; a copy on stream 2 waiting
+        (cuStreamWaitEvent) for a kernel on stream 1; launch-parameter checks. No faults.
+      - Speed: 20 back-to-back saxpy launches run at **399 GB/s with exec_boost** (89 % of the 448 GB/s peak), but
+        19 GB/s at the idle P8 clocks. A single launch timed between copy-engine events is about 10 ms at P8,
+        mostly cross-channel fence latency.
+      - [ ] nvcuda should get P0 while compute work is queued: a uAPI hint, or exec_boost for compute
+        channels. GSP-RM's governor only reacts after about 2.5 s of load.
+      - [ ] Fewer generic branches: turn clang's `inttoptr(ptrtoint(addrspace(1)))` back into addrspacecast so
+        LLVM infer-address-spaces sees global pointers; or a NIR pass treating kernel-argument pointers as global.
+      - [ ] Module-scope `__device__`/`__constant__` variables (cuModuleGetGlobal), dynamic `extern __shared__`,
+        printf, math built-ins beyond what vtn lowers natively (libclc is not linked).
 - [ ] **Milestone 3: PTX front end** (PTX → NIR, C with nir_builder). PTX is NVIDIA's public ISA spec, so this is
       not reverse engineering. Needed for programs that ship PTX (Blender ships `kernel_compute_75.ptx`). Mesa has
       no PTX parser.

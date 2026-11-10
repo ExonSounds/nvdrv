@@ -10,3 +10,4 @@ modules.order
 *.bin
 __pycache__/
 cuda/build/
+cuda/mesa/mesa.mk

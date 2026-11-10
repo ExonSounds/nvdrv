@@ -67,6 +67,8 @@ static int probe(drmDevicePtr d, struct nvc_device *out)
 	/* GRAPH_UNITS: GPCs 7:0, TPCs 15:8 (nouveau gf100_gr_units); two SMs per TPC since Turing */
 	if (!drmCommandWriteRead(fd, DRM_NOUVEAU_GETPARAM, &gp, sizeof(gp)))
 		out->sm_count = ((gp.value >> 8) & 0xff) * 2;
+	out->gpc_count = gp.value & 0xff;
+	out->tpc_count = (gp.value >> 8) & 0xff;
 	out->pci_domain = d->businfo.pci->domain;
 	out->pci_bus = d->businfo.pci->bus;
 	out->pci_dev = d->businfo.pci->dev;
