@@ -89,26 +89,38 @@ static void msg_work(struct work_struct *w)
 }
 
 /*
+ * GSP RISC-V stopped while running? Report once, fail every channel (device lost) and start
+ * the in-place reset. From the health check and the vblank watchdog (process context).
+ */
+bool nv_gsp_check_dead(struct nvdrv_dev *nv, const char *why)
+{
+	struct nv_intr *in = &nv->intr;
+
+	if (!READ_ONCE(in->active) || !READ_ONCE(nv->gsp_running) || nv_gsp_riscv_active(nv))
+		return false;
+	if (xchg(&in->gsp_dead, true))
+		return true;
+	mutex_lock(&nv->gsp_lock);
+	nv_gsp_dump_state(nv, "GSP RISC-V stopped while running");
+	mutex_unlock(&nv->gsp_lock);
+	nv_uapi_device_lost(nv, why);
+	nv_gpu_reset_schedule(nv, why);
+	return true;
+}
+
+/*
  * kgspHealthCheck while idle: RPC waits notice a dead GSP themselves, but with interrupts
- * nothing else would. Report once and fail every channel (device lost); recovery needs a
- * reload (an in-place reset would also have to rebuild the display state).
+ * nothing else would (the vblank watchdog, src/drm.c, notices sooner while vblanks are on).
  */
 #define GSP_HEALTH_PERIOD	(5 * HZ)
 static void health_work(struct work_struct *w)
 {
 	struct nvdrv_dev *nv = container_of(to_delayed_work(w), struct nvdrv_dev, intr.health_work);
-	struct nv_intr *in = &nv->intr;
 
-	if (!READ_ONCE(in->active))
+	if (!READ_ONCE(nv->intr.active))
 		return;
-	if (!in->gsp_dead && READ_ONCE(nv->gsp_running) && !nv_gsp_riscv_active(nv)) {
-		in->gsp_dead = true;
-		mutex_lock(&nv->gsp_lock);
-		nv_gsp_dump_state(nv, "GSP RISC-V stopped while running (health check)");
-		mutex_unlock(&nv->gsp_lock);
-		nv_uapi_device_lost(nv, "GSP RISC-V stopped (health check)");
-	}
-	schedule_delayed_work(&in->health_work, GSP_HEALTH_PERIOD);
+	nv_gsp_check_dead(nv, "GSP RISC-V stopped (health check)");
+	schedule_delayed_work(&nv->intr.health_work, GSP_HEALTH_PERIOD);
 }
 
 static irqreturn_t nv_intr_handler(int irq, void *data)

@@ -393,6 +393,8 @@ int nv_evo_wait(struct nvdrv_dev *nv, struct nv_evo_chan *c)
 	u32 get;
 	int ret;
 
+	if (!READ_ONCE(nv->gsp_running))	/* GSP-RM dead or down for a GPU reset: no display engine */
+		return -ENODEV;
 	ret = readl_poll_timeout(c->user + 4, get, get == c->put, 10, 2000000);
 	if (ret)
 		dev_err(&nv->pdev->dev, "evo: chn %u stuck: PUT 0x%x GET 0x%x, except 0x%08x/0x%08x, core chnstatus 0x%08x\n",

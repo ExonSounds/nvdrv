@@ -706,6 +706,11 @@ int nv_disp_power(struct nvdrv_dev *nv, bool on, const struct nv_mode *m)
 	u8 d3 = 2;
 	int ret = 0;
 
+	if (!READ_ONCE(nv->gsp_running)) {	/* GPU reset in progress: nothing to talk to */
+		if (!on)
+			nv->evo.active = false;
+		return -ENODEV;
+	}
 	if (!on) {
 		if (READ_ONCE(nv->evo.vrr_active))
 			nv_disp_vrr(nv, false, 0);	/* the stall lock is sticky core state */
@@ -923,6 +928,25 @@ void nv_disp_dp_status_show(struct nvdrv_dev *nv, struct seq_file *m)
 			seq_printf(m, "  0x100 link bw set 0x%02x, lane count set 0x%02x, pattern 0x%02x\n", rev[0], rev[1], rev[2]);
 	}
 	mutex_unlock(&nv->gsp_lock);
+}
+
+/*
+ * In-place GPU reset: the RM objects died with the old GSP-RM. Forget their handles and the
+ * link state, keep what was learnt about the displays; the next power-on probes again.
+ * Caller holds gsp_lock.
+ */
+void nv_disp_reset_rm(struct nvdrv_dev *nv)
+{
+	struct nv_disp *dp = &nv->disp;
+	u32 i;
+
+	dp->h_common = 0;
+	dp->events = false;
+	dp->manual_dp = false;
+	for (i = 0; i < dp->ndpy; i++) {
+		dp->dpy[i].link_lanes = 0;
+		dp->dpy[i].sor = ~0u;
+	}
 }
 
 /* Called from nv_rm_fini_objects: the objects die with the client. */

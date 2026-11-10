@@ -64,7 +64,18 @@ struct nv_drm {
 	unsigned long win_start;	/* jiffies: start of the 1 s traffic window */
 	u64 win_bytes;			/* bytes copied in the window */
 	atomic64_t updates, bytes;	/* totals, debugfs drm_stats */
+	/*
+	 * Vblank watchdog: every vblank interrupt re-arms it; firing means the interrupts
+	 * stopped while vblanks are on. If GSP-RM died (an FLR or a crash also stops the
+	 * display) that is found long before the 5 s health check, and software vblanks keep
+	 * DRM's 100 ms vblank waits from timing out until the reset turns vblanks off.
+	 */
+	struct timer_list vbl_wd;
+	struct work_struct vbl_wd_work;
+	bool vbl_on;
 };
+
+#define NV_VBL_WD_MS	50	/* > 2 frames at the 48 Hz VRR floor */
 
 #define NV_DRM_BOOST_SECONDS	3
 #define NV_DRM_BOOST_BYTES	(64ULL << 20)	/* per second; a blinking cursor stays far below */
@@ -469,17 +480,58 @@ static void nv_crtc_atomic_disable(struct drm_crtc *crtc, struct drm_atomic_comm
 #define PDISP_RG_DPCB(h)		(0x00616334 + (h) * 0x800)
 #define CORE_ARM_HEAD(h, r)		(0x0068a000 + (h) * 0x400 + (r))	/* nouveau gv100_head_state */
 
+static void vbl_wd_arm(struct nv_drm *d)
+{
+	mod_timer(&d->vbl_wd, jiffies + msecs_to_jiffies(NV_VBL_WD_MS));
+}
+
+static void vbl_wd_timer(struct timer_list *t)
+{
+	struct nv_drm *d = timer_container_of(d, t, vbl_wd);
+
+	if (READ_ONCE(d->vbl_on))
+		schedule_work(&d->vbl_wd_work);
+}
+
+static void vbl_wd_work(struct work_struct *w)
+{
+	struct nv_drm *d = container_of(w, struct nv_drm, vbl_wd_work);
+	struct nvdrv_dev *nv = d->nv;
+
+	if (!READ_ONCE(d->vbl_on) || !READ_ONCE(nv->gsp_running) || !READ_ONCE(nv->intr.active))
+		return;
+	if (!READ_ONCE(nv->intr.gsp_dead) && nv_gsp_riscv_active(nv)) {
+		/*
+		 * GSP-RM alive, or not answering yet (BAR0 reads all ones during an FLR):
+		 * look again while the vblanks stay away (a head that does not scan).
+		 */
+		if (READ_ONCE(d->vbl_on))
+			mod_timer(&d->vbl_wd, jiffies + msecs_to_jiffies(100));
+		return;
+	}
+	drm_crtc_handle_vblank(&d->crtc);	/* release vblank waiters first */
+	if (READ_ONCE(d->vbl_on))
+		vbl_wd_arm(d);
+	nv_gsp_check_dead(nv, "GSP RISC-V stopped (vblank watchdog)");
+}
+
 static int nv_crtc_enable_vblank(struct drm_crtc *crtc)
 {
 	struct nv_drm *d = to_nv_drm(crtc->dev);
 
-	return nv_intr_vblank_enable(d->nv, d->nv->evo.head, true) ? 0 : -ENODEV;
+	if (!nv_intr_vblank_enable(d->nv, d->nv->evo.head, true))
+		return -ENODEV;
+	WRITE_ONCE(d->vbl_on, true);
+	vbl_wd_arm(d);
+	return 0;
 }
 
 static void nv_crtc_disable_vblank(struct drm_crtc *crtc)
 {
 	struct nv_drm *d = to_nv_drm(crtc->dev);
 
+	WRITE_ONCE(d->vbl_on, false);
+	timer_delete(&d->vbl_wd);
 	nv_intr_vblank_enable(d->nv, d->nv->evo.head, false);
 }
 
@@ -488,8 +540,11 @@ void nv_drm_vblank_irq(struct nvdrv_dev *nv, u32 head)
 {
 	struct nv_drm *d = READ_ONCE(nv->drm);
 
-	if (d && head == nv->evo.head)
+	if (d && head == nv->evo.head) {
+		if (READ_ONCE(d->vbl_on))
+			vbl_wd_arm(d);
 		drm_crtc_handle_vblank(&d->crtc);
+	}
 }
 
 /*
@@ -622,6 +677,24 @@ static const struct drm_crtc_funcs nv_crtc_funcs = {
 	DRM_CRTC_VBLANK_TIMER_FUNCS,
 };
 
+/*
+ * While GSP-RM is down (GPU lost, reset, suspend) there is no raster to sample: no timestamp
+ * (DRM uses the system time). drm_crtc_vblank_off, which the reset calls before it holds the
+ * modeset locks, clears the hwmode clock but not the frame duration, so a commit already in
+ * flight (fence deadlines) would otherwise hit the helper's "uninitialized mode" WARN.
+ */
+static bool nv_crtc_get_vblank_timestamp(struct drm_crtc *crtc, int *max_error,
+					 ktime_t *vblank_time, bool in_vblank_irq)
+{
+	struct nv_drm *d = to_nv_drm(crtc->dev);
+
+	if (!READ_ONCE(d->nv->gsp_running) || READ_ONCE(d->nv->intr.gsp_dead) ||
+	    !drm_crtc_vblank_crtc(crtc)->hwmode.crtc_clock)
+		return false;
+	return drm_crtc_vblank_helper_get_vblank_timestamp(crtc, max_error, vblank_time,
+							   in_vblank_irq);
+}
+
 static const struct drm_crtc_funcs nv_crtc_funcs_hw = {
 	.reset = drm_atomic_helper_crtc_reset,
 	.destroy = drm_crtc_cleanup,
@@ -631,7 +704,7 @@ static const struct drm_crtc_funcs nv_crtc_funcs_hw = {
 	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
 	.enable_vblank = nv_crtc_enable_vblank,
 	.disable_vblank = nv_crtc_disable_vblank,
-	.get_vblank_timestamp = drm_crtc_vblank_helper_get_vblank_timestamp,
+	.get_vblank_timestamp = nv_crtc_get_vblank_timestamp,
 };
 
 static const struct drm_encoder_funcs nv_encoder_funcs = {
@@ -644,6 +717,61 @@ int nv_drm_suspend(struct nvdrv_dev *nv)
 	struct nv_drm *d = READ_ONCE(nv->drm);
 
 	return d ? drm_mode_config_helper_suspend(&d->dev) : 0;
+}
+
+/*
+ * The GPU died (src/reset.c): no vblank interrupts will come. Send the queued vblank and
+ * flip events now and stop vblank waits, so commits in flight finish instead of timing out.
+ */
+void nv_drm_gpu_lost(struct nvdrv_dev *nv)
+{
+	struct nv_drm *d = READ_ONCE(nv->drm);
+
+	if (d && d->dev.num_crtcs)
+		drm_crtc_vblank_off(&d->crtc);
+}
+
+/*
+ * In-place GPU reset with the display state kept: all modeset locks are held for the whole
+ * reset (one acquire context), so no other commit - fbdev restore on a file's release,
+ * damage work, a compositor - runs against half-reset hardware. The current state is
+ * duplicated, everything is disabled, @hw_reset runs, then the duplicate is committed again
+ * (a full modeset: the display bring-up starts from scratch).
+ */
+int nv_drm_reset(struct nvdrv_dev *nv, int (*hw_reset)(struct nvdrv_dev *nv))
+{
+	struct nv_drm *d = READ_ONCE(nv->drm);
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_atomic_commit *state;
+	int ret;
+
+	if (!d)
+		return hw_reset(nv);
+	nv_drm_gpu_lost(nv);	/* commits in flight complete instead of waiting for vblanks */
+	drm_modeset_acquire_init(&ctx, 0);
+	while ((ret = drm_modeset_lock_all_ctx(&d->dev, &ctx)) == -EDEADLK)
+		drm_modeset_backoff(&ctx);
+	if (ret) {
+		drm_modeset_acquire_fini(&ctx);
+		return hw_reset(nv);
+	}
+	state = drm_atomic_helper_duplicate_state(&d->dev, &ctx);
+	if (IS_ERR(state))
+		state = NULL;
+	else
+		drm_atomic_helper_disable_all(&d->dev, &ctx);
+	ret = hw_reset(nv);
+	if (!ret && state) {
+		int r = drm_atomic_helper_commit_duplicated_state(state, &ctx);
+
+		if (r)
+			drm_err(&d->dev, "display state after GPU reset: %d\n", r);
+	}
+	if (state)
+		drm_atomic_commit_put(state);
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+	return ret;
 }
 
 void nv_drm_resume(struct nvdrv_dev *nv)
@@ -883,6 +1011,8 @@ int nv_drm_register(struct nvdrv_dev *nv)
 	if (ret)
 		return ret;
 	INIT_WORK(&d->boost_work, nv_drm_boost_work);
+	timer_setup(&d->vbl_wd, vbl_wd_timer, 0);
+	INIT_WORK(&d->vbl_wd_work, vbl_wd_work);
 	d->boost_next = jiffies;
 	d->win_start = jiffies;
 	d->pitch = ALIGN(dpy->mode.hdisplay * 4, 256);
@@ -992,6 +1122,9 @@ void nv_drm_unregister(struct nvdrv_dev *nv)
 	if (nv->intr.irq > 0)
 		synchronize_irq(nv->intr.irq);
 	cancel_work_sync(&d->boost_work);
+	WRITE_ONCE(d->vbl_on, false);
+	timer_shutdown_sync(&d->vbl_wd);
+	cancel_work_sync(&d->vbl_wd_work);
 	d->scanout = NULL;
 	drm_edid_free(d->edid);
 	d->edid = NULL;

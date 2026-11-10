@@ -56,10 +56,50 @@ static int bar1_invalidate(struct nvdrv_dev *nv)
 	return readl_poll_timeout(nv->bar0 + MMU_INVALIDATE, v, !(v & INVALIDATE_TRIGGER), 10, 2000000);
 }
 
+static int bar1_write(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size);
+
+/* Empty tables, PD2 -> PD1 -> PD0 linked; returns PD2. */
+static u64 bar1_link(struct nvdrv_dev *nv)
+{
+	struct nv_bar1 *b = &nv->bar1;
+	u64 pd2 = b->tables, pd1 = b->tables + SZ_4K, i;
+
+	nv_vram_fill(nv, b->tables, BAR1_TABLES_SIZE(b->npd0), 0, NULL, NULL);
+	for (i = 0; i < b->npd0; i++)	/* PD1 entry i: BAR1 VA [i * 512 MiB, +512 MiB) */
+		wr64(nv, pd1 + i * 8, ((b->pd0 + i * SZ_4K) >> 4) | PDE_VRAM);
+	wr64(nv, pd2, (pd1 >> 4) | PDE_VRAM);
+	return pd2;
+}
+
+/*
+ * After an in-place GPU reset (fresh GSP-RM, VRAM contents not to be trusted): the same
+ * tables written again, hung into the new root, every mapping restored. CPU mappings of
+ * BAR1 stay valid. Caller holds gsp_lock.
+ */
+void nv_bar1_rebuild(struct nvdrv_dev *nv)
+{
+	struct nv_bar1 *b = &nv->bar1;
+	u64 root = nv->gsp_info.bar1_pde_base, pd2;
+	int ret = 0;
+	u32 i;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	if (!b->tables || !root)
+		return;
+	pd2 = bar1_link(nv);
+	b->old_root0 = (u64)nv_vram_rd32(nv, root + 4) << 32 | nv_vram_rd32(nv, root);
+	wr64(nv, root, (pd2 >> 4) | PDE_VRAM);
+	for (i = 0; i < b->nmaps && !ret; i++)
+		ret = bar1_write(nv, b->maps[i].va, b->maps[i].vram, b->maps[i].size);
+	if (!ret)
+		ret = bar1_invalidate(nv);
+	dev_info(&nv->pdev->dev, "bar1: rebuilt, %u mappings: %d\n", b->nmaps, ret);
+}
+
 int nv_bar1_init(struct nvdrv_dev *nv)
 {
 	struct nv_bar1 *b = &nv->bar1;
-	u64 root = nv->gsp_info.bar1_pde_base, pd2, pd1, i;
+	u64 root = nv->gsp_info.bar1_pde_base, pd2;
 	int ret;
 
 	lockdep_assert_held(&nv->gsp_lock);
@@ -71,15 +111,9 @@ int nv_bar1_init(struct nvdrv_dev *nv)
 	ret = nv_vram_alloc(nv, BAR1_TABLES_SIZE(b->npd0), SZ_64K, &b->tables);
 	if (ret)
 		return ret;
-	nv_vram_fill(nv, b->tables, BAR1_TABLES_SIZE(b->npd0), 0, NULL, NULL);
-	pd2 = b->tables;
-	pd1 = b->tables + SZ_4K;
 	b->pd0 = b->tables + 2 * SZ_4K;
 	b->pts = b->pd0 + b->npd0 * SZ_4K;
-
-	for (i = 0; i < b->npd0; i++)	/* PD1 entry i: BAR1 VA [i * 512 MiB, +512 MiB) */
-		wr64(nv, pd1 + i * 8, ((b->pd0 + i * SZ_4K) >> 4) | PDE_VRAM);
-	wr64(nv, pd2, (pd1 >> 4) | PDE_VRAM);
+	pd2 = bar1_link(nv);
 	b->old_root0 = (u64)nv_vram_rd32(nv, root + 4) << 32 | nv_vram_rd32(nv, root);
 	wr64(nv, root, (pd2 >> 4) | PDE_VRAM);
 	ret = bar1_invalidate(nv);
@@ -96,15 +130,34 @@ int nv_bar1_init(struct nvdrv_dev *nv)
  * Point BAR1 [va, va + size) at [vram, vram + size), or unmap it (vram == NV_BAR1_UNMAP).
  * All 64 KiB aligned. Caller holds gsp_lock (PRAMIN).
  */
-int nv_bar1_set(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size)
+static void bar1_track(struct nv_bar1 *b, u64 va, u64 vram, u64 size)
+{
+	u32 i;
+
+	for (i = 0; i < b->nmaps; i++)
+		if (b->maps[i].va == va)
+			break;
+	if (vram == NV_BAR1_UNMAP) {
+		if (i < b->nmaps)
+			b->maps[i] = b->maps[--b->nmaps];
+		return;
+	}
+	if (i == b->nmaps) {
+		if (b->nmaps == ARRAY_SIZE(b->maps))
+			return;
+		b->nmaps++;
+	}
+	b->maps[i].va = va;
+	b->maps[i].vram = vram;
+	b->maps[i].size = size;
+}
+
+static int bar1_write(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size)
 {
 	struct nv_bar1 *b = &nv->bar1;
 	bool unmap = vram == NV_BAR1_UNMAP;
 	u64 off;
 
-	lockdep_assert_held(&nv->gsp_lock);
-	if (!b->tables || (va | size | (unmap ? 0 : vram)) & (SZ_64K - 1) || va + size > b->size)
-		return -EINVAL;
 	for (off = 0; off < size; off += SZ_64K) {
 		u64 v = va + off, pt = b->pts + (v >> 21) * BAR1_PT_BYTES;
 
@@ -114,6 +167,21 @@ int nv_bar1_set(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size)
 		wr64(nv, pt + ((v >> 16) & 31) * 8, unmap ? 0 : ((vram + off) >> 4) | PTE_VALID);
 	}
 	return bar1_invalidate(nv);
+}
+
+int nv_bar1_set(struct nvdrv_dev *nv, u64 va, u64 vram, u64 size)
+{
+	struct nv_bar1 *b = &nv->bar1;
+	bool unmap = vram == NV_BAR1_UNMAP;
+	int ret;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	if (!b->tables || (va | size | (unmap ? 0 : vram)) & (SZ_64K - 1) || va + size > b->size)
+		return -EINVAL;
+	ret = bar1_write(nv, va, vram, size);
+	if (!ret)
+		bar1_track(b, va, vram, size);
+	return ret;
 }
 
 /*
@@ -169,8 +237,10 @@ void nv_bar1_resume(struct nvdrv_dev *nv)
 		return;
 	want = (b->tables >> 4) | PDE_VRAM;
 	cur = (u64)nv_vram_rd32(nv, root + 4) << 32 | nv_vram_rd32(nv, root);
-	if (cur != want)
+	if (cur != want) {
+		b->old_root0 = cur;	/* GSP-RM's own entry, for the next detach */
 		wr64(nv, root, want);
+	}
 	dev_info(&nv->pdev->dev, "bar1: resume: root entry 0 0x%llx%s, invalidate %d\n", cur,
 		 cur != want ? " (rewritten)" : "", bar1_invalidate(nv));
 }

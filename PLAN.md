@@ -384,7 +384,7 @@ contexts, nouveau uAPI subset for Mesa NVK (`nvk=1`), Zink GL, zero-copy scanout
 **Status (2026-11-09):** every to-do item that needs no display checking is done (per-object fences and async
 VM_BIND, 2 MiB pages, GPU recovery, sparse binding, preemption buffers, clean unload), and on the display side
 hardware vblank, hardware cursor, gamma/CTM, block-linear scanout, tearing flips, VRR, DPMS and hotplug. Left:
-in-place GPU reset, multi-monitor, suspend/resume, NVDEC/NVENC (items marked ▶ first). Switching between nvdrv
+multi-monitor, NVDEC/NVENC (items marked ▶ first). Switching between nvdrv
 and NVIDIA's driver: "Switching drivers" under Hardware workflow.
 
 **Long-term goal (user, 2026-11-09): make the whole driver independent of nouveau.** Today nvdrv leans on it in
@@ -528,12 +528,36 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
         RM free, re-created on the same chid); that one operation fails, later ones work.
       - GSP death (RPC wait or the 5 s health check sees the RISC-V stopped): device lost for everyone at once;
         every pending fence fails with -ENODEV, and EXEC, CHANNEL_ALLOC, GEM_NEW and VM_BIND return -ENODEV.
-        Recovery is a module reload.
+        After a GSP death the in-place reset below brings the GPU back (before 2026-11-10: a module reload).
       - Tests: `nvktest hang` (job_timeout_ms=2000: another channel runs meanwhile, the hung one is stopped after
         2.2 s, its write never lands, EXEC -ENODEV, a new channel works), debugfs `ce_fault` (faulting kernel copy,
         rebuild, clear works), `nvktest lost` with debugfs `gpu_lost` (fence fails at once, 4 ioctls -ENODEV).
-- [ ] **In-place GPU reset** (no reload after GSP death): FLR + GSP reboot + RM objects, and rebuilding the display
-      (EVO channels, modeset from the saved DRM atomic state) needs display verification.
+- [x] **In-place GPU reset** (2026-11-10, `src/reset.c`): when GSP-RM dies the GPU comes back on the same bind,
+      without a reload.
+      - Detection: the 5 s health check (RISC-V ACTIVE_STAT), an RPC that finds GSP dead, or the *vblank
+        watchdog* (`src/drm.c`). Every vblank interrupt re-arms a 50 ms timer. If it fires while vblanks are on
+        and GSP's RISC-V is stopped, software vblanks release DRM's vblank waiters and the reset starts. While an
+        FLR is still running, BAR0 reads are all ones, so the watchdog looks again every 100 ms. Before the
+        watchdog, the fbdev damage worker hit DRM's 1 s vblank-wait WARNs while the 5 s check had not yet fired.
+      - Sequence: programs get the device lost → `nv_drm_reset` holds **every DRM modeset lock** for the whole
+        reset. Pending vblank events are sent first, then the state is duplicated and everything disabled. No
+        commit can interleave: the first version used the suspend/resume helpers, and vkmark's file release
+        committed in the middle of them, which oopsed in `drm_atomic_helper_commit_cleanup_done`. nvdrv then
+        forgets the dead RM's objects: display channels, kernel channels, VM and GR ctxbufs, with pool memory
+        freed. A generation counter (`rm_gen`) makes stale frees from programs' files skip RM. Then FLR → cold
+        GSP boot (FWSEC-FRTS, Booter-Load, INIT_DONE, new WPR meta) → BAR1 tables rewritten from the tracked
+        mappings (VRAM after an FLR reads 0xBAD0ACxx until GSP boots: treated as lost) → kernel channels →
+        display object → the duplicated state is committed (full DP bring-up).
+      - The timestamp hook returns no timestamp while GSP-RM is down. `drm_crtc_vblank_off` clears the hwmode
+        clock but not the frame duration, so a commit already in flight would otherwise hit the helper's
+        "uninitialized mode" WARN through fence deadlines.
+      - Kernel VMM page tables, channel instance blocks and GR context buffers now come from the VRAM pool
+        (freeable) instead of the carve-out bump allocator. That also ends the 4 KiB carve-out leak per channel.
+      - At most 3 resets within 10 minutes (`auto_reset=0` turns it off); debugfs `gpu_reset` resets on demand.
+      - Verified: a sysfs FLR during vkmark (vkmark gets ErrorDeviceLost) is noticed by the watchdog about 150 ms
+        later, and the GPU is back after 4.1 s. 2560x1440@180 is up again with no WARN, oops or IOMMU fault. Two
+        deaths in a row both recover. Afterwards vkmark gives 32-33k, nvktest PASS, pm_test 2 (suspend + FLR +
+        resume) OK, and DPMS off/on OK. Unbind after resets is clean (no pool leak warning).
 
 ### Display
 - [x] **Hotplug (HPD) and DP IRQ** (2026-11-09): subscribed like nouveau r535_gsp_device_event_ctor:
@@ -719,7 +743,9 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
 - [ ] The Hyprland session needs `VK_DRIVER_FILES` pointing at NVK while the proprietary `nvidia-utils` ICD is
       installed (it deadlocks Xwayland otherwise).
 - [ ] LibOS log decoding (`.fwlogging_*` format strings are not shipped in linux-firmware); raw logs in debugfs.
-- [ ] Large-RPC continuation path (`_issueRpcAndWaitLarge`) for messages > 64 KiB.
+- [x] Large-RPC continuation path (`_issueRpcAndWaitLarge`, `nv_rpc_call_large`) for messages > 64 KiB: send side
+      done for the FBSR page lists (suspend); replies come back the same way and their continuation records are
+      drained as events.
 
 ## Hardware workflow
 

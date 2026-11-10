@@ -377,6 +377,39 @@ static int gsp_boot_locked(struct nvdrv_dev *nv)
 	return ret;
 }
 
+/*
+ * In-place GPU reset (src/reset.c): GSP-RM died and the GPU went through an FLR. Boot a
+ * fresh GSP-RM on the same bind: cold-boot rmargs, a new WPR meta (Booter writes into it),
+ * then the normal boot. Caller holds gsp_lock.
+ */
+int nv_gsp_reboot_locked(struct nvdrv_dev *nv)
+{
+	struct device *dev = &nv->pdev->dev;
+	bool done;
+	u32 gfw;
+	int ret;
+
+	lockdep_assert_held(&nv->gsp_lock);
+	nv->gsp_running = false;
+	nv->gsp_touched = false;
+	nv->gsp_info.valid = false;
+	nv->evo.pramin_base = ~0ULL;	/* the window register lost its value */
+	if (read_poll_timeout(nv_gfw_boot_completed, done, done, 1000, 2050000, false, nv, &gfw)) {
+		dev_err(dev, "gsp: GFW boot not complete after reset (0x%x)\n", gfw);
+		return -ETIMEDOUT;
+	}
+	if (nv_wpr2_hi(nv)) {
+		dev_err(dev, "gsp: WPR2 still up after reset\n");
+		return -EBUSY;
+	}
+	nv_libos_set_sr(nv, false);
+	nv_wpr_meta_fini(nv);
+	ret = nv_wpr_meta_build(nv);
+	if (ret)
+		return ret;
+	return gsp_boot_locked(nv);
+}
+
 int nv_gsp_boot(struct nvdrv_dev *nv)
 {
 	int ret;

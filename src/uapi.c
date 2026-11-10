@@ -2363,7 +2363,7 @@ void nv_uapi_mem_show(struct nvdrv_dev *nv, struct seq_file *m)
 	mutex_unlock(&ua->lru_lock);
 	seq_printf(m, "VRAM pool: %llu MiB, %llu MiB used\n", nv->mem.size >> 20, nv->mem.used >> 20);
 	seq_printf(m, "GEM objects in VRAM: %llu (%llu MiB, %llu MiB not evictable)\n", n, bytes >> 20, pinned >> 20);
-	seq_printf(m, "device lost: %s\n", ua->lost ? "YES (reload nvdrv)" : "no");
+	seq_printf(m, "device lost: %s\n", ua->lost ? "YES" : "no");
 	seq_printf(m, "hung channels stopped by the watchdog: %d (job_timeout_ms %u)\n", atomic_read(&ua->hangs),
 		   job_timeout_ms);
 	seq_printf(m, "evictions: %lld (%lld MiB moved to system memory)\n", atomic64_read(&ua->evictions),
@@ -2496,8 +2496,25 @@ void nv_uapi_device_lost(struct nvdrv_dev *nv, const char *why)
 		n++;
 	}
 	spin_unlock_irqrestore(&ua->lock, flags);
-	dev_err(&nv->pdev->dev, "GPU lost (%s): %d channels failed, programs get device lost; reload nvdrv to recover\n",
+	dev_err(&nv->pdev->dev, "GPU lost (%s): %d channels failed, programs get device lost\n",
 		why, n);
+}
+
+/*
+ * In-place GPU reset (src/reset.c): begin keeps new submissions out (every fence already
+ * failed with the device lost); end lets them in again on the new GSP-RM. Channels from
+ * before stay dead; new channels and new files work.
+ */
+void nv_uapi_reset(struct nvdrv_dev *nv, bool begin)
+{
+	struct nv_uapi *ua = &nv->uapi;
+
+	if (begin) {
+		down_write(&ua->evict_sem);
+		return;
+	}
+	WRITE_ONCE(ua->lost, false);
+	up_write(&ua->evict_sem);
 }
 
 /* GPU going away (GSP teardown): stop polling and fail every pending fence. */

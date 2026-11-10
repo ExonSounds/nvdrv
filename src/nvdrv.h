@@ -373,6 +373,9 @@ struct nv_bar1 {
 	bool pool_mapped;	/* VRAM pool mapped 1:1 (BAR1 offset == VRAM address) */
 	u64 old_root0;		/* GSP's original root entry 0 */
 	u64 size;		/* usable BAR1 VA */
+	/* every live mapping, so the tables can be written again after a GPU reset */
+	struct { u64 va, vram, size; } maps[8];
+	u32 nmaps;
 };
 
 struct nv_drm;
@@ -389,7 +392,8 @@ struct nv_vmm {
 	u64 lpt_key, lpt_addr;	/* same for the 64 KiB-page table */
 	bool lpt_valid;
 	struct xarray huge;	/* client VMs: VA >> 21 -> tables kept while the region is a 2 MiB PTE */
-	struct list_head pts;	/* struct nv_pt, external only */
+	struct list_head pts;	/* struct nv_pt: page-table pages from the pool */
+	u32 gen;		/* RM instance it was made under (nvdrv_dev.rm_gen) */
 };
 
 /* A freeable VRAM allocation from the pool (src/mem.c). */
@@ -410,6 +414,8 @@ struct nv_chan {
 	u32 handle, chid, runlist, token, ce, rl_base, engine;
 	struct drm_mm_node ctx[7];		/* client GR channels: MAIN, PATCH, then the preemption buffers */
 	u64 inst;				/* VRAM */
+	struct drm_mm_node inst_node;		/* ... from the pool */
+	u32 gen;				/* RM instance it was made under */
 	void __iomem *userd_cpu;		/* this channel's USERD through BAR1 */
 	struct nv_dma_buf gpfifo, pb, mthdbuf, sem, errnotif;
 	u64 gpfifo_va, pb_va, sem_va;
@@ -423,7 +429,7 @@ struct nv_fifo {
 	u32 gr_runlist, gr_rl_base;
 	/* GR context buffers (promoted to RM once, for the GR channel) */
 	u32 ctxbuf_nr;
-	struct { u64 vram, va, size; u16 id; bool nonmapped; } ctxbuf[NV_GR_MAX_CTXBUFS];
+	struct { u64 vram, va, size; u16 id; bool nonmapped; struct drm_mm_node node; } ctxbuf[NV_GR_MAX_CTXBUFS];
 	bool gr_ready;
 	unsigned long chids[2];			/* chids in use (0 = reserved by RM) */
 	u32 gr_ce;				/* a copy engine on the GR runlist (GRCE) */
@@ -528,6 +534,12 @@ struct nvdrv_dev {
 	struct nv_intr intr;
 	struct nv_pm pm;
 	bool gsp_touched;	/* Booter/FWSEC ran: GSP may DMA into our memory */
+	u32 rm_gen;		/* GSP-RM instance: +1 per in-place GPU reset */
+	struct work_struct reset_work;	/* in-place GPU reset after GSP-RM died */
+	const char *reset_why;
+	u32 resets;		/* done since bind */
+	unsigned long reset_last;	/* jiffies of the last one */
+	bool reset_pending;
 	bool gsp_running;	/* GSP_INIT_DONE received */
 	unsigned int gsp_nocat;	/* GSP_POST_NOCAT_RECORD events (diagnostic journal) */
 
@@ -694,6 +706,7 @@ int nv_intr_init(struct nvdrv_dev *nv);
 void nv_intr_fini(struct nvdrv_dev *nv);
 void nv_intr_show(struct nvdrv_dev *nv, struct seq_file *m);
 void nv_uapi_fence_irq(struct nvdrv_dev *nv);
+bool nv_gsp_check_dead(struct nvdrv_dev *nv, const char *why);
 bool nv_intr_vblank_enable(struct nvdrv_dev *nv, u32 head, bool on);
 bool nv_intr_has_vblank(struct nvdrv_dev *nv);
 void nv_drm_vblank_irq(struct nvdrv_dev *nv, u32 head);
@@ -730,10 +743,18 @@ int nv_ce_fault_test(struct nvdrv_dev *nv);
 int nv_gr_chan_preempt(struct nvdrv_dev *nv, struct nv_chan *ch, u32 gfxp, u32 cilp);
 int nv_ce_recover(struct nvdrv_dev *nv, const char *why);
 void nv_uapi_device_lost(struct nvdrv_dev *nv, const char *why);
+void nv_uapi_reset(struct nvdrv_dev *nv, bool begin);
+/* src/reset.c: in-place GPU reset after GSP-RM died */
+void nv_gpu_reset_init(struct nvdrv_dev *nv);
+void nv_gpu_reset_schedule(struct nvdrv_dev *nv, const char *why);
+int nv_gpu_reset(struct nvdrv_dev *nv, const char *why);
+int nv_gsp_reboot_locked(struct nvdrv_dev *nv);
+void nv_disp_reset_rm(struct nvdrv_dev *nv);
 void nv_uapi_preempt_show(struct nvdrv_dev *nv, struct seq_file *m);
 void nv_fifo_show(struct nvdrv_dev *nv, struct seq_file *m);
 int nv_chan_kick(struct nvdrv_dev *nv, u32 mode);
 void nv_fifo_fini(struct nvdrv_dev *nv);
+void nv_fifo_reset(struct nvdrv_dev *nv);
 
 /* drm.c */
 void nv_put(struct nvdrv_dev *nv);
@@ -795,12 +816,15 @@ int nv_uapi_pm(struct nvdrv_dev *nv, bool suspend);
 
 /* System suspend/resume (src/pm.c). */
 void nv_bar1_resume(struct nvdrv_dev *nv);
+void nv_bar1_rebuild(struct nvdrv_dev *nv);
 void nv_bar1_detach(struct nvdrv_dev *nv);
 int nv_pm_suspend(struct nvdrv_dev *nv);
 int nv_pm_resume(struct nvdrv_dev *nv);
 int nv_pm_test(struct nvdrv_dev *nv, u32 mode);
 int nv_drm_suspend(struct nvdrv_dev *nv);
 void nv_drm_resume(struct nvdrv_dev *nv);
+void nv_drm_gpu_lost(struct nvdrv_dev *nv);
+int nv_drm_reset(struct nvdrv_dev *nv, int (*hw_reset)(struct nvdrv_dev *nv));
 void nv_evo_fini(struct nvdrv_dev *nv);
 void nv_evo_show(struct nvdrv_dev *nv, struct seq_file *m);
 

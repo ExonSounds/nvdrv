@@ -65,12 +65,15 @@ static int vram_zero(struct nvdrv_dev *nv, u64 addr, u64 size)
 	return 0;
 }
 
-/* A zeroed 4K page-table page: carve-out for nvdrv's VM, the freeable pool for client VMs. */
+/*
+ * A zeroed 4K page-table page from the freeable pool (client VMs, and nvdrv's own VM once
+ * the pool exists: a GPU reset rebuilds it); the carve-out before that.
+ */
 static int pt_page(struct nvdrv_dev *nv, struct nv_vmm *vm, u64 *out)
 {
 	int ret;
 
-	if (vm->external) {
+	if (vm->external || (nv->mem.ready && vm->pts.next)) {
 		struct nv_pt *pt = kzalloc(sizeof(*pt), GFP_KERNEL);
 
 		ret = pt ? nv_mem_get(nv, &pt->node, SZ_4K, SZ_4K) : -ENOMEM;
@@ -386,6 +389,8 @@ static int vmm_init(struct nvdrv_dev *nv, struct nv_vmm *vm)
 	vm->h_client = nv->rm.h_client;
 	vm->h_device = nv->rm.h_device;
 	vm->h_subdevice = nv->rm.h_subdevice;
+	vm->gen = nv->rm_gen;
+	INIT_LIST_HEAD(&vm->pts);
 	ret = pt_page(nv, vm, &vm->root);
 	if (!ret)
 		ret = pd_next(nv, vm, vm->root + ((SPLIT_VAS_START >> 47) & 3) * 8, &pd2);
@@ -452,6 +457,7 @@ int nv_vmm_client_init(struct nvdrv_dev *nv, struct nv_vmm *vm, u32 h_client, u6
 	xa_init(&vm->huge);
 	vm->external = true;
 	vm->next = kernel_va;
+	vm->gen = nv->rm_gen;
 	ret = nv_rm_client_alloc(nv, h_client);
 	if (ret)
 		return ret;
@@ -481,7 +487,7 @@ void nv_vmm_client_fini(struct nvdrv_dev *nv, struct nv_vmm *vm)
 	struct nv_pt *pt, *tmp;
 
 	lockdep_assert_held(&nv->gsp_lock);
-	if (vm->h_client && nv->gsp_running) {
+	if (vm->h_client && nv->gsp_running && vm->gen == nv->rm_gen) {	/* not from before a GPU reset */
 		if (vm->handle) {
 			__le32 un[2] = { cpu_to_le32(vm->handle), 0 };
 
@@ -640,9 +646,11 @@ int nv_chan_create(struct nvdrv_dev *nv, struct nv_chan *ch, struct nv_vmm *vm, 
 	if (!ret)
 		ret = userd_page(nv);
 	if (!ret)
-		ret = nv_vram_alloc(nv, CHAN_INST_SIZE, SZ_4K, &ch->inst);
+		ret = nv_mem_get(nv, &ch->inst_node, CHAN_INST_SIZE, SZ_4K);
 	if (ret)
 		return ret;
+	ch->inst = ch->inst_node.start;
+	ch->gen = nv->rm_gen;
 	mthdbuf_size = le32_to_cpu(v32);
 	ch->vm = vm;
 	ch->chid = chid;
@@ -714,8 +722,9 @@ int nv_chan_create(struct nvdrv_dev *nv, struct nv_chan *ch, struct nv_vmm *vm, 
 void nv_chan_destroy(struct nvdrv_dev *nv, struct nv_chan *ch)
 {
 	lockdep_assert_held(&nv->gsp_lock);
-	if (ch->handle && nv->gsp_running)
+	if (ch->handle && nv->gsp_running && ch->gen == nv->rm_gen)	/* not from before a GPU reset */
 		nv_rm_free(nv, ch->vm->h_client, ch->handle);
+	nv_mem_put(nv, &ch->inst_node);
 	nv_dma_buf_free(nv, &ch->gpfifo);
 	nv_dma_buf_free(nv, &ch->pb);
 	nv_dma_buf_free(nv, &ch->mthdbuf);
@@ -864,9 +873,10 @@ static int gr_ctxbuf_add(struct nvdrv_dev *nv, u16 id, u32 size, bool init, bool
 	page = size >= SZ_2M ? SZ_2M : size >= SZ_64K ? SZ_64K : SZ_4K;
 	align = id == PROMOTE_ID_ATTRIBUTE_CB ? roundup_pow_of_two(size) : page;
 	size = ALIGN(size, SZ_4K);
-	ret = nv_vram_alloc(nv, size, page, &vram);
+	ret = nv_mem_get(nv, &f->ctxbuf[f->ctxbuf_nr].node, size, page);
 	if (ret)
 		return ret;
+	vram = f->ctxbuf[f->ctxbuf_nr].node.start;
 	if (init)
 		nv_vram_fill(nv, vram, size, 0, NULL, NULL);
 	if (!nonmapped) {
@@ -1373,8 +1383,6 @@ int nv_fifo_init(struct nvdrv_dev *nv)
 	ret = nv_bar1_init(nv);
 	set_bit(CHID_CE, nv->fifo.chids);
 	set_bit(CHID_GR, nv->fifo.chids);
-	if (!ret && !nv->vmm.handle)
-		ret = vmm_init(nv, &nv->vmm);
 	if (!ret && !nv->mem.ready) {	/* the VRAM pool takes its range from the carve-out */
 		struct drm_mm_node n;
 
@@ -1384,6 +1392,8 @@ int nv_fifo_init(struct nvdrv_dev *nv)
 		if (!ret)
 			nv_bar1_map_pool(nv);	/* large BAR: CPU sees the whole pool */
 	}
+	if (!ret && !nv->vmm.handle)	/* after the pool: its page tables come from there */
+		ret = vmm_init(nv, &nv->vmm);
 	if (!ret && !nv->chan.handle) {
 		ret = ce_chan_init(nv, &nv->chan);
 		if (!ret) {
@@ -1506,23 +1516,56 @@ void nv_fifo_show(struct nvdrv_dev *nv, struct seq_file *m)
 }
 
 /* After the GPU reset in .remove: host memory only (RM objects died with the client). */
-void nv_fifo_fini(struct nvdrv_dev *nv)
+/*
+ * Host side of nvdrv's own FIFO objects: kernel channels, the kernel VM's page tables and
+ * the GR context buffers go back to the pool. RM objects are not freed here (the client
+ * free at unload takes them; after a GPU reset they are gone with the old GSP-RM).
+ */
+static void fifo_release(struct nvdrv_dev *nv)
 {
+	struct nv_fifo *f = &nv->fifo;
 	struct nv_chan *chans[] = { &nv->chan, &nv->grch };
-	int i;
+	struct nv_pt *pt, *tmp;
+	u32 i;
 
 	for (i = 0; i < ARRAY_SIZE(chans); i++) {
 		struct nv_chan *ch = chans[i];
 
-		nv_dma_buf_free(nv, &ch->gpfifo);
-		nv_dma_buf_free(nv, &ch->pb);
-		nv_dma_buf_free(nv, &ch->mthdbuf);
-		nv_dma_buf_free(nv, &ch->sem);
-		nv_dma_buf_free(nv, &ch->errnotif);
-		memset(ch, 0, sizeof(*ch));
+		ch->handle = 0;		/* no RM free */
+		ch->chid = 0;		/* CHID_CE/CHID_GR stay reserved */
+		nv_chan_destroy(nv, ch);
 	}
+	if (nv->vmm.pts.next)
+		list_for_each_entry_safe(pt, tmp, &nv->vmm.pts, head) {
+			nv_mem_put(nv, &pt->node);
+			kfree(pt);
+		}
+	memset(&nv->vmm, 0, sizeof(nv->vmm));
+	for (i = 0; i < f->ctxbuf_nr; i++)
+		nv_mem_put(nv, &f->ctxbuf[i].node);
+	f->ctxbuf_nr = 0;
+	f->gr_ready = false;
+}
+
+void nv_fifo_fini(struct nvdrv_dev *nv)
+{
+	mutex_lock(&nv->gsp_lock);
+	fifo_release(nv);
+	mutex_unlock(&nv->gsp_lock);
 	if (nv->fifo.userd_cpu)
 		iounmap(nv->fifo.userd_cpu);
 	memset(&nv->fifo, 0, sizeof(nv->fifo));
-	memset(&nv->vmm, 0, sizeof(nv->vmm));
+}
+
+/*
+ * In-place GPU reset: the same, but the USERD page (and its BAR1 mapping) and the chid
+ * bitmap stay - channels of programs that saw the device lost still hold their chids until
+ * they are freed. Caller holds gsp_lock, GSP-RM is down.
+ */
+void nv_fifo_reset(struct nvdrv_dev *nv)
+{
+	lockdep_assert_held(&nv->gsp_lock);
+	fifo_release(nv);
+	if (nv->fifo.userd_cpu)
+		memset_io(nv->fifo.userd_cpu, 0, SZ_64K);
 }

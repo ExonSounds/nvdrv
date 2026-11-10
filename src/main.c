@@ -459,9 +459,20 @@ static ssize_t vram_read(struct file *f, char __user *buf, size_t count, loff_t 
 	return done;
 }
 
+/* The PRAMIN window register may have lost its value (FLR, reset): look it up again. */
+static int vram_open(struct inode *inode, struct file *f)
+{
+	struct nvdrv_dev *nv = inode->i_private;
+
+	mutex_lock(&nv->gsp_lock);
+	nv->evo.pramin_base = ~0ULL;
+	mutex_unlock(&nv->gsp_lock);
+	return simple_open(inode, f);
+}
+
 static const struct file_operations vram_fops = {
 	.owner = THIS_MODULE,
-	.open = simple_open,
+	.open = vram_open,
 	.read = vram_read,
 	.llseek = default_llseek,
 };
@@ -728,6 +739,27 @@ static ssize_t gpu_lost_write(struct file *f, const char __user *buf, size_t cou
 	return count;
 }
 
+/* gpu_reset: in-place GPU reset now, as after GSP-RM death (src/reset.c) */
+static ssize_t gpu_reset_write(struct file *f, const char __user *buf, size_t count, loff_t *ppos)
+{
+	struct nvdrv_dev *nv = f->private_data;
+	bool go;
+	int ret = kstrtobool_from_user(buf, count, &go);
+
+	if (ret || !go)
+		return ret ?: count;
+	if (xchg(&nv->reset_pending, true))
+		return -EBUSY;
+	ret = nv_gpu_reset(nv, "requested through debugfs");
+	return ret ? ret : count;
+}
+
+static const struct file_operations gpu_reset_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = gpu_reset_write,
+};
+
 /* pm_test: "1" suspend + resume, "2" with an FLR in between (src/pm.c nv_pm_test) */
 static ssize_t pm_test_write(struct file *f, const char __user *buf, size_t count, loff_t *ppos)
 {
@@ -810,6 +842,7 @@ static void nv_debugfs_init(struct nvdrv_dev *nv)
 		debugfs_create_file("ce_fault", 0200, nv->dbg, nv, &ce_fault_fops);
 		debugfs_create_file("gpu_lost", 0200, nv->dbg, nv, &gpu_lost_fops);
 		debugfs_create_file("pm_test", 0200, nv->dbg, nv, &pm_test_fops);
+		debugfs_create_file("gpu_reset", 0200, nv->dbg, nv, &gpu_reset_fops);
 		debugfs_create_file("preempt", 0400, nv->dbg, nv, &preempt_fops);
 		debugfs_create_file("chan_status", 0400, nv->dbg, nv, &chan_status_fops);
 		debugfs_create_file("chan_kick", 0200, nv->dbg, nv, &chan_kick_fops);
@@ -1021,6 +1054,7 @@ static int nvdrv_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	mutex_init(&nv->evo.win_lock);
 	mutex_init(&nv->evo.curs_lock);
 	INIT_WORK(&nv->disp.hpd_work, nv_disp_hpd_work);
+	nv_gpu_reset_init(nv);
 	nv_uapi_init(nv);
 	ret = devm_add_action_or_reset(&pdev->dev, nv_put_action, nv);
 	if (ret)
@@ -1059,6 +1093,8 @@ static void nvdrv_remove(struct pci_dev *pdev)
 	struct nvdrv_dev *nv = pci_get_drvdata(pdev);
 
 	debugfs_remove_recursive(nv->dbg);
+	WRITE_ONCE(nv->reset_pending, true);	/* no new resets */
+	cancel_work_sync(&nv->reset_work);
 	cancel_work_sync(&nv->disp.hpd_work);
 	nv_drm_unregister(nv);	/* before nv_gsp_fini: no BAR1 access after the unload/FLR */
 	nv_gsp_fini(nv);	/* GSP-RM unload (or FLR) first: it DMAs into what follows */
