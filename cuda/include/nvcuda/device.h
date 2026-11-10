@@ -4,9 +4,11 @@
  *   clang -x cuda --cuda-device-only -nocudainc -nocudalib --offload=spirv64-unknown-unknown \
  *         -include nvcuda/device.h -O2 -S -emit-llvm k.cu -o k.ll
  *   llc -mtriple=spirv64-unknown-unknown -filetype=obj k.ll -o k.spv
- * threadIdx and friends map to the SPIR-V compute builtins; __syncthreads to OpControlBarrier
+ * For SPIR-V, threadIdx and friends map to the SPIR-V compute builtins; __syncthreads to OpControlBarrier
  * (Workgroup scope, workgroup memory semantics), which the LLVM SPIR-V backend recognises by
- * its __spirv_ name.
+ * its __spirv_ name. For NVPTX (PTX for the PTX front end):
+ *   clang -x cuda --cuda-device-only -nocudainc -nocudalib --cuda-gpu-arch=sm_86 \\
+ *         -include nvcuda/device.h -O2 -S k.cu -o k.ptx
  */
 #ifndef NVCUDA_DEVICE_H
 #define NVCUDA_DEVICE_H
@@ -18,6 +20,14 @@
 #define __constant__	__attribute__((constant))
 #define __forceinline__	__inline__ __attribute__((always_inline))
 
+#if defined(__NVPTX__)
+/*
+ * NVPTX (PTX output, the input of nvcuda's PTX front end): clang's own builtin variables
+ * (threadIdx & co. through __nvvm_read_ptx_sreg_*) and bar.sync.
+ */
+#include <__clang_cuda_builtin_vars.h>
+#define __syncthreads()	__nvvm_bar_sync(0)
+#else
 struct nvcuda_dim3 { unsigned int x, y, z; };
 
 #define NVCUDA_SV(name, fn)								\
@@ -45,5 +55,6 @@ static __device__ __forceinline__ void __syncthreads(void)
 {
 	__spirv_ControlBarrier(2, 2, 0x108);
 }
+#endif
 
 #endif

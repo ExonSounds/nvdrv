@@ -27,6 +27,7 @@
 #include "nv_device_info.h"
 
 #include "compile.h"
+#include "ptx.h"
 
 static struct nak_compiler *nak;
 static struct nv_device_info devinfo;
@@ -166,12 +167,62 @@ static void set_err(char *err, size_t len, const char *what)
 		snprintf(err, len, "%s", what);
 }
 
+/*
+ * Shared by both front ends: an explicit-I/O kernel in NIR (stage KERNEL) -> cbuf 0 -> NAK.
+ * Takes ownership of nir and kb (freed on failure).
+ */
+static struct nvc_kernel_bin *finish(nir_shader *nir, struct nvc_kernel_bin *kb, char *err, size_t errlen)
+{
+	struct nak_shader_bin *bin;
+
+	/* from here NAK's view: a compute shader with its inputs in cbuf 0 */
+	NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_cbuf0, nir_metadata_control_flow, NULL);
+	nir->info.stage = MESA_SHADER_COMPUTE;
+	nir->info.workgroup_size_variable = true;
+	/*
+	 * NAK derives the register limit from the workgroup size: 1x1x1 leaves it at 255, as CUDA does
+	 * without __launch_bounds__; cuLaunchKernel checks registers x threads against the SM.
+	 */
+	nir->info.workgroup_size[0] = nir->info.workgroup_size[1] = nir->info.workgroup_size[2] = 1;
+	nak_preprocess_nir(nir, nak);
+	NIR_PASS(_, nir, nir_lower_int64);
+	optimize(nir);
+	nak_lower_nir_before_linking(nir, nak);
+	nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+	kb->shared_static = nir->info.shared_size;
+	if (getenv("NVCUDA_DUMP_NIR"))
+		nir_print_shader(nir, stderr);
+
+	bin = nak_compile_shader(nir, getenv("NVCUDA_DUMP_ASM") != NULL, nak, 0, NULL, false);
+	if (!bin) {
+		set_err(err, errlen, "NAK compile failed");
+		free(kb);
+		ralloc_free(nir);
+		return NULL;
+	}
+	if (bin->asm_str && getenv("NVCUDA_DUMP_ASM"))
+		fprintf(stderr, "%s\n", bin->asm_str);
+	kb->info = malloc(sizeof(bin->info));
+	if (kb->info)
+		memcpy(kb->info, &bin->info, sizeof(bin->info));
+	kb->code_size = bin->code_size;
+	kb->code = malloc(bin->code_size);
+	if (kb->code)
+		memcpy(kb->code, bin->code, bin->code_size);
+	nak_shader_bin_destroy(bin);
+	ralloc_free(nir);
+	if (!kb->code || !kb->info) {
+		nvc_kernel_bin_free(kb);
+		return NULL;
+	}
+	return kb;
+}
+
 struct nvc_kernel_bin *nvc_compile_spirv(const uint32_t *words, size_t nwords, const char *entry, char *err,
 					 size_t errlen)
 {
 	const nir_shader_compiler_options *nir_opts = nak_nir_options(nak);
 	struct nvc_kernel_bin *kb = NULL;
-	struct nak_shader_bin *bin;
 	nir_shader *nir;
 	unsigned int n = 0;
 
@@ -238,45 +289,7 @@ struct nvc_kernel_bin *nvc_compile_spirv(const uint32_t *words, size_t nwords, c
 		 nir_var_mem_generic, nir_address_format_62bit_generic);
 	optimize(nir);
 
-	/* from here NAK's view: a compute shader with its inputs in cbuf 0 */
-	NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_cbuf0, nir_metadata_control_flow, NULL);
-	nir->info.stage = MESA_SHADER_COMPUTE;
-	nir->info.workgroup_size_variable = true;
-	/*
-	 * NAK derives the register limit from the workgroup size: 1x1x1 leaves it at 255, as CUDA does
-	 * without __launch_bounds__; cuLaunchKernel checks registers x threads against the SM.
-	 */
-	nir->info.workgroup_size[0] = nir->info.workgroup_size[1] = nir->info.workgroup_size[2] = 1;
-	nak_preprocess_nir(nir, nak);
-	NIR_PASS(_, nir, nir_lower_int64);
-	optimize(nir);
-	nak_lower_nir_before_linking(nir, nak);
-	nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
-	kb->shared_static = nir->info.shared_size;
-	if (getenv("NVCUDA_DUMP_NIR"))
-		nir_print_shader(nir, stderr);
-
-	bin = nak_compile_shader(nir, getenv("NVCUDA_DUMP_ASM") != NULL, nak, 0, NULL, false);
-	if (!bin) {
-		set_err(err, errlen, "NAK compile failed");
-		goto fail;
-	}
-	if (bin->asm_str && getenv("NVCUDA_DUMP_ASM"))
-		fprintf(stderr, "%s\n", bin->asm_str);
-	kb->info = malloc(sizeof(bin->info));
-	if (kb->info)
-		memcpy(kb->info, &bin->info, sizeof(bin->info));
-	kb->code_size = bin->code_size;
-	kb->code = malloc(bin->code_size);
-	if (kb->code)
-		memcpy(kb->code, bin->code, bin->code_size);
-	nak_shader_bin_destroy(bin);
-	ralloc_free(nir);
-	if (!kb->code || !kb->info) {
-		nvc_kernel_bin_free(kb);
-		return NULL;
-	}
-	return kb;
+	return finish(nir, kb, err, errlen);
 fail:
 	free(kb);
 	ralloc_free(nir);
@@ -341,3 +354,36 @@ const struct nak_constant_offset_info nak_const_offsets_turing_graphics = {
 	.printf_cb = 0,
 	.printf_buffer_offset = 0x18,
 };
+
+/* PTX text -> NIR (ptx.c) -> the same tail as SPIR-V */
+struct nvc_kernel_bin *nvc_compile_ptx(const char *ptx, const char *entry, char *err, size_t errlen)
+{
+	struct nvc_kernel_bin *kb = calloc(1, sizeof(*kb));
+	nir_shader *nir;
+
+	if (!kb)
+		return NULL;
+	nir = nvc_ptx_build(ptx, entry, nak_nir_options(nak), kb, err, errlen);
+	if (!nir) {
+		free(kb);
+		return NULL;
+	}
+	if (NVC_CB_PARAMS + kb->param_bytes > NVC_CB_SIZE) {
+		set_err(err, errlen, "kernel parameters larger than 4 KiB");
+		free(kb);
+		ralloc_free(nir);
+		return NULL;
+	}
+	nir_validate_shader(nir, "after the PTX front end");
+	NIR_PASS(_, nir, nir_lower_goto_ifs);		/* PTX's branches -> structured control flow */
+	NIR_PASS(_, nir, nir_opt_dead_cf);
+	NIR_PASS(_, nir, nir_lower_vars_to_ssa);	/* PTX registers -> SSA */
+	NIR_PASS(_, nir, nir_lower_system_values);
+	{
+		nir_lower_compute_system_values_options cs = { 0 };
+
+		NIR_PASS(_, nir, nir_lower_compute_system_values, &cs);
+	}
+	optimize(nir);
+	return finish(nir, kb, err, errlen);
+}

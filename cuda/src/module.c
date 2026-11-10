@@ -2,12 +2,12 @@
 /*
  * Modules, functions and launches.
  *
- * Images: SPIR-V (OpenCL Kernel modules, e.g. CUDA C++ compiled by clang for spirv64; an nvcuda
- * extension until the PTX front end exists). cuModuleLoadData gets no size, so a SPIR-V image must
+ * Images: PTX text (src/ptx.c), or SPIR-V (OpenCL Kernel modules, e.g. CUDA C++ compiled by clang
+ * for spirv64; an nvcuda extension). cuModuleLoadData gets no size, so a SPIR-V image must
  * end with a zero word (cuModuleLoad adds it). Functions are compiled on first lookup by
  * src/compile.c (Mesa's spirv_to_nir + NAK) and uploaded to VRAM. NVIDIA cubins are never
  * accepted (undocumented format): CUDA_ERROR_NO_BINARY_FOR_GPU, so programs that also ship PTX
- * can fall back to it; PTX text gets CUDA_ERROR_NOT_SUPPORTED for now.
+ * can fall back to it.
  *
  * Launch (the way NVK and NAK's hw_runner do it, classes from open-gpu-doc clc7c0.h): constant
  * buffer 0 (block, grid, parameters) and a QMD (V03_00, filled by NAK) are written into the push
@@ -58,8 +58,9 @@ struct CUfunc_st {
 struct CUmod_st {
 	struct CUmod_st *next;
 	struct CUctx_st *ctx;
-	uint32_t *words;
+	uint32_t *words;		/* SPIR-V, or NULL */
 	size_t nwords;
+	char *ptx;			/* PTX text, or NULL */
 	struct CUfunc_st *funcs;
 };
 
@@ -73,6 +74,14 @@ static bool is_elf(const void *image)
 static bool is_spirv(const void *image)
 {
 	return *(const uint32_t *)image == SPIRV_MAGIC;
+}
+
+/* PTX is text: its .version and .target directives come before any code */
+static bool is_ptx(const char *s)
+{
+	const char *v = strstr(s, ".version");
+
+	return v && v - s < 4096 && strstr(s, ".target");
 }
 
 /* ---- the compute channel, created with the first launch ---- */
@@ -175,8 +184,17 @@ CUAPI CUresult cuModuleLoadDataEx(CUmodule *module, const void *image, unsigned 
 		return CUDA_ERROR_INVALID_VALUE;
 	if (is_elf(image))
 		return CUDA_ERROR_NO_BINARY_FOR_GPU;
-	if (!is_spirv(image))
-		return CUDA_ERROR_NOT_SUPPORTED;	/* PTX: milestone 3 */
+	if (!is_spirv(image)) {
+		if (!is_ptx(image))
+			return CUDA_ERROR_INVALID_IMAGE;
+		m = calloc(1, sizeof(*m));
+		if (!m || !(m->ptx = strdup(image))) {	/* PTX images are NUL-terminated text */
+			free(m);
+			return CUDA_ERROR_OUT_OF_MEMORY;
+		}
+		m->ctx = ctx;
+		goto add;
+	}
 	/* SPIR-V carries no length: the header's bound is not one either, so walk the instructions */
 	for (words = 5; ; ) {
 		uint32_t len = w[words] >> 16;
@@ -198,6 +216,7 @@ CUAPI CUresult cuModuleLoadDataEx(CUmodule *module, const void *image, unsigned 
 		return CUDA_ERROR_OUT_OF_MEMORY;
 	}
 	memcpy(m->words, image, words * 4);
+add:
 	pthread_mutex_lock(&ctx->lock);
 	m->next = ctx->modules;
 	ctx->modules = m;
@@ -212,9 +231,11 @@ static CUresult load_sized(CUmodule *module, const void *data, size_t size)
 	uint32_t *buf;
 	CUresult r;
 
-	if (size < 20 || size % 4 || !is_spirv(data))
-		return size >= 4 && is_elf(data) ? CUDA_ERROR_NO_BINARY_FOR_GPU : CUDA_ERROR_NOT_SUPPORTED;
-	buf = calloc(1, size + 4);
+	if (size >= 4 && is_elf(data))
+		return CUDA_ERROR_NO_BINARY_FOR_GPU;
+	if (size < 20 || (is_spirv(data) && size % 4))
+		return CUDA_ERROR_INVALID_IMAGE;
+	buf = calloc(1, size + 4);	/* a zero word after SPIR-V, a NUL after PTX */
 	if (!buf)
 		return CUDA_ERROR_OUT_OF_MEMORY;
 	memcpy(buf, data, size);
@@ -274,6 +295,7 @@ static void module_free(struct CUmod_st *m)
 		func_free(m->ctx, f);
 	}
 	free(m->words);
+	free(m->ptx);
 	free(m);
 }
 
@@ -335,7 +357,8 @@ CUAPI CUresult cuModuleGetFunction(CUfunction *func, CUmodule module, const char
 	pthread_mutex_lock(&compiler_lock);
 	r = nvc_compiler_init(ctx->dev->gpc_count, ctx->dev->tpc_count) ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
 	if (r == CUDA_SUCCESS) {
-		f->kb = nvc_compile_spirv(module->words, module->nwords, name, err, sizeof(err));
+		f->kb = module->ptx ? nvc_compile_ptx(module->ptx, name, err, sizeof(err)) :
+				      nvc_compile_spirv(module->words, module->nwords, name, err, sizeof(err));
 		if (!f->kb)
 			r = CUDA_ERROR_NOT_FOUND;
 	}

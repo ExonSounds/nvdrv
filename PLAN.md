@@ -831,9 +831,36 @@ not used.
         LLVM infer-address-spaces sees global pointers; or a NIR pass treating kernel-argument pointers as global.
       - [ ] Module-scope `__device__`/`__constant__` variables (cuModuleGetGlobal), dynamic `extern __shared__`,
         printf, math built-ins beyond what vtn lowers natively (libclc is not linked).
-- [ ] **Milestone 3: PTX front end** (PTX → NIR, C with nir_builder). PTX is NVIDIA's public ISA spec, so this is
-      not reverse engineering. Needed for programs that ship PTX (Blender ships `kernel_compute_75.ptx`). Mesa has
-      no PTX parser.
+- [ ] **Milestone 3: PTX front end** (`src/ptx.c`, started 2026-11-10). PTX is NVIDIA's public ISA spec; Mesa has no PTX
+      parser. PTX text → NIR directly, then the same NAK tail as SPIR-V (`finish()` in compile.c):
+      - Registers become function_temp variables (made SSA by vars_to_ssa). Branches become an unstructured
+        CFG (`nir_goto`/`nir_goto_if`, structured by `nir_lower_goto_ifs`). A predicated instruction gets its
+        own block.
+      - Memory with a named state space maps straight onto load/store_global, _shared, _scratch (.local) and
+        load_kernel_input (.param), so there are no run-time pointer checks: saxpy is 240 bytes of code vs
+        1024 via SPIR-V. Generic addresses follow NVIDIA's window model (shared at 0xfe000000, local at
+        0xff000000, as nvcuda programs them): `cvta` converts, and a generic ld/st/atom checks the window.
+      - Parameters are laid out in order with their own alignment (`.ptr .align N` is the pointee's).
+        `extern .shared` (dynamic) starts after all static shared memory (the body is prescanned).
+      - Instructions: mov (incl. pack/unpack), cvta, cvt (int/float, rni/rzi/rmi/rpi, sat), ld/st/ldu (v2/v4,
+        all spaces), atom/red (add/min/max/and/or/xor/exch/inc/dec/cas; .acquire/.release fences), bar,
+        barrier, membar, fence, shfl.sync (up/down/bfly/idx with the PTX clamp/segment rules), vote
+        (all/any/uni/ballot), activemask, setp (all comparisons, .and/.or/.xor, p|q), selp, integer
+        add/sub(.sat)/mul(.lo/.hi/.wide)/mad/mul24/div/rem/abs/neg/min/max/and/or/xor/not/cnot/shl/shr
+        (PTX clamping)/popc/clz/brev/bfe/bfi/prmt/bfind, float add/sub/mul/fma/mad/div/neg/abs/min/max/
+        sqrt/rsqrt/rcp/sin/cos/ex2/lg2/tanh/copysign/testp, predicate and/or/xor/not, bra, ret, exit.
+        Special registers: tid, ntid, ctaid, nctaid, laneid, warpid, clock(64), lanemask_*.
+      - cuModuleLoad/LoadData take PTX text (detected by `.version`/`.target`).
+      - Verified on the GPU: kerneltest 10/10 from PTX (saxpy 404 GB/s) and `build/ptxtest` 15/15 (tests/ptxops.cu
+        through clang's NVPTX back end: f32/f64 math and rounding, 64-bit integer math, 32-bit bit operations,
+        all four shuffle modes and ballot, shared/CAS/max atomics, dynamic shared memory, generic pointers,
+        data-dependent loops).
+      - [ ] Device functions (`.func`, `call`, `.param` passing): nvcc does not always inline.
+      - [ ] Module-scope `.global`/`.const` variables with initializers (`cuModuleGetGlobal`; Cycles'
+        `kernel_params` is a `__constant__`).
+      - [ ] Textures and surfaces (`tex`, `suld`/`sust` with texture objects) for Cycles' images.
+      - [ ] f16/bf16 (`.f16`, `.f16x2`), carry chains (add.cc/addc), `match`, `redux`, `cp.async`, `mma`/`wmma`.
+      - [ ] Real nvcc output: test against Blender's shipped `kernel_compute_75.ptx`.
 - [ ] **Milestone 4: Blender Cycles.** Needs textures (`cuTexObjectCreate` for PITCH2D/LINEAR), `cuMemcpy2DUnaligned`,
       `cuModuleGetGlobal` (the `kernel_params` constant), `cuOccupancyMaxPotentialBlockSize`, dynamic shared
       memory, and about 50 kernels. Official builds ship `lib/kernel_sm_86.cubin.zst`, which Cycles picks first

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-/* Offline check of nvcuda's compiler: nakc file.spv entry...  (prints NAK's result per kernel) */
+/* Offline check of nvcuda's compilers: nakc file.{spv,ptx} entry...  (NAK's result per kernel) */
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -20,7 +20,7 @@ int main(int argc, char **argv)
 	if (!f || fseek(f, 0, SEEK_END) || (n = ftell(f)) <= 0)
 		return 1;
 	rewind(f);
-	w = malloc(n);
+	w = calloc(1, n + 4);
 	if (fread(w, 1, n, f) != (size_t)n)
 		return 1;
 	fclose(f);
@@ -28,7 +28,8 @@ int main(int argc, char **argv)
 		return 1;
 	for (i = 2; i < argc; i++) {
 		char err[256] = "";
-		struct nvc_kernel_bin *kb = nvc_compile_spirv(w, n / 4, argv[i], err, sizeof(err));
+		struct nvc_kernel_bin *kb = w[0] == 0x07230203u ? nvc_compile_spirv(w, n / 4, argv[i], err, sizeof(err)) :
+								  nvc_compile_ptx((const char *)w, argv[i], err, sizeof(err));
 
 		if (!kb) {
 			printf("%s: FAIL %s\n", argv[i], err);

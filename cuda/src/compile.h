@@ -25,6 +25,7 @@ struct nvc_kernel_bin {
 int nvc_compiler_init(unsigned int gpcs, unsigned int tpcs);
 struct nvc_kernel_bin *nvc_compile_spirv(const uint32_t *words, size_t nwords, const char *entry, char *err,
 					 size_t errlen);
+struct nvc_kernel_bin *nvc_compile_ptx(const char *ptx, const char *entry, char *err, size_t errlen);
 void nvc_kernel_bin_free(struct nvc_kernel_bin *kb);
 uint32_t nvc_qmd_size(void);
 void nvc_fill_qmd(const struct nvc_kernel_bin *kb, uint64_t code_va, uint64_t cb0_va, uint32_t cb0_size,
