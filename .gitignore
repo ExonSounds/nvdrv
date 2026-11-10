@@ -9,3 +9,4 @@ Module.symvers
 modules.order
 *.bin
 __pycache__/
+cuda/build/

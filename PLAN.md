@@ -768,6 +768,55 @@ To-do list (GA104 / RTX 3060 Ti), roughly by user impact within each group:
       done for the FBSR page lists (suspend); replies come back the same way and their continuation records are
       drained as events.
 
+### Open CUDA (`cuda/`, nvcuda) - the fully open compute path (user, 2026-11-10)
+Goal: an open `libcuda.so.1` (CUDA Driver API) on nvdrv's uAPI, with kernels compiled from source or PTX by open
+compilers. No NVIDIA binaries: no closed libcuda/libcudart, no cubins (undocumented format), no reverse engineering.
+`cuda/` is MIT (like Mesa) so the library can be used independently of the GPL kernel module. API numbers come from
+NVIDIA's public Driver API reference, cross-checked against Blender's cuew (Apache-2.0); NVIDIA's EULA'd `cuda.h` is
+not used.
+- [x] **Milestone 1: devices, contexts, memory, streams, events** (2026-11-10). `make -C cuda`, then
+      `LD_LIBRARY_PATH=cuda/build cuda/build/cudatest`: 21/21.
+      - Devices: nvdrv render nodes, queried like NVK (VM_INIT, NVIF device info, GRAPH_UNITS → 38 SMs). Fixed
+        compute 8.6 limits; the driver version reports 13000 (Blender's minimum).
+      - Contexts: one DRM file each (own VM, a copy channel). Primary contexts are reference counted; the current
+        context is a per-thread stack.
+      - Unified addressing: one process-wide VA range [128 GiB, 508 GiB), also reserved PROT_NONE in the process, so
+        device and host pointers never collide.
+      - Memory: VRAM GEM objects; pinned host memory (GART, mapped CPU + GPU, `cuMemHostGetDevicePointer`).
+        Copies and memsets run on the copy engine (clc7b5.h; memsets through REMAP with CONST_A). Pageable copies
+        go through an 8 MiB double-buffered staging buffer.
+      - Streams are timeline syncobjs; `cuStreamWaitEvent` adds EXEC waits. Events are timeline points plus a
+        copy-engine four-word semaphore (GPU timestamp), used by `cuEventElapsedTime`.
+      - Every symbol Blender's cuew loads exists; the 155 not done yet fail with `CUDA_ERROR_NOT_SUPPORTED`
+        (`src/stubs.c`). Cubin images get `CUDA_ERROR_NO_BINARY_FOR_GPU`.
+      - Bandwidth: 3-4 GB/s by default, because copy-only work leaves the GPU at P8 / PCIe Gen1. With nvdrv
+        `exec_boost=1`: 12.5 GB/s pinned, 13.3 GB/s async, 7.3 GB/s pageable (full Gen3 x16). → nvcuda should ask
+        for P0 while work is queued (a uAPI hint, or exec_boost per channel).
+- [ ] **Milestone 2: kernel launch from CUDA source.** Route: clang `-x cuda --offload=spirv64` → `llc` → SPIR-V
+      (works with the installed LLVM 23: `spirv-val` clean, OpenCL Kernel module) → Mesa `spirv_to_nir` → NAK →
+      QMD launch.
+      - NAK needs Mesa built with `-Dvulkan-drivers=nouveau`, plus rustc ≥ 1.85, bindgen, meson ≥ 1.7, mako and
+        PyYAML. None of these are installed (installing needs the user's OK). NVK's CLC dependency needs
+        LLVMSPIRVLib and libclc, or a small meson patch.
+      - Launch: QMD V03_00 (clc6c0qmd.h layout; NAK's `nak_fill_qmd`), `SEND_PCAS_A` = qmd >> 8,
+        `SEND_SIGNALING_PCAS2_B` = 3. One-time setup: shared/local memory windows 0xfe000000 / 0xff000000 (keep that
+        VA free) and SET_SHADER_LOCAL_MEMORY(_NON_THROTTLED). SLM sized like NVK (per TPC × 19 TPCs).
+      - cbuf0 layout like NVK's cubin launcher: block_dim at 0x0, grid_dim at 0xc, kernel params after them. Our
+        own NIR pass maps load_kernel_input / workgroup size / num_workgroups to `ldc_nv`.
+      - NAK has no generic loads: generic pointers must be resolved to global/shared/local in NIR.
+      - Mesa's `nak/hw_runner.rs` is a complete uAPI compute runner to follow.
+- [ ] **Milestone 3: PTX front end** (PTX → NIR, C with nir_builder). PTX is NVIDIA's public ISA spec, so this is
+      not reverse engineering. Needed for programs that ship PTX (Blender ships `kernel_compute_75.ptx`). Mesa has
+      no PTX parser.
+- [ ] **Milestone 4: Blender Cycles.** Needs textures (`cuTexObjectCreate` for PITCH2D/LINEAR), `cuMemcpy2DUnaligned`,
+      `cuModuleGetGlobal` (the `kernel_params` constant), `cuOccupancyMaxPotentialBlockSize`, dynamic shared
+      memory, and about 50 kernels. Official builds ship `lib/kernel_sm_86.cubin.zst`, which Cycles picks first
+      with no PTX fallback, so that file has to be renamed (Cycles then loads `kernel_compute_75.ptx.zst`) or
+      Blender built without sm_8x cubins.
+- [ ] Later: unified memory (`cuMemAllocManaged`; replayable faults, nouveau's MIT SVM/HMM as reference),
+      `cuMemHostRegister` (needs a userptr-like uAPI), cross-context copies, legacy default-stream semantics
+      (today the null stream is one more stream).
+
 ## Hardware workflow
 
 ```
@@ -822,5 +871,6 @@ src/              kernel module sources
 tools/            userspace helpers (VBIOS parser, register decoders)
 scripts/          bind / unbind
 tests/            per-phase smoke tests
+cuda/             nvcuda: open libcuda.so.1 (MIT), its headers and tests
 ref/              (gitignored) NVIDIA reference trees
 ```
