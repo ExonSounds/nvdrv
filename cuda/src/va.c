@@ -5,6 +5,7 @@
  * no host allocation can ever get an address that is also a device pointer. GPU VAs come from a
  * first-fit free list over that range; every context maps its objects at the VA they got here.
  */
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 
@@ -196,4 +197,38 @@ void nvc_alloc_drop_ctx(struct CUctx_st *ctx)
 		nvc_bo_free(ctx, &a->bo);
 		free(a);
 	}
+}
+
+/*
+ * Diagnosis (NVCUDA_DUMP in module.c): write every device allocation of the context up to max_bytes
+ * to dir, named by allocation order, address and size, so two runs can be compared field by field.
+ */
+void nvc_alloc_dump(struct CUctx_st *ctx, const char *dir, uint64_t max_bytes)
+{
+	struct nvc_alloc *a;
+	int n = 0, written = 0;
+
+	for (a = allocs; a; a = a->next)
+		n++;
+	for (a = allocs; a; a = a->next) {	/* the list is newest first */
+		char path[512];
+		void *buf;
+		FILE *f;
+
+		n--;
+		if (a->ctx != ctx || a->kind != NVC_ALLOC_DEVICE || a->bo.size > max_bytes)
+			continue;
+		snprintf(path, sizeof(path), "%s/%04d_%llx_%llu.bin", dir, n, (unsigned long long)a->bo.va,
+			 (unsigned long long)a->bo.size);
+		buf = malloc(a->bo.size);
+		if (!buf || cuMemcpyDtoH_v2(buf, a->bo.va, a->bo.size) != CUDA_SUCCESS || !(f = fopen(path, "wb"))) {
+			free(buf);
+			continue;
+		}
+		fwrite(buf, 1, a->bo.size, f);
+		fclose(f);
+		free(buf);
+		written++;
+	}
+	fprintf(stderr, "nvcuda: dumped %d allocations to %s\n", written, dir);
 }

@@ -133,12 +133,14 @@ struct nvc_alloc *nvc_alloc_remove_host(void *p);
 struct nvc_alloc *nvc_alloc_find_va(uint64_t va, uint64_t len);	/* [va, va+len) inside one allocation */
 struct nvc_alloc *nvc_alloc_find_host(const void *p, uint64_t len);
 void nvc_alloc_drop_ctx(struct CUctx_st *ctx);
+void nvc_alloc_dump(struct CUctx_st *ctx, const char *dir, uint64_t max_bytes);
 
 /* submit.c */
 struct CUstream_st *nvc_stream(struct CUctx_st *ctx, CUstream s);
 uint32_t *nvc_push_begin(struct CUctx_st *ctx, uint32_t dwords);
 CUresult nvc_push_submit(struct CUctx_st *ctx, struct CUstream_st *s, uint32_t chan, uint32_t *start, uint32_t *end);
 CUresult nvc_stream_wait_idle(struct CUstream_st *s);
+void nvc_trace_synced(void);
 CUresult nvc_ctx_idle(struct CUctx_st *ctx);
 uint32_t *nvc_mthd(uint32_t *p, int subc, uint32_t mthd, int n, const uint32_t *data);
 

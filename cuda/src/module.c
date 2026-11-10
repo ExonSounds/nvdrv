@@ -159,6 +159,8 @@ static CUresult slm_ensure(struct CUctx_st *ctx, uint32_t slm_per_thread)
 	if (slm_per_thread <= ctx->slm_per_thread)
 		return CUDA_SUCCESS;
 	slm_per_thread = (slm_per_thread + 0x1ff) & ~0x1ffu;	/* some headroom against regrowing */
+	if (getenv("NVCUDA_SLM_SCALE"))	/* diagnosis: oversize the area */
+		slm_per_thread *= atoi(getenv("NVCUDA_SLM_SCALE"));
 	per_warp = ((uint64_t)slm_per_thread * 32 + 0x1ff) & ~0x1ffull;
 	per_tpc = (per_warp * 48 * 2 + 0x7fff) & ~0x7fffull;
 	total = (per_tpc * ctx->dev->tpc_count + 0x1ffff) & ~0x1ffffull;
@@ -409,7 +411,7 @@ CUAPI CUresult cuModuleGetFunction(CUfunction *func, CUmodule module, const char
 	pthread_mutex_lock(&compiler_lock);
 	r = nvc_compiler_init(ctx->dev->gpc_count, ctx->dev->tpc_count) ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
 	if (r == CUDA_SUCCESS) {
-		f->kb = module->ptx ? nvc_compile_ptx(module->ptx, name, module->globals_va, err, sizeof(err)) :
+		f->kb = module->ptx ? nvc_compile_ptx(module->ptx, name, err, sizeof(err)) :
 				      nvc_compile_spirv(module->words, module->nwords, name, err, sizeof(err));
 		if (!f->kb)
 			r = CUDA_ERROR_NOT_FOUND;
@@ -546,6 +548,20 @@ CUAPI CUresult cuOccupancyMaxPotentialBlockSize(int *min_grid, int *block, CUfun
 
 /* ---- launch ---- */
 
+/* NVCUDA_DUMP=<kernel>:<grid_x>:<dir>: after that launch completes, allocations up to 1 MB go to <dir> */
+static void dump_after(struct CUctx_st *ctx, const char *name, unsigned int gx, const char *spec)
+{
+	static int done;
+	char kernel[128], dir[256];
+	unsigned int want;
+
+	if (done || sscanf(spec, "%127[^:]:%u:%255s", kernel, &want, dir) != 3 || strcmp(kernel, name) || gx != want)
+		return;
+	done = 1;
+	nvc_ctx_idle(ctx);
+	nvc_alloc_dump(ctx, dir, 1 << 20);
+}
+
 CUAPI CUresult cuLaunchKernel(CUfunction f, unsigned int gx, unsigned int gy, unsigned int gz, unsigned int bx,
 			      unsigned int by, unsigned int bz, unsigned int shared_bytes, CUstream stream,
 			      void **params, void **extra)
@@ -558,6 +574,7 @@ CUAPI CUresult cuLaunchKernel(CUfunction f, unsigned int gx, unsigned int gy, un
 	uint64_t threads = (uint64_t)bx * by * bz, cb_va, qmd_va;
 	char *ring;
 	CUresult r;
+	const char *dump;
 
 	if (!f)
 		return CUDA_ERROR_INVALID_HANDLE;
@@ -577,6 +594,9 @@ CUAPI CUresult cuLaunchKernel(CUfunction f, unsigned int gx, unsigned int gy, un
 		return CUDA_ERROR_INVALID_VALUE;
 	if (!ctx->gr_ready && (r = gr_init(ctx)) != CUDA_SUCCESS)
 		return r;
+	if (getenv("NVCUDA_TRACE"))
+		fprintf(stderr, "nvcuda: launch %s grid %ux%ux%u block %ux%ux%u smem %u stream %p\n", f->name, gx, gy, gz, bx,
+			by, bz, shared_bytes, (void *)stream);
 	if (nvc_kernel_slm(kb) && (r = slm_ensure(ctx, nvc_kernel_slm(kb))) != CUDA_SUCCESS)
 		return r;
 
@@ -592,6 +612,7 @@ CUAPI CUresult cuLaunchKernel(CUfunction f, unsigned int gx, unsigned int gy, un
 	memset(cb, 0, cb_size);
 	memcpy(cb + NVC_CB_BLOCK / 4, block, sizeof(block));
 	memcpy(cb + NVC_CB_GRID / 4, grid, sizeof(grid));
+	memcpy(cb + NVC_CB_GLOBALS / 4, &f->mod->globals_va, 8);
 	if (params) {
 		for (i = 0; i < kb->nparams; i++)
 			memcpy((char *)cb + NVC_CB_PARAMS + kb->params[i].offset, params[i], kb->params[i].size);
@@ -621,5 +642,7 @@ CUAPI CUresult cuLaunchKernel(CUfunction f, unsigned int gx, unsigned int gy, un
 	p = nvc_mthd1(p, SUBC_COMPUTE, C7C0_SEND_SIGNALING_PCAS2_B, PCAS_ACTION_INVALIDATE_COPY_SCHEDULE);
 	r = nvc_push_submit(ctx, s, ctx->gr_chan, start, p);
 	pthread_mutex_unlock(&ctx->lock);
+	if (r == CUDA_SUCCESS && (dump = getenv("NVCUDA_DUMP")))
+		dump_after(ctx, f->name, gx, dump);
 	return r;
 }

@@ -877,9 +877,11 @@ not used.
         integer coordinates). Caches are invalidated at the next launch after a change. Also
         `cuMemcpy2D(Unaligned/Async)` on the copy engine's multi-line mode and `cuMemAllocPitch`.
         ptxtest: point and linear filtering, clamping, uchar4 normalized, 1-D fetch: 28/28.
-      - [x] Compile cache: `~/.cache/nvcuda/<fnv64>.bin` keyed on the image, entry, globals address and a
-        version string (`NVCUDA_CACHE=0` disables). Cycles loads ~50 kernels at startup; the big ones take
-        40-85 s each to compile the first time.
+      - [x] Compile cache: `~/.cache/nvcuda/<fnv64>.bin` keyed on the image, entry, the mode overrides and a
+        version string (`NVCUDA_CACHE=0` disables). The module-globals base is read from cbuf 0 at 0x18 at run
+        time instead of being baked into the code, so a cached kernel is position independent and shared
+        between processes: `build/nakc` pre-compiles for Blender (`xargs -P 6` over the entries, 10 min
+        for all 75 vs 631 s serial in Blender). The big ones take 40-110 s each.
       - **NAK on huge kernels.** Cycles' shading kernels inline the whole SVM evaluator: 240K-520K NIR
         instructions in 16K-30K blocks after optimisation (5.9-13.6 MB of code each). NAK's `SimpleLiveness`
         kept four dense bitsets per block sized to the function's value count and ran out of memory (>16 GB).
@@ -912,17 +914,38 @@ not used.
         others. A JIT inside an application must not take it down.
       - **Cycles 5.2.3: all 75 kernels compile** (631 s for all once, cached afterwards; 95 MB of code; up to
         30 KB of local memory per thread, about 1.5 GB of VRAM for local memory at full occupancy). 10 kernels
-        use memory mode, 3 needed a retry. Not run on the GPU yet (needs Blender).
+        use memory mode, 3 needed a retry.
       - `tests/blender-cycles.sh <blender-dir>` renders the default scene with Cycles on nvcuda headless
-        (sets the shipped sm_86 cubin aside so Cycles loads its PTX). Not run yet: Blender's binary is a
-        downloaded executable.
+        (sets the shipped sm_86 cubin aside so Cycles loads its PTX).
+      - Diagnostics: `NVCUDA_TRACE=1` prints every launch and small readback (asynchronous ones when the next
+        synchronisation completes, which is how Cycles' queue counters become visible);
+        `NVCUDA_DUMP=<kernel>:<grid_x>:<dir>` writes every allocation up to 1 MB after that launch;
+        `NVCUDA_REGMEM=k1,k2` keeps only the named kernels in memory mode (bisecting); `NVCUDA_SLM_SCALE=n`
+        oversizes local memory. Tests added for what Cycles leans on: `build/stress` (a path-tracer-shaped
+        integer kernel: bounce loop, state struct through non-inlined calls, switch, early exits; 65536 threads
+        compared with the host, in all four outline/regmem modes), `build/compaction` (ballot + popcount +
+        shared prefix sum + one atomic, as Cycles' active-index arrays), rotations and 8/16-bit memory in
+        ptxtest (30/30).
       - [ ] Surfaces (`suld`/`sust`), `tld4`, `txq`, CUDA arrays and mipmaps; array/cube textures.
       - [ ] f16/bf16 (`.f16`, `.f16x2`), carry chains (add.cc/addc), `match`, `redux`, `cp.async`, `mma`/`wmma`.
-- [ ] **Milestone 4: Blender Cycles.** Needs textures (`cuTexObjectCreate` for PITCH2D/LINEAR), `cuMemcpy2DUnaligned`,
-      `cuModuleGetGlobal` (the `kernel_params` constant), `cuOccupancyMaxPotentialBlockSize`, dynamic shared
-      memory, and about 50 kernels. Official builds ship `lib/kernel_sm_86.cubin.zst`, which Cycles picks first
-      with no PTX fallback, so that file has to be renamed (Cycles then loads `kernel_compute_75.ptx.zst`) or
-      Blender built without sm_8x cubins.
+- [x] **Milestone 4: Blender Cycles renders on the open stack** (2026-11-10). Blender 5.2.3 headless, the
+      default scene, Cycles on "CUDA" = nvcuda + NAK + nvdrv: **960x540, 16 samples in 2.65 s** (plus 1.3 s of
+      scene setup), the cube lit and shadowed as on the CPU. The integrator's queue counters (traced) go
+      camera 518400 -> 422146 background + 96254 surface -> shadow and bounce rays -> all zero. Official builds
+      ship `lib/kernel_sm_86.cubin.zst`, which Cycles picks first with no PTX fallback, so that file has to be
+      renamed (Cycles then loads `kernel_compute_75.ptx.zst`) or Blender built without sm_8x cubins.
+      - Getting there: the first runs looped at "Sample 0" (shade_surface in memory mode never drained its
+        queue) or rendered the cube black (SSA mode); after the globals-through-cbuf0 change and a clean
+        cache the default mode is right every time. Whether the earlier code was wrong or the structurizer's
+        nondeterminism picked a bad shape is not settled (see below); the compile is now checked for it.
+      - [ ] **Open: SSA mode of `shade_surface` faults on the GPU** (`NVCUDA_REGMEM=0`, 38 KB local/thread, MMU
+        fault, also at 10 %), while memory mode is correct. Diagnosis in progress: a validating (asserts on)
+        build of NIR/NAK in `ref/mesa-src/build-nak-debug` to check the front end's NIR, and a determinism check
+        (three compiles of the same kernel compared). Only diagnostic modes are affected; the default is right.
+      - [ ] Denoising: Cycles' OptiX denoiser is unavailable (no OptiX), OIDN runs on the CPU; GPU OIDN would need
+        SYCL/CUDA OIDN kernels (not shipped as PTX).
+      - [ ] Interactive viewport rendering (needs a Blender session on the Hyprland desktop; the GL/Vulkan interop
+        path `cuGraphicsGLRegisterBuffer` is a stub).
 - [ ] Later: unified memory (`cuMemAllocManaged`; replayable faults, nouveau's MIT SVM/HMM as reference),
       `cuMemHostRegister` (needs a userptr-like uAPI), cross-context copies, legacy default-stream semantics
       (today the null stream is one more stream).

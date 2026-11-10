@@ -9,6 +9,7 @@
 /* nvcuda's constant buffer 0 */
 #define NVC_CB_BLOCK	0x00	/* uint32 x 3: block size */
 #define NVC_CB_GRID	0x0c	/* uint32 x 3: grid size */
+#define NVC_CB_GLOBALS	0x18	/* uint64: the module's globals buffer (so code never embeds an address) */
 #define NVC_CB_PARAMS	0x20	/* kernel parameters */
 #define NVC_CB_SIZE	0x1000
 #define NVC_MAX_PARAMS	128
@@ -35,7 +36,7 @@ struct nvc_kernel_bin {
 int nvc_compiler_init(unsigned int gpcs, unsigned int tpcs);
 struct nvc_kernel_bin *nvc_compile_spirv(const uint32_t *words, size_t nwords, const char *entry, char *err,
 					 size_t errlen);
-struct nvc_kernel_bin *nvc_compile_ptx(const char *ptx, const char *entry, uint64_t globals_va, char *err, size_t errlen);
+struct nvc_kernel_bin *nvc_compile_ptx(const char *ptx, const char *entry, char *err, size_t errlen);
 
 /* module-scope .global/.const variables of a PTX module (ptx.c): layout and initial contents */
 struct nvc_global {

@@ -16,7 +16,7 @@ struct nvc_ptx_opts {
 };
 
 nir_shader *nvc_ptx_build(const char *src, const char *entry, const nir_shader_compiler_options *opts,
-			  struct nvc_kernel_bin *kb, uint64_t globals_va, const struct nvc_ptx_opts *po, char *err,
+			  struct nvc_kernel_bin *kb, const struct nvc_ptx_opts *po, char *err,
 			  size_t errlen);
 
 #endif

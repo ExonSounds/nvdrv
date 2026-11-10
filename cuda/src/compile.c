@@ -40,7 +40,7 @@
 /* ---- on-disk cache of compiled kernels: $XDG_CACHE_HOME/nvcuda (NVCUDA_CACHE=0 disables) ---- */
 
 #define CACHE_MAGIC	"NVCUDAK2"
-#define CACHE_VERSION	"nvcuda-2026-11-10b"	/* bump when the compiler or the ABI changes */
+#define CACHE_VERSION	"nvcuda-2026-11-10c"	/* bump when the compiler or the ABI changes */
 
 struct cache_hdr {
 	char magic[8];
@@ -557,7 +557,7 @@ static void stats(nir_shader *nir, const char *stage)
 }
 
 /* PTX text -> NIR (ptx.c) -> the same tail as SPIR-V */
-static struct nvc_kernel_bin *compile_ptx_once(const char *ptx, const char *entry, uint64_t globals_va,
+static struct nvc_kernel_bin *compile_ptx_once(const char *ptx, const char *entry,
 					       const struct nvc_ptx_opts *po, char *err, size_t errlen)
 {
 	struct nvc_kernel_bin *kb = calloc(1, sizeof(*kb));
@@ -565,7 +565,7 @@ static struct nvc_kernel_bin *compile_ptx_once(const char *ptx, const char *entr
 
 	if (!kb)
 		return NULL;
-	nir = nvc_ptx_build(ptx, entry, nak_nir_options(nak), kb, globals_va, po, err, errlen);
+	nir = nvc_ptx_build(ptx, entry, nak_nir_options(nak), kb, po, err, errlen);
 	if (!nir) {
 		free(kb);
 		return NULL;
@@ -659,7 +659,7 @@ static bool read_all(int fd, void *p, size_t n)
 	return true;
 }
 
-static struct nvc_kernel_bin *compile_ptx_forked(const char *ptx, const char *entry, uint64_t globals_va,
+static struct nvc_kernel_bin *compile_ptx_forked(const char *ptx, const char *entry,
 						 const struct nvc_ptx_opts *po, char *err, size_t errlen)
 {
 	struct nvc_kernel_bin *kb = NULL;
@@ -668,14 +668,14 @@ static struct nvc_kernel_bin *compile_ptx_forked(const char *ptx, const char *en
 	pid_t pid;
 
 	if (getenv("NVCUDA_NO_FORK"))
-		return compile_ptx_once(ptx, entry, globals_va, po, err, errlen);
+		return compile_ptx_once(ptx, entry, po, err, errlen);
 	if (pipe(fds))
-		return compile_ptx_once(ptx, entry, globals_va, po, err, errlen);
+		return compile_ptx_once(ptx, entry, po, err, errlen);
 	pid = fork();
 	if (pid < 0) {
 		close(fds[0]);
 		close(fds[1]);
-		return compile_ptx_once(ptx, entry, globals_va, po, err, errlen);
+		return compile_ptx_once(ptx, entry, po, err, errlen);
 	}
 	if (pid == 0) {	/* child: compile, write header + info + params + code (+ the error text on failure) */
 		char cerr[256] = "";
@@ -683,7 +683,7 @@ static struct nvc_kernel_bin *compile_ptx_forked(const char *ptx, const char *en
 
 		close(fds[0]);
 		signal(SIGPIPE, SIG_IGN);
-		ckb = compile_ptx_once(ptx, entry, globals_va, po, cerr, sizeof(cerr));
+		ckb = compile_ptx_once(ptx, entry, po, cerr, sizeof(cerr));
 		if (!ckb) {
 			memset(&h, 0, sizeof(h));
 			memcpy(h.magic, "NVCFAIL!", 8);
@@ -743,7 +743,7 @@ static struct nvc_kernel_bin *compile_ptx_forked(const char *ptx, const char *en
  * NAK does not survive every shape the structurizer makes of a huge kernel. Try the default
  * build first; if it fails, registers in scratch (a different shape), then no outlining.
  */
-static struct nvc_kernel_bin *compile_ptx(const char *ptx, const char *entry, uint64_t globals_va, char *err, size_t errlen)
+static struct nvc_kernel_bin *compile_ptx(const char *ptx, const char *entry, char *err, size_t errlen)
 {
 	static const struct nvc_ptx_opts tries[] = { { -1, -1 }, { -1, 1 }, { 0, -1 }, { 0, 1 } };
 	struct nvc_kernel_bin *kb = NULL;
@@ -755,9 +755,9 @@ static struct nvc_kernel_bin *compile_ptx(const char *ptx, const char *entry, ui
 				tries[i].regmem, err);
 		if (i && strstr(err, "ptx line"))
 			break;	/* the PTX itself is the problem */
-		kb = compile_ptx_forked(ptx, entry, globals_va, &tries[i], err, errlen);
+		kb = compile_ptx_forked(ptx, entry, &tries[i], err, errlen);
 		if (!kb && strstr(err, "crashed"))	/* the crash follows the address layout: once more as is */
-			kb = compile_ptx_forked(ptx, entry, globals_va, &tries[i], err, errlen);
+			kb = compile_ptx_forked(ptx, entry, &tries[i], err, errlen);
 	}
 	return kb;
 }
@@ -781,21 +781,26 @@ struct nvc_kernel_bin *nvc_compile_spirv(const uint32_t *words, size_t nwords, c
 	return kb;
 }
 
-struct nvc_kernel_bin *nvc_compile_ptx(const char *ptx, const char *entry, uint64_t globals_va, char *err, size_t errlen)
+struct nvc_kernel_bin *nvc_compile_ptx(const char *ptx, const char *entry, char *err, size_t errlen)
 {
 	uint64_t key = 0xcbf29ce484222325ull;
 	struct nvc_kernel_bin *kb;
 
-	/* the globals address is an immediate in the code */
+	/* the globals address is an immediate in the code; the mode overrides change the code */
 	key = fnv(key, CACHE_VERSION, strlen(CACHE_VERSION));
 	key = fnv(key, "ptx", 3);
+	{
+		const char *o = getenv("NVCUDA_OUTLINE"), *m = getenv("NVCUDA_REGMEM");
+
+		key = fnv(key, o ? o : "-", o ? strlen(o) : 1);
+		key = fnv(key, m ? m : "-", m ? strlen(m) : 1);
+	}
 	key = fnv(key, entry, strlen(entry) + 1);
-	key = fnv(key, &globals_va, sizeof(globals_va));
 	key = fnv(key, ptx, strlen(ptx));
 	kb = cache_load(key);
 	if (kb)
 		return kb;
-	kb = compile_ptx(ptx, entry, globals_va, err, errlen);
+	kb = compile_ptx(ptx, entry, err, errlen);
 	if (kb)
 		cache_store(key, kb);
 	return kb;

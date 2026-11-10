@@ -71,6 +71,19 @@ extern "C" __global__ void bits32(unsigned *out, const unsigned *in, int n)
 	out[i * 12 + 11] = (x & 1) ? x * 3 + 1 : x / 2;
 }
 
+/* rotations: shf.l.wrap / shf.r.wrap, as Cycles' hash functions use them */
+extern "C" __global__ void rotates(unsigned *out, const unsigned *in, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n)
+		return;
+	unsigned x = in[i], y = in[(i + 3) % n];
+	out[i * 4 + 0] = __builtin_rotateleft32(x, y & 31);
+	out[i * 4 + 1] = __builtin_rotateright32(x, y & 31);
+	out[i * 4 + 2] = __builtin_rotateleft32(x, 13);
+	out[i * 4 + 3] = __builtin_rotateright32(x ^ y, 7) + __builtin_rotateleft32(y, 23);
+}
+
 /* per-warp sum with shfl.down, broadcast with shfl.idx, ballot, shfl.up and shfl.bfly */
 extern "C" __global__ void warp(unsigned *out)
 {
@@ -227,4 +240,26 @@ extern "C" __global__ void tex1dfetch(float *out, unsigned long long tex, int n)
 	asm volatile("tex.1d.v4.f32.s32 {%0, %1, %2, %3}, [%4, {%5}];"
 		     : "=f"(r), "=f"(g), "=f"(b), "=f"(a) : "l"(tex), "r"(i));
 	out[i] = r + g * 1000.0f;
+}
+
+/* 8- and 16-bit memory and arithmetic, as Cycles' path state uses (uint16_t bounce counters, uint8 flags) */
+extern "C" __global__ void small_types(unsigned short *u16, unsigned char *u8, short *s16, const unsigned *in, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n)
+		return;
+	unsigned short a = u16[i];
+	unsigned char b = u8[i];
+	short c = s16[i];
+	a = (unsigned short)(a + 1);
+	if (in[i] & 1)
+		a = (unsigned short)(a * 3);
+	b = (unsigned char)(b | (in[i] & 0x50));
+	b = (unsigned char)(b - 1);
+	c = (short)(c - (short)(in[i] & 0xff));
+	if (c < -100)
+		c = (short)(c / 3);
+	u16[i] = a;
+	u8[i] = b;
+	s16[i] = (short)(c + (short)(a >> 3));
 }

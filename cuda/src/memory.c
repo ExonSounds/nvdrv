@@ -10,6 +10,7 @@
  * variants complete before returning, as CUDA allows.
  */
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <xf86drm.h>
@@ -321,7 +322,59 @@ static CUresult memcpy_htod(CUdeviceptr dst, const void *src, size_t bytes, CUst
 	return htod_staged(ctx, s, dst, src, bytes);
 }
 
+static CUresult memcpy_dtoh_(void *dst, CUdeviceptr src, size_t bytes, CUstream stream, bool async);
+
+/*
+ * NVCUDA_TRACE=1: small readbacks are printed (the values a program's loop decides on); an
+ * asynchronous one is printed when the next synchronisation completes (nvc_trace_synced).
+ */
+static struct {
+	const void *dst;
+	size_t bytes;
+	uint64_t src;
+} trace_pending;
+
+static void trace_values(const void *dst, size_t bytes)
+{
+	size_t i;
+
+	fprintf(stderr, " =");
+	for (i = 0; i + 4 <= bytes; i += 4)
+		fprintf(stderr, " %u", ((const uint32_t *)dst)[i / 4]);
+	fprintf(stderr, "\n");
+}
+
+void nvc_trace_synced(void)
+{
+	if (!trace_pending.dst)
+		return;
+	fprintf(stderr, "nvcuda: synced: DtoH %zu bytes from 0x%llx", trace_pending.bytes,
+		(unsigned long long)trace_pending.src);
+	trace_values(trace_pending.dst, trace_pending.bytes);
+	trace_pending.dst = NULL;
+}
+
 static CUresult memcpy_dtoh(void *dst, CUdeviceptr src, size_t bytes, CUstream stream, bool async)
+{
+	CUresult r = memcpy_dtoh_(dst, src, bytes, stream, async);
+
+	if (getenv("NVCUDA_TRACE")) {
+		fprintf(stderr, "nvcuda: DtoH %zu bytes from 0x%llx%s -> %d", bytes, (unsigned long long)src,
+			async ? " (async)" : "", r);
+		if (!r && bytes <= 128 && !async)
+			trace_values(dst, bytes);
+		else
+			fprintf(stderr, "\n");
+		if (!r && bytes <= 128 && async) {
+			trace_pending.dst = dst;
+			trace_pending.bytes = bytes;
+			trace_pending.src = src;
+		}
+	}
+	return r;
+}
+
+static CUresult memcpy_dtoh_(void *dst, CUdeviceptr src, size_t bytes, CUstream stream, bool async)
 {
 	struct CUctx_st *ctx;
 	struct CUstream_st *s;

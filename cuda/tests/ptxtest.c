@@ -187,6 +187,75 @@ int main(int argc, char **argv)
 		free(out);
 	}
 
+	/* rotations (funnel shifts) */
+	{
+		uint32_t *in = malloc(N * 4), *out = malloc(N * 16);
+		int bad = 0, n = N;
+		for (int i = 0; i < N; i++)
+			in[i] = (uint32_t)lcg(&seed) >> (i % 20);
+		CUdeviceptr di = dalloc(N * 4, in), dout = dalloc(N * 16, NULL);
+		void *args[] = { &dout, &di, &n };
+		CK(cuLaunchKernel(fn("rotates"), N / 128, 1, 1, 128, 1, 1, 0, NULL, args, NULL));
+		CK(cuMemcpyDtoH(out, dout, N * 16));
+		for (int i = 0; i < N; i++) {
+			uint32_t x = in[i], y = in[(i + 3) % N], s = y & 31;
+#define ROL(v, k) ((k) ? ((v) << (k)) | ((v) >> (32 - (k))) : (v))
+#define ROR(v, k) ((k) ? ((v) >> (k)) | ((v) << (32 - (k))) : (v))
+			uint32_t ref[4] = { ROL(x, s), ROR(x, s), ROL(x, 13), ROR(x ^ y, 7) + ROL(y, 23) };
+			for (int k = 0; k < 4; k++)
+				if (out[i * 4 + k] != ref[k]) {
+					if (bad < 3)
+						printf("    rotates[%d][%d]: 0x%x != 0x%x\n", i, k, out[i * 4 + k], ref[k]);
+					bad++;
+				}
+		}
+		TEST(!bad, "shf.l.wrap / shf.r.wrap rotations (%d wrong)", bad);
+		free(in);
+		free(out);
+	}
+
+	/* 8- and 16-bit memory */
+	{
+		uint16_t *u16 = malloc(N * 2), *gu16 = malloc(N * 2);
+		uint8_t *u8 = malloc(N), *gu8 = malloc(N);
+		int16_t *s16 = malloc(N * 2), *gs16 = malloc(N * 2);
+		uint32_t *in = malloc(N * 4);
+		int bad = 0, n = N;
+		for (int i = 0; i < N; i++) {
+			in[i] = (uint32_t)lcg(&seed);
+			u16[i] = (uint16_t)(in[i] >> 3);
+			u8[i] = (uint8_t)(in[i] >> 11);
+			s16[i] = (int16_t)(in[i] >> 7);
+		}
+		CUdeviceptr d16 = dalloc(N * 2, u16), d8 = dalloc(N, u8), ds = dalloc(N * 2, s16), di = dalloc(N * 4, in);
+		void *args[] = { &d16, &d8, &ds, &di, &n };
+		CK(cuLaunchKernel(fn("small_types"), N / 128, 1, 1, 128, 1, 1, 0, NULL, args, NULL));
+		CK(cuMemcpyDtoH(gu16, d16, N * 2));
+		CK(cuMemcpyDtoH(gu8, d8, N));
+		CK(cuMemcpyDtoH(gs16, ds, N * 2));
+		for (int i = 0; i < N; i++) {
+			uint16_t a = u16[i];
+			uint8_t b = u8[i];
+			int16_t c = s16[i];
+			a = (uint16_t)(a + 1);
+			if (in[i] & 1)
+				a = (uint16_t)(a * 3);
+			b = (uint8_t)(b | (in[i] & 0x50));
+			b = (uint8_t)(b - 1);
+			c = (int16_t)(c - (int16_t)(in[i] & 0xff));
+			if (c < -100)
+				c = (int16_t)(c / 3);
+			c = (int16_t)(c + (int16_t)(a >> 3));
+			if (gu16[i] != a || gu8[i] != b || gs16[i] != c) {
+				if (bad < 3)
+					printf("    small_types[%d]: %u/%u %u/%u %d/%d\n", i, gu16[i], a, gu8[i], b, gs16[i], c);
+				bad++;
+			}
+		}
+		TEST(!bad, "8/16-bit loads, stores and arithmetic (%d wrong)", bad);
+		free(u16); free(gu16); free(u8); free(gu8); free(s16); free(gs16); free(in);
+	}
+
 	/* warp shuffles and votes */
 	{
 		uint32_t *out = calloc(1024 + 2048, 4);

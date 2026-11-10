@@ -80,6 +80,8 @@ CUresult nvc_stream_wait_idle(struct CUstream_st *s)
 	if (!point)
 		return CUDA_SUCCESS;
 	r = drmSyncobjTimelineWait(s->ctx->fd, &s->tl, &point, 1, INT64_MAX, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+	if (!r)
+		nvc_trace_synced();
 	return r ? CUDA_ERROR_LAUNCH_FAILED : CUDA_SUCCESS;
 }
 

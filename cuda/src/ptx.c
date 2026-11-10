@@ -150,7 +150,6 @@ struct ctx {
 	struct nvc_global *globals;
 	uint32_t nglobals, maxglobals, globals_size;
 	uint8_t *globals_image;
-	uint64_t globals_va;
 };
 
 static void inline_call(struct ctx *c, char rets[][256], int nrets, const char *fname, char args[][256], int nargs);
@@ -793,6 +792,17 @@ static nir_def *special(struct ctx *c, const char *name)
 	fail(c, "unknown special register %s", name);
 }
 
+/*
+ * The module's globals buffer address is a launch-time constant (cbuf0, NVC_CB_GLOBALS) rather than
+ * an immediate, so compiled code does not depend on where the buffer landed and the on-disk cache
+ * is shared between processes. NIR's CSE merges the loads.
+ */
+static nir_def *globals_base(struct ctx *c)
+{
+	return nir_ldc_nv(&c->b, 1, 64, nir_imm_int(&c->b, 0), nir_imm_int(&c->b, NVC_CB_GLOBALS), .align_mul = 8,
+			  .align_offset = 0);
+}
+
 /* the address a variable name stands for (mov %r, sym): an offset in its own state space */
 static nir_def *sym_value(struct ctx *c, const struct opnd *o, unsigned bits)
 {
@@ -803,7 +813,7 @@ static nir_def *sym_value(struct ctx *c, const struct opnd *o, unsigned bits)
 	if (s->space == SP_SHARED || s->space == SP_LOCAL || s->space == SP_PARAM)
 		return nir_imm_intN_t(&c->b, s->offset + o->u, bits);
 	/* .global / .const: an address in the module's globals buffer */
-	return nir_imm_intN_t(&c->b, c->globals_va + s->offset + o->u, bits);
+	return nir_u2uN(&c->b, nir_iadd_imm(&c->b, globals_base(c), s->offset + o->u), bits);
 }
 
 static nir_def *rd(struct ctx *c, const struct opnd *o, struct ptype t)
@@ -898,7 +908,7 @@ static enum space resolve_mem(struct ctx *c, const struct opnd *m, enum space is
 		if (!s)
 			fail(c, "unknown name %s", m->name);
 		if (s->space == SP_GLOBAL || s->space == SP_CONST) {
-			*addr = nir_imm_int64(b, c->globals_va + s->offset + m->u);
+			*addr = nir_iadd_imm(b, globals_base(c), s->offset + m->u);
 			return SP_GLOBAL;
 		}
 		*addr = nir_imm_int(b, s->offset + (uint32_t)m->u);
@@ -2936,6 +2946,24 @@ static void topo_visit(struct ctx *c, struct pfunc *f, struct pfunc **order, int
 	order[(*n)++] = f;	/* callees first */
 }
 
+static bool name_in_list(const char *name, const char *list)
+{
+	size_t n = strlen(name);
+	const char *p = list;
+
+	while (*p) {
+		const char *e = strchr(p, ',');
+		size_t l = e ? (size_t)(e - p) : strlen(p);
+
+		if (l == n && !strncmp(p, name, n))
+			return true;
+		if (!e)
+			break;
+		p = e + 1;
+	}
+	return false;
+}
+
 static void decide_outlining(struct ctx *c)
 {
 	const char *env = getenv("NVCUDA_OUTLINE");
@@ -3364,7 +3392,7 @@ static void parse_params(struct ctx *c)
 }
 
 nir_shader *nvc_ptx_build(const char *src, const char *entry, const nir_shader_compiler_options *opts,
-			  struct nvc_kernel_bin *kb, uint64_t globals_va, const struct nvc_ptx_opts *po, char *err,
+			  struct nvc_kernel_bin *kb, const struct nvc_ptx_opts *po, char *err,
 			  size_t errlen)
 {
 	struct ctx *c = ctx_new(src, err, errlen);
@@ -3377,7 +3405,6 @@ nir_shader *nvc_ptx_build(const char *src, const char *entry, const nir_shader_c
 	if (!c)
 		return NULL;
 	c->kb = kb;
-	c->globals_va = globals_va;
 	c->po = *po;
 	kb->used_regmem = false;
 	if (setjmp(c->fail)) {
@@ -3415,8 +3442,12 @@ nir_shader *nvc_ptx_build(const char *src, const char *entry, const nir_shader_c
 
 		if (c->po.regmem >= 0)
 			c->regmem = c->po.regmem;
-		else
-			c->regmem = rm ? rm[0] != '0' : c->est_bytes > (4u << 20);
+		else if (!rm)
+			c->regmem = c->est_bytes > (4u << 20);
+		else if (!strcmp(rm, "0") || !strcmp(rm, "1"))
+			c->regmem = rm[0] == '1';
+		else	/* a comma-separated list: those kernels decide as usual, every other one stays SSA */
+			c->regmem = name_in_list(entry, rm) && c->est_bytes > (4u << 20);
 		if (c->regmem) {
 			compute_liveness(c, &c->entry_fn);
 			c->frames[0].regbase = c->entry_fn.regs_bytes ? alloc_local(c, c->entry_fn.regs_bytes, 8) : 0;
