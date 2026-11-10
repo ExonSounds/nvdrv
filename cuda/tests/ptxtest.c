@@ -292,6 +292,60 @@ int main(int argc, char **argv)
 		free(out);
 	}
 
+	/* device function calls and module-scope variables */
+	{
+		const int n = 4096;
+		float *out = malloc(n * 4);
+		uint32_t *iout = malloc(n * 4), sc = 7;
+		unsigned long long hits = 0;
+		int tbl[16] = { 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3 };
+		float coef[8] = { 1.0f, 0.5f, 0.25f, 0.125f, 2.0f, 4.0f, 8.0f, 16.0f };
+		CUdeviceptr dout = dalloc(n * 4, NULL), diout = dalloc(n * 4, NULL), gscale, ghits, gtable;
+		size_t sz;
+		int bad = 0, badi = 0;
+		void *args[] = { &dout, &diout, (void *)&n };
+
+		CK(cuModuleGetGlobal(&gscale, &sz, mod, "scale"));
+		TEST(sz == 4, "cuModuleGetGlobal: __constant__ scale is %zu bytes", sz);
+		CK(cuModuleGetGlobal(&ghits, &sz, mod, "hits"));
+		CK(cuModuleGetGlobal(&gtable, &sz, mod, "table"));
+		TEST(sz == 64 && cuModuleGetGlobal(&gtable, &sz, mod, "nope") == CUDA_ERROR_NOT_FOUND,
+		     "cuModuleGetGlobal: table is 64 bytes, unknown names fail");
+		CK(cuMemcpyHtoD(gscale, &sc, 4));
+		CK(cuMemsetD32(ghits, 0, 2));
+		CK(cuLaunchKernel(fn("calls"), n / 128, 1, 1, 128, 1, 1, 0, NULL, args, NULL));
+		CK(cuMemcpyDtoH(out, dout, n * 4));
+		CK(cuMemcpyDtoH(iout, diout, n * 4));
+		CK(cuMemcpyDtoH(&hits, ghits, 8));
+		for (int i = 0; i < n; i++) {
+			float a[3] = { (float)i, 1.0f, 2.0f }, b[3] = { 0.5f, (float)(i & 3), -1.0f }, s = coef[i & 7], d1 = 0, d2 = 0;
+			uint32_t acc = 0, want;
+			for (int k = 0; k < 3; k++) {
+				d1 += a[k] * s * b[k];
+				d2 += b[k] * (a[k] * 0.5f);
+			}
+			if (!close_f(out[i], d1 + d2 * (float)sc, 1e-5))
+				bad++;
+			want = 0;
+			for (uint32_t k = 0; k < (uint32_t)(i & 7); k++) {
+				acc += tbl[(i + k) & 15];
+				if (acc > 20) {
+					want = acc * 2;
+					goto done;
+				}
+			}
+			want = acc;
+done:
+			badi += iout[i] != want;
+		}
+		TEST(!bad, "device functions: struct arguments and returns, __constant__ initializer and host-set value (%d wrong)",
+		     bad);
+		TEST(!badi, "callee with a loop and an early return, reading a __device__ table (%d wrong)", badi);
+		TEST(hits == (n + 96) / 97, "__device__ variable read back through cuModuleGetGlobal: %llu", hits);
+		free(out);
+		free(iout);
+	}
+
 	CK(cuModuleUnload(mod));
 	CK(cuCtxDestroy(ctx));
 	printf("%d/%d passed\n", total - fails, total);

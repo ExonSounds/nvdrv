@@ -61,10 +61,16 @@ struct CUmod_st {
 	uint32_t *words;		/* SPIR-V, or NULL */
 	size_t nwords;
 	char *ptx;			/* PTX text, or NULL */
+	struct nvc_global *globals;	/* module-scope variables, in the globals bo */
+	uint32_t nglobals;
+	uint64_t globals_va;		/* their buffer (a device allocation), 0 if none */
 	struct CUfunc_st *funcs;
 };
 
 static pthread_mutex_t compiler_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static CUresult module_globals(struct CUmod_st *m);
+static void module_free(struct CUmod_st *m);
 
 static bool is_elf(const void *image)
 {
@@ -193,6 +199,11 @@ CUAPI CUresult cuModuleLoadDataEx(CUmodule *module, const void *image, unsigned 
 			return CUDA_ERROR_OUT_OF_MEMORY;
 		}
 		m->ctx = ctx;
+		r = module_globals(m);
+		if (r) {
+			module_free(m);
+			return r;
+		}
 		goto add;
 	}
 	/* SPIR-V carries no length: the header's bound is not one either, so walk the instructions */
@@ -278,6 +289,33 @@ CUAPI CUresult cuModuleLoad(CUmodule *module, const char *path)
 	return r;
 }
 
+/* .global/.const variables: one VRAM buffer per module, initializers uploaded */
+static CUresult module_globals(struct CUmod_st *m)
+{
+	struct CUctx_st *ctx = m->ctx;
+	void *image = NULL;
+	uint32_t size = 0;
+	char err[256] = "";
+	CUresult r = CUDA_SUCCESS;
+
+	pthread_mutex_lock(&compiler_lock);
+	if (nvc_compiler_init(ctx->dev->gpc_count, ctx->dev->tpc_count) ||
+	    nvc_ptx_globals(m->ptx, &m->globals, &m->nglobals, &image, &size, err, sizeof(err))) {
+		if (err[0] && getenv("NVCUDA_DEBUG"))
+			fprintf(stderr, "nvcuda: module globals: %s\n", err);
+		pthread_mutex_unlock(&compiler_lock);
+		return CUDA_ERROR_INVALID_IMAGE;
+	}
+	pthread_mutex_unlock(&compiler_lock);
+	if (size) {
+		r = nvc_mem_alloc_device(ctx, size, &m->globals_va);
+		if (r == CUDA_SUCCESS)
+			r = nvc_upload(ctx, m->globals_va, image, size);
+	}
+	free(image);
+	return r;
+}
+
 static void func_free(struct CUctx_st *ctx, struct CUfunc_st *f)
 {
 	nvc_bo_free(ctx, &f->code);
@@ -294,6 +332,8 @@ static void module_free(struct CUmod_st *m)
 		m->funcs = f->next;
 		func_free(m->ctx, f);
 	}
+	nvc_mem_free_device(m->ctx, m->globals_va);
+	free(m->globals);
 	free(m->words);
 	free(m->ptx);
 	free(m);
@@ -357,7 +397,7 @@ CUAPI CUresult cuModuleGetFunction(CUfunction *func, CUmodule module, const char
 	pthread_mutex_lock(&compiler_lock);
 	r = nvc_compiler_init(ctx->dev->gpc_count, ctx->dev->tpc_count) ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
 	if (r == CUDA_SUCCESS) {
-		f->kb = module->ptx ? nvc_compile_ptx(module->ptx, name, err, sizeof(err)) :
+		f->kb = module->ptx ? nvc_compile_ptx(module->ptx, name, module->globals_va, err, sizeof(err)) :
 				      nvc_compile_spirv(module->words, module->nwords, name, err, sizeof(err));
 		if (!f->kb)
 			r = CUDA_ERROR_NOT_FOUND;
@@ -385,10 +425,21 @@ CUAPI CUresult cuModuleGetFunction(CUfunction *func, CUmodule module, const char
 
 CUAPI CUresult cuModuleGetGlobal_v2(CUdeviceptr *dptr, size_t *bytes, CUmodule module, const char *name)
 {
-	(void)dptr;
-	(void)bytes;
-	(void)name;
-	return module ? CUDA_ERROR_NOT_FOUND : CUDA_ERROR_INVALID_HANDLE;	/* module globals: milestone 4 */
+	uint32_t i;
+
+	if (!name)
+		return CUDA_ERROR_INVALID_VALUE;
+	if (!module)
+		return CUDA_ERROR_INVALID_HANDLE;
+	for (i = 0; i < module->nglobals; i++)
+		if (!strcmp(module->globals[i].name, name)) {
+			if (dptr)
+				*dptr = module->globals_va + module->globals[i].offset;
+			if (bytes)
+				*bytes = module->globals[i].size;
+			return CUDA_SUCCESS;
+		}
+	return CUDA_ERROR_NOT_FOUND;
 }
 
 /* ---- function attributes and occupancy ---- */
@@ -396,12 +447,13 @@ CUAPI CUresult cuModuleGetGlobal_v2(CUdeviceptr *dptr, size_t *bytes, CUmodule m
 /* Threads per block the register file allows: registers go out per warp in units of 8 per thread. */
 static uint32_t max_threads(const struct nvc_kernel_bin *kb)
 {
-	uint32_t regs = (nvc_kernel_gprs(kb) + 7) & ~7u, warps;
+	uint32_t regs = (nvc_kernel_gprs(kb) + 7) & ~7u, warps, t;
 
 	if (!regs)
 		regs = 8;
 	warps = 65536 / (regs * 32);
-	return warps * 32 < 1024 ? warps * 32 : 1024;
+	t = warps * 32 < 1024 ? warps * 32 : 1024;
+	return kb->max_threads && kb->max_threads < t ? kb->max_threads : t;	/* __launch_bounds__ */
 }
 
 CUAPI CUresult cuFuncGetAttribute(int *value, CUfunction_attribute attrib, CUfunction func)

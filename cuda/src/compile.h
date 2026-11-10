@@ -18,6 +18,7 @@ struct nvc_kernel_bin {
 	void *code;
 	uint32_t code_size;
 	uint32_t shared_static;		/* bytes of __shared__ the kernel declares */
+	uint32_t max_threads;		/* .maxntid / .reqntid, 0 = none */
 	uint32_t nparams, param_bytes;
 	struct { uint32_t offset, size; } params[NVC_MAX_PARAMS];
 };
@@ -25,7 +26,15 @@ struct nvc_kernel_bin {
 int nvc_compiler_init(unsigned int gpcs, unsigned int tpcs);
 struct nvc_kernel_bin *nvc_compile_spirv(const uint32_t *words, size_t nwords, const char *entry, char *err,
 					 size_t errlen);
-struct nvc_kernel_bin *nvc_compile_ptx(const char *ptx, const char *entry, char *err, size_t errlen);
+struct nvc_kernel_bin *nvc_compile_ptx(const char *ptx, const char *entry, uint64_t globals_va, char *err, size_t errlen);
+
+/* module-scope .global/.const variables of a PTX module (ptx.c): layout and initial contents */
+struct nvc_global {
+	char name[128];
+	uint32_t offset, size;
+};
+int nvc_ptx_globals(const char *ptx, struct nvc_global **globals, uint32_t *count, void **image, uint32_t *size,
+		    char *err, size_t errlen);
 void nvc_kernel_bin_free(struct nvc_kernel_bin *kb);
 uint32_t nvc_qmd_size(void);
 void nvc_fill_qmd(const struct nvc_kernel_bin *kb, uint64_t code_va, uint64_t cb0_va, uint32_t cb0_size,

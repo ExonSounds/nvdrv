@@ -854,10 +854,19 @@ not used.
       - Verified on the GPU: kerneltest 10/10 from PTX (saxpy 404 GB/s) and `build/ptxtest` 15/15 (tests/ptxops.cu
         through clang's NVPTX back end: f32/f64 math and rounding, 64-bit integer math, 32-bit bit operations,
         all four shuffle modes and ballot, shared/CAS/max atomics, dynamic shared memory, generic pointers,
-        data-dependent loops).
-      - [ ] Device functions (`.func`, `call`, `.param` passing): nvcc does not always inline.
-      - [ ] Module-scope `.global`/`.const` variables with initializers (`cuModuleGetGlobal`; Cycles'
-        `kernel_params` is a `__constant__`).
+        data-dependent loops; 20/20 with calls and module variables).
+      - [x] Device functions (2026-11-10): every `call` is inlined. The callee gets a frame of its own
+        (registers, labels, variables); its `.param` names are bound to the caller's `.param` variables;
+        `.param`/`.local` variables are scratch allocated like a stack (freed at the end of their PTX scope
+        and when the callee returns), so scratch is the deepest chain, not the sum. Nesting is limited to 32
+        (recursion fails cleanly); indirect calls and registers as arguments are refused.
+      - [x] Module-scope `.global`/`.const` variables with initializers: laid out 16-byte aligned in one
+        buffer per module (`nvc_ptx_globals`), uploaded at load, addressed as global memory;
+        `cuModuleGetGlobal` returns the address. Also `shf.l/r.wrap/clamp`, 64-bit `bfi`, `[%rd+-24]`,
+        `WARP_SZ`, `.maxntid`/`.reqntid` (NAK's register cap follows them, as nvcc's does).
+      - **Blender's own PTX** (Cycles 5.2.3, `kernel_compute_75.ptx`, nvcc 11.4, 12 MB, 75 kernels, 1611 calls):
+        **62 of 75 kernels compile through NAK** (3 s for all); the largest is 750 KB of code at 168
+        registers. The 13 that fail all use `tex.2d` (image textures).
       - [ ] Textures and surfaces (`tex`, `suld`/`sust` with texture objects) for Cycles' images.
       - [ ] f16/bf16 (`.f16`, `.f16x2`), carry chains (add.cc/addc), `match`, `redux`, `cp.async`, `mma`/`wmma`.
       - [ ] Real nvcc output: test against Blender's shipped `kernel_compute_75.ptx`.

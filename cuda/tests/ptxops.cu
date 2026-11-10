@@ -155,3 +155,48 @@ extern "C" __global__ void collatz(unsigned *out, int n)
 	}
 	out[i] = steps;
 }
+
+/* ---- device functions (not inlined: real PTX calls with .param passing) and module variables ---- */
+
+struct vec3 { float x, y, z; };
+
+__constant__ float coef[8] = { 1.0f, 0.5f, 0.25f, 0.125f, 2.0f, 4.0f, 8.0f, 16.0f };
+__constant__ unsigned int scale;			/* set by the host through cuModuleGetGlobal */
+__device__ unsigned long long hits;			/* read back by the host */
+__device__ int table[16] = { 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3 };
+
+__device__ __attribute__((noinline)) float dot3(vec3 a, vec3 b)
+{
+	return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+__device__ __attribute__((noinline)) vec3 scale3(vec3 a, float s)
+{
+	vec3 r = { a.x * s, a.y * s, a.z * s };
+	return r;
+}
+
+__device__ __attribute__((noinline)) unsigned int weird(unsigned int i)
+{
+	/* a loop and a conditional return inside a callee */
+	unsigned int acc = 0;
+	for (unsigned int k = 0; k < (i & 7); k++) {
+		acc += table[(i + k) & 15];
+		if (acc > 20)
+			return acc * 2;
+	}
+	return acc;
+}
+
+extern "C" __global__ void calls(float *out, unsigned int *iout, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n)
+		return;
+	vec3 a = { (float)i, 1.0f, 2.0f }, b = { 0.5f, (float)(i & 3), -1.0f };
+	vec3 c = scale3(a, coef[i & 7]);
+	out[i] = dot3(c, b) + dot3(b, scale3(a, 0.5f)) * (float)scale;
+	iout[i] = weird(i);
+	if (i % 97 == 0)
+		__atomic_fetch_add(&hits, 1ull, __ATOMIC_RELAXED);
+}

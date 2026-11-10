@@ -51,6 +51,27 @@ static CUresult alloc_bo(struct CUctx_st *ctx, enum nvc_alloc_kind kind, size_t 
 	return CUDA_SUCCESS;
 }
 
+/* a device allocation for nvcuda's own use (module globals): copies work on it like on cuMemAlloc memory */
+CUresult nvc_mem_alloc_device(struct CUctx_st *ctx, size_t bytes, uint64_t *va)
+{
+	struct nvc_alloc *a;
+	CUresult r = alloc_bo(ctx, NVC_ALLOC_DEVICE, bytes, &a);
+
+	if (r == CUDA_SUCCESS)
+		*va = a->bo.va;
+	return r;
+}
+
+void nvc_mem_free_device(struct CUctx_st *ctx, uint64_t va)
+{
+	struct nvc_alloc *a = va ? nvc_alloc_remove_va(va) : NULL;
+
+	if (a) {
+		nvc_bo_free(ctx, &a->bo);
+		free(a);
+	}
+}
+
 CUAPI CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytes)
 {
 	struct CUctx_st *ctx;

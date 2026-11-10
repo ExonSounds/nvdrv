@@ -12,7 +12,13 @@
  *    NVIDIA's model: shared and local memory appear in windows of the generic address space
  *    (nvcuda programs them at 0xfe000000 and 0xff000000); cvta converts, and a generic access
  *    checks the window at run time;
- *  - predicated instructions get a block of their own.
+ *  - predicated instructions get a block of their own;
+ *  - device functions (.func) are inlined at each call: the callee's registers, labels and
+ *    variables live in a frame of their own, its .param arguments are the caller's .param
+ *    variables, and .param/.local variables are scratch memory allocated like a stack (freed
+ *    at the end of the PTX scope that declared them, and when a callee returns);
+ *  - module-scope .global/.const variables live in one buffer per module (nvc_ptx_globals lays
+ *    it out and fills the initializers); ld.const/ld.global of them are global loads from it.
  * Kernel parameters are laid out in declaration order with their alignment, as cuLaunchKernel
  * packs them (load_kernel_input offsets).
  *
@@ -54,6 +60,21 @@ struct lex {
 	int pc;			/* punctuation char */
 };
 
+#define MAX_DEPTH	32	/* nested inlined calls */
+
+/* one function being emitted: the entry, or an inlined callee */
+struct frame {
+	struct hash_table *regs, *labels, *syms;
+	nir_block *ret;		/* where ret goes (the impl's end block for the entry) */
+};
+
+/* a .func of the module */
+struct pfunc {
+	const char *hdr;	/* just after ".func" */
+	int line;
+	bool has_body;
+};
+
 struct ctx {
 	struct lex lx;
 	jmp_buf fail;
@@ -63,13 +84,24 @@ struct ctx {
 	nir_shader *nir;
 	nir_function_impl *impl;
 	nir_builder b;
-	struct hash_table *regs, *labels, *syms;
+	struct hash_table *modsyms;	/* module-scope variables */
+	struct hash_table *funcs;	/* name -> struct pfunc */
+	struct frame frames[MAX_DEPTH + 1];
+	int depth;
 	struct nvc_kernel_bin *kb;
 	bool terminated;	/* current block ended with a jump */
-	uint32_t shared_size, local_size;
+	uint32_t shared_size;
+	uint32_t local_top, local_max;	/* scratch: stack top and high-water mark */
 	bool dyn_shared;
-	nir_variable *tmp64;	/* scratch for generic accesses */
+	/* module globals (.global/.const): layout and initializers */
+	struct nvc_global *globals;
+	uint32_t nglobals, maxglobals, globals_size;
+	uint8_t *globals_image;
+	uint64_t globals_va;
 };
+
+static void inline_call(struct ctx *c, char rets[][256], int nrets, const char *fname, char args[][256], int nargs);
+static void parse_params(struct ctx *c);
 
 static void __attribute__((noreturn, format(printf, 2, 3))) fail(struct ctx *c, const char *fmt, ...)
 {
@@ -297,38 +329,82 @@ struct psym {
 	uint32_t offset, size;
 };
 
-static void declare_reg(struct ctx *c, const char *name, struct ptype t)
+static struct frame *frame(struct ctx *c)
 {
-	struct preg *r = ralloc(c->mem, struct preg);
-	const struct glsl_type *gt = t.cls == TC_PRED ? glsl_bool_type() : glsl_uintN_t_type(t.bits < 16 ? 16 : t.bits);
+	return &c->frames[c->depth];
+}
 
-	r->bits = t.cls == TC_PRED ? 1 : (t.bits < 16 ? 16 : t.bits);	/* registers are at least 16 bits */
-	r->var = nir_local_variable_create(c->impl, gt, name);
-	_mesa_hash_table_insert(c->regs, ralloc_strdup(c->mem, name), r);
+static struct hash_table *new_table(struct ctx *c)
+{
+	return _mesa_hash_table_create(c->mem, _mesa_hash_string, _mesa_key_string_equal);
 }
 
 static struct preg *find_reg(struct ctx *c, const char *name)
 {
-	struct hash_entry *e = _mesa_hash_table_search(c->regs, name);
+	struct hash_entry *e = _mesa_hash_table_search(frame(c)->regs, name);
 
 	return e ? e->data : NULL;
 }
 
+static void declare_reg(struct ctx *c, const char *name, struct ptype t)
+{
+	struct preg *r;
+	const struct glsl_type *gt = t.cls == TC_PRED ? glsl_bool_type() : glsl_uintN_t_type(t.bits < 16 ? 16 : t.bits);
+	unsigned bits = t.cls == TC_PRED ? 1 : (t.bits < 16 ? 16 : t.bits);	/* registers are at least 16 bits */
+
+	r = find_reg(c, name);
+	if (r) {	/* nvcc redeclares temp_param_reg in every call scope */
+		if (r->bits != bits)
+			fail(c, "register %s redeclared with another size", name);
+		return;
+	}
+	r = ralloc(c->mem, struct preg);
+	r->bits = bits;
+	r->var = nir_local_variable_create(c->impl, gt, name);
+	_mesa_hash_table_insert(frame(c)->regs, ralloc_strdup(c->mem, name), r);
+}
+
+/* the frame's own variables first, then the module's */
 static struct psym *find_sym(struct ctx *c, const char *name)
 {
-	struct hash_entry *e = _mesa_hash_table_search(c->syms, name);
+	struct hash_entry *e = _mesa_hash_table_search(frame(c)->syms, name);
 
+	if (!e)
+		e = _mesa_hash_table_search(c->modsyms, name);
 	return e ? e->data : NULL;
 }
 
-static void add_sym(struct ctx *c, const char *name, enum space space, uint32_t offset, uint32_t size)
+static struct psym *add_sym_to(struct ctx *c, struct hash_table *t, const char *name, enum space space,
+			       uint32_t offset, uint32_t size)
 {
 	struct psym *s = ralloc(c->mem, struct psym);
 
 	s->space = space;
 	s->offset = offset;
 	s->size = size;
-	_mesa_hash_table_insert(c->syms, ralloc_strdup(c->mem, name), s);
+	_mesa_hash_table_insert(t, ralloc_strdup(c->mem, name), s);
+	return s;
+}
+
+static struct psym *add_sym(struct ctx *c, const char *name, enum space space, uint32_t offset, uint32_t size)
+{
+	return add_sym_to(c, frame(c)->syms, name, space, offset, size);
+}
+
+/* scratch memory, allocated like a stack (parse_body frees at the end of the scope) */
+static uint32_t alloc_local(struct ctx *c, uint32_t size, uint32_t align)
+{
+	uint32_t off = (c->local_top + align - 1) / align * align;
+
+	c->local_top = off + size;
+	if (c->local_top > c->local_max)
+		c->local_max = c->local_top;
+	return off;
+}
+
+static uint32_t align_up(uint32_t v, uint32_t a)
+{
+	return a ? (v + a - 1) / a * a : v;
 }
 
 /* ---- blocks ---- */
@@ -344,13 +420,13 @@ static nir_block *new_block(struct ctx *c)
 
 static nir_block *label_block(struct ctx *c, const char *name)
 {
-	struct hash_entry *e = _mesa_hash_table_search(c->labels, name);
+	struct hash_entry *e = _mesa_hash_table_search(frame(c)->labels, name);
 	nir_block *blk;
 
 	if (e)
 		return e->data;
 	blk = new_block(c);
-	_mesa_hash_table_insert(c->labels, ralloc_strdup(c->mem, name), blk);
+	_mesa_hash_table_insert(frame(c)->labels, ralloc_strdup(c->mem, name), blk);
 	return blk;
 }
 
@@ -404,7 +480,10 @@ static void parse_imm_or_name(struct ctx *c, struct opnd *o)
 		next(c);
 		if (find_reg(c, o->name))
 			o->kind = O_REG;
-		else if (o->name[0] == '%')
+		else if (!strcmp(o->name, "WARP_SZ")) {	/* PTX's predefined constant */
+			o->kind = O_IMM;
+			o->u = 32;
+		} else if (o->name[0] == '%')
 			o->kind = O_SPECIAL;
 		else if (!strcmp(o->name, "_"))
 			o->kind = O_SINK;
@@ -440,6 +519,8 @@ static void parse_operand(struct ctx *c, struct opnd *o)
 			bool minus = is_p(c, '-');
 
 			next(c);
+			if (accept(c, '-'))	/* nvcc writes [%rd+-24] */
+				minus = !minus;
 			if (c->lx.t != T_INT)
 				fail(c, "bad address offset");
 			o->u += minus ? -c->lx.u : c->lx.u;
@@ -540,7 +621,8 @@ static nir_def *sym_value(struct ctx *c, const struct opnd *o, unsigned bits)
 		fail(c, "unknown name %s", o->name);
 	if (s->space == SP_SHARED || s->space == SP_LOCAL || s->space == SP_PARAM)
 		return nir_imm_intN_t(&c->b, s->offset + o->u, bits);
-	fail(c, "%s: module-scope .global/.const variables are not supported yet", o->name);
+	/* .global / .const: an address in the module's globals buffer */
+	return nir_imm_intN_t(&c->b, c->globals_va + s->offset + o->u, bits);
 }
 
 static nir_def *rd(struct ctx *c, const struct opnd *o, struct ptype t)
@@ -616,37 +698,39 @@ static void wr(struct ctx *c, const struct opnd *o, nir_def *v, struct ptype t)
 
 /* ---- memory ---- */
 
-static nir_def *mem_offset32(struct ctx *c, const struct opnd *m)
+/*
+ * Where an address operand points: the state space and the address in that space's form
+ * (64-bit for global and generic, an offset for shared/local/param). A named variable decides
+ * by itself; a register-based ld.param inside a callee is scratch, and .const is global memory.
+ */
+static enum space resolve_mem(struct ctx *c, const struct opnd *m, enum space isp, nir_def **addr)
 {
 	nir_builder *b = &c->b;
+	nir_def *base = NULL;
 
 	if (m->mem_sym) {
 		struct psym *s = find_sym(c, m->name);
 
 		if (!s)
 			fail(c, "unknown name %s", m->name);
-		return nir_imm_int(b, s->offset + (uint32_t)m->u);
+		if (s->space == SP_GLOBAL || s->space == SP_CONST) {
+			*addr = nir_imm_int64(b, c->globals_va + s->offset + m->u);
+			return SP_GLOBAL;
+		}
+		*addr = nir_imm_int(b, s->offset + (uint32_t)m->u);
+		return s->space;
 	}
-	if (m->mem_reg) {
-		struct preg *r = find_reg(c, m->name);
-
-		return nir_iadd_imm(b, nir_u2u32(b, nir_load_var(b, r->var)), (uint32_t)m->u);
-	}
-	return nir_imm_int(b, (uint32_t)m->u);
-}
-
-static nir_def *mem_addr64(struct ctx *c, const struct opnd *m)
-{
-	nir_builder *b = &c->b;
-
-	if (m->mem_reg) {
-		struct preg *r = find_reg(c, m->name);
-
-		return nir_iadd_imm(b, nir_u2u64(b, nir_load_var(b, r->var)), m->u);
-	}
-	if (m->mem_sym)
-		return nir_u2u64(b, sym_value(c, m, 64));
-	return nir_imm_int64(b, m->u);
+	if (isp == SP_PARAM && c->depth)
+		isp = SP_LOCAL;
+	if (isp == SP_CONST)
+		isp = SP_GLOBAL;
+	if (m->mem_reg)
+		base = nir_load_var(b, find_reg(c, m->name)->var);
+	if (isp == SP_GLOBAL || isp == SP_NONE)
+		*addr = base ? nir_iadd_imm(b, nir_u2u64(b, base), m->u) : nir_imm_int64(b, m->u);
+	else
+		*addr = base ? nir_iadd_imm(b, nir_u2u32(b, base), (uint32_t)m->u) : nir_imm_int(b, (uint32_t)m->u);
+	return isp;
 }
 
 enum maccess { M_LOAD, M_STORE, M_ATOMIC, M_CAS };
@@ -990,11 +1074,10 @@ static void emit_insn(struct ctx *c, struct insn *in)
 		struct mop m = { .kind = store ? M_STORE : M_LOAD, .comps = in->vec ? in->vec : 1, .bits = t.bits,
 				 .align = t.bits / 8 * (in->vec ? in->vec : 1) };
 		nir_def *addr;
+		enum space sp;
 
 		if (mem->kind != O_MEM)
 			fail(c, "%s without an address", op);
-		if (in->space == SP_CONST)
-			fail(c, "ld.const (module-scope __constant__ variables) is not supported yet");
 		if (store) {
 			if (in->vec) {
 				nir_def *comps[4];
@@ -1006,11 +1089,8 @@ static void emit_insn(struct ctx *c, struct insn *in)
 				m.data = rd(c, val, t);
 			}
 		}
-		if (in->space == SP_GLOBAL || in->space == SP_NONE)
-			addr = mem_addr64(c, mem);
-		else
-			addr = mem_offset32(c, mem);
-		r = in->space == SP_NONE ? access_generic(c, addr, &m) : access_space(c, in->space, addr, &m);
+		sp = resolve_mem(c, mem, in->space, &addr);
+		r = sp == SP_NONE ? access_generic(c, addr, &m) : access_space(c, sp, addr, &m);
 		if (!store) {
 			if (in->vec)
 				for (int i = 0; i < in->vec; i++)
@@ -1024,7 +1104,8 @@ static void emit_insn(struct ctx *c, struct insn *in)
 		bool red = op[0] == 'r';
 		struct opnd *mem = red ? &o[0] : &o[1], *src = red ? &o[1] : &o[2];
 		struct mop m = { .kind = M_ATOMIC, .comps = 1, .bits = t.bits, .aop = atomic_op(c, in, t) };
-		nir_def *addr = in->space == SP_SHARED ? mem_offset32(c, mem) : mem_addr64(c, mem);
+		nir_def *addr;
+		enum space sp = resolve_mem(c, mem, in->space, &addr);
 
 		if (has_mod(in, "release") || has_mod(in, "acq_rel"))
 			emit_barrier(b, SCOPE_NONE, SCOPE_DEVICE);
@@ -1033,7 +1114,7 @@ static void emit_insn(struct ctx *c, struct insn *in)
 			m.kind = M_CAS;
 			m.data2 = rd(c, &o[3], t);
 		}
-		r = in->space == SP_NONE ? access_generic(c, addr, &m) : access_space(c, in->space, addr, &m);
+		r = sp == SP_NONE ? access_generic(c, addr, &m) : access_space(c, sp, addr, &m);
 		if (has_mod(in, "acquire") || has_mod(in, "acq_rel"))
 			emit_barrier(b, SCOPE_NONE, SCOPE_DEVICE);
 		if (!red)
@@ -1270,12 +1351,34 @@ static void emit_insn(struct ctx *c, struct insn *in)
 			r = s ? nir_ibitfield_extract(b, a, pos, len) : nir_ubitfield_extract(b, a, pos, len);
 			r = nir_bcsel(b, nir_ieq_imm(b, len, 0), nir_imm_int(b, 0), r);
 		} else if (!strcmp(op, "bfi")) {
-			/* bfi d, a (insert), b (base), pos, len */
+			/* bfi d, a (insert), b (base), pos, len: len bits of a at bit pos of b */
 			nir_def *pos = rd(c, &o[3], (struct ptype){ TC_U, 32 }), *len = rd(c, &o[4], (struct ptype){ TC_U, 32 });
 
+			if (t.bits == 32) {
+				r = nir_bitfield_insert(b, bb, a, pos, len);
+			} else {
+				nir_def *one = nir_imm_intN_t(b, 1, t.bits), *mask, *p64 = nir_u2uN(b, pos, t.bits);
+
+				mask = nir_iadd_imm(b, nir_ishl(b, one, nir_u2uN(b, len, t.bits)), -1);
+				mask = nir_bcsel(b, nir_uge_imm(b, len, t.bits), nir_imm_intN_t(b, ~0ull, t.bits), mask);
+				mask = nir_ishl(b, mask, p64);
+				mask = nir_bcsel(b, nir_uge_imm(b, pos, t.bits), nir_imm_intN_t(b, 0, t.bits), mask);
+				r = nir_ior(b, nir_iand(b, bb, nir_inot(b, mask)), nir_iand(b, nir_ishl(b, a, p64), mask));
+			}
+		} else if (!strcmp(op, "shf")) {
+			/* funnel shift of {b:a} by c: shf.l d = high word of (b:a) << n, shf.r d = low word of >> n */
+			nir_def *n = rd(c, &o[3], (struct ptype){ TC_U, 32 }), *w = nir_imm_int(b, 32), *rest;
+
+			n = has_mod(in, "clamp") ? nir_umin(b, n, w) : nir_iand_imm(b, n, 31);
 			if (t.bits != 32)
-				fail(c, "bfi.%u", t.bits);
-			r = nir_bitfield_insert(b, bb, a, pos, len);
+				fail(c, "shf.%u", t.bits);
+			if (has_mod(in, "l")) {
+				rest = nir_ior(b, nir_ishl(b, bb, n), nir_ushr(b, a, nir_isub(b, w, n)));
+				r = nir_bcsel(b, nir_ieq_imm(b, n, 0), bb, nir_bcsel(b, nir_ieq_imm(b, n, 32), a, rest));
+			} else {
+				rest = nir_ior(b, nir_ushr(b, a, n), nir_ishl(b, bb, nir_isub(b, w, n)));
+				r = nir_bcsel(b, nir_ieq_imm(b, n, 0), a, nir_bcsel(b, nir_ieq_imm(b, n, 32), bb, rest));
+			}
 		} else if (!strcmp(op, "prmt")) {
 			/* default mode: each selector nibble picks one of the 8 bytes of {b, a}, bit 3 = replicate sign */
 			nir_def *sel = rd(c, &o[3], (struct ptype){ TC_U, 32 });
@@ -1363,6 +1466,54 @@ static void emit_statement(struct ctx *c)
 	}
 	if (c->lx.t != T_ID)
 		fail(c, "expected an instruction");
+	if (!strncmp(c->lx.s, "tex.", 4) || !strncmp(c->lx.s, "tld4.", 5) || !strncmp(c->lx.s, "suld.", 5) ||
+	    !strncmp(c->lx.s, "sust.", 5) || !strncmp(c->lx.s, "txq.", 4) || !strncmp(c->lx.s, "suq.", 4))
+		fail(c, "textures and surfaces (%s) are not supported yet", c->lx.s);
+	if (!strcmp(c->lx.s, "call") || !strncmp(c->lx.s, "call.", 5)) {
+		/* call[.uni] [(ret, ...),] name[, (arg, ...)]; -- inlined */
+		char rets[8][256], args[32][256], fname[256];
+		int nrets = 0, nargs = 0;
+
+		next(c);
+		if (accept(c, '(')) {
+			do {
+				if (nrets == 8)
+					fail(c, "too many return values");
+				snprintf(rets[nrets++], 256, "%s", expect_id(c));
+			} while (accept(c, ','));
+			expect(c, ')');
+			expect(c, ',');
+		}
+		snprintf(fname, sizeof(fname), "%s", expect_id(c));
+		if (accept(c, ',')) {
+			expect(c, '(');
+			if (!accept(c, ')')) {
+				do {
+					if (nargs == 32)
+						fail(c, "too many arguments");
+					snprintf(args[nargs++], 256, "%s", expect_id(c));
+				} while (accept(c, ','));
+				expect(c, ')');
+			}
+			if (accept(c, ','))
+				fail(c, "indirect call (prototype)");
+		}
+		expect(c, ';');
+		if (c->terminated)
+			return;
+		if (has_pred) {
+			then = new_block(c);
+			join = new_block(c);
+			nir_goto_if(&c->b, then, rd(c, &pred, (struct ptype){ TC_PRED, 1 }), join);
+			switch_to(c, then);
+		}
+		inline_call(c, rets, nrets, fname, args, nargs);
+		if (has_pred) {
+			nir_goto(&c->b, join);
+			switch_to(c, join);
+		}
+		return;
+	}
 	if (c->terminated) {	/* unreachable code after a jump, up to the next label */
 		parse_insn(c, &in);
 		return;
@@ -1385,15 +1536,17 @@ static void emit_statement(struct ctx *c)
 		return;
 	}
 	if (!strcmp(in.op, "ret") || !strcmp(in.op, "exit") || !strcmp(in.op, "trap")) {
+		nir_block *target = !strcmp(in.op, "ret") ? frame(c)->ret : c->impl->end_block;
+
 		if (!strcmp(in.op, "trap") && !has_pred)
 			fail(c, "trap");
 		if (has_pred) {
 			nir_block *fall = new_block(c);
 
-			nir_goto_if(&c->b, c->impl->end_block, rd(c, &pred, (struct ptype){ TC_PRED, 1 }), fall);
+			nir_goto_if(&c->b, target, rd(c, &pred, (struct ptype){ TC_PRED, 1 }), fall);
 			switch_to(c, fall);
 		} else {
-			nir_goto(&c->b, c->impl->end_block);
+			nir_goto(&c->b, target);
 			c->terminated = true;
 		}
 		return;
@@ -1445,7 +1598,8 @@ static void parse_reg_decl(struct ctx *c)
 }
 
 /* [.align N] .type name[N]... in a state space; returns the variable's size and alignment */
-static void parse_var(struct ctx *c, char *name, size_t len, uint32_t *size, uint32_t *align, bool *unsized)
+static void parse_var(struct ctx *c, char *name, size_t len, uint32_t *size, uint32_t *align, bool *unsized,
+		      struct ptype *elem)
 {
 	struct ptype t = { TC_B, 8 };
 	uint32_t al = 0, count = 1;
@@ -1485,44 +1639,53 @@ static void parse_var(struct ctx *c, char *name, size_t len, uint32_t *size, uin
 	}
 	*size = count * (t.cls == TC_PRED ? 1 : t.bits / 8);
 	*align = al ? al : (t.cls == TC_PRED ? 1 : t.bits / 8);
+	if (elem)
+		*elem = t;
 }
 
-static uint32_t align_up(uint32_t v, uint32_t a)
-{
-	return a ? (v + a - 1) / a * a : v;
-}
+static void parse_body(struct ctx *c);
+static void inline_call(struct ctx *c, char rets[][256], int nrets, const char *fname, char args[][256], int nargs);
 
 static void parse_body(struct ctx *c)
 {
+	uint32_t scope_top[64];
+	int scope = 0;
+
 	expect(c, '{');
 	for (;;) {
 		if (c->lx.t == T_EOF)
 			fail(c, "unterminated function");
-		if (accept(c, '}'))
-			break;
-		if (accept(c, '{'))	/* nested scopes: names stay visible (clang uses them for calls) */
+		if (accept(c, '}')) {
+			if (!scope)
+				break;
+			c->local_top = scope_top[--scope];	/* the scope's .param/.local variables die */
 			continue;
+		}
+		if (accept(c, '{')) {	/* nested scope (nvcc: one per call); names stay visible */
+			if (scope == 64)
+				fail(c, "scopes nested too deep");
+			scope_top[scope++] = c->local_top;
+			continue;
+		}
 		if (c->lx.t == T_ID && c->lx.s[0] == '.') {
 			if (is_id(c, ".reg")) {
 				parse_reg_decl(c);
-			} else if (is_id(c, ".local") || is_id(c, ".shared")) {
+			} else if (is_id(c, ".local") || is_id(c, ".shared") || is_id(c, ".param")) {
 				bool shared = is_id(c, ".shared"), unsized;
 				char name[256];
 				uint32_t size, al;
 
 				next(c);
-				parse_var(c, name, sizeof(name), &size, &al, &unsized);
+				parse_var(c, name, sizeof(name), &size, &al, &unsized, NULL);
 				expect(c, ';');
-				if (shared && find_sym(c, name)) {
+				if (shared && _mesa_hash_table_search(c->modsyms, name)) {
 					/* allocated by prescan_shared */
 				} else if (shared) {
 					c->shared_size = align_up(c->shared_size, al);
-					add_sym(c, name, SP_SHARED, c->shared_size, size);
+					add_sym_to(c, c->modsyms, name, SP_SHARED, c->shared_size, size);
 					c->shared_size += size;
-				} else {
-					c->local_size = align_up(c->local_size, al);
-					add_sym(c, name, SP_LOCAL, c->local_size, size);
-					c->local_size += size;
+				} else {	/* .local, and a call's .param variables: scratch */
+					add_sym(c, name, SP_LOCAL, alloc_local(c, size, al), size);
 				}
 			} else if (is_id(c, ".loc")) {	/* debug line info: the rest of the line, no ';' */
 				int line = c->lx.line;
@@ -1533,8 +1696,6 @@ static void parse_body(struct ctx *c)
 				while (!is_p(c, ';') && c->lx.t != T_EOF)
 					next(c);
 				expect(c, ';');
-			} else if (is_id(c, ".param")) {
-				fail(c, "device function calls (.param in a body) are not supported yet");
 			} else {
 				fail(c, "unsupported directive %s", c->lx.s);
 			}
@@ -1565,17 +1726,110 @@ static void parse_body(struct ctx *c)
 		emit_statement(c);
 	}
 	if (!c->terminated)
-		nir_goto(&c->b, c->impl->end_block);
+		nir_goto(&c->b, frame(c)->ret);
 }
 
-/* Static .shared variables of the body, so dynamic (extern) shared memory can start after them. */
-static void prescan_shared(struct ctx *c, const char *body, int line)
+/*
+ * Inline a call: the callee's header binds its .param names to the caller's variables (return
+ * values first, then arguments), then its body is emitted in a frame of its own with ret going
+ * to a fresh block. The lexer resumes after the call afterwards.
+ */
+static void inline_call(struct ctx *c, char rets[][256], int nrets, const char *fname, char args[][256], int nargs)
+{
+	struct hash_entry *e = _mesa_hash_table_search(c->funcs, fname);
+	struct pfunc *f = e ? e->data : NULL;
+	struct lex saved = c->lx;
+	struct frame *fr;
+	struct psym *bind[40];
+	uint32_t saved_top = c->local_top;
+	nir_block *ret;
+	int i, n = 0;
+
+	if (!f)
+		fail(c, "call of unknown function %s%s", fname, find_reg(c, fname) ? " (indirect calls)" : "");
+	if (!f->has_body)
+		fail(c, "call of %s, which has no body in this module", fname);
+	if (c->depth == MAX_DEPTH)
+		fail(c, "calls nested deeper than %d (recursion?)", MAX_DEPTH);
+	for (i = 0; i < nrets; i++) {
+		bind[n] = find_sym(c, rets[i]);
+		if (!bind[n] || bind[n]->space != SP_LOCAL)
+			fail(c, "return variable %s is not a .param", rets[i]);
+		n++;
+	}
+	for (i = 0; i < nargs; i++) {
+		bind[n] = find_sym(c, args[i]);
+		if (!bind[n] || bind[n]->space != SP_LOCAL)
+			fail(c, "argument %s is not a .param variable (registers as arguments are not supported)", args[i]);
+		n++;
+	}
+	ret = new_block(c);
+	c->depth++;
+	fr = frame(c);
+	fr->regs = new_table(c);
+	fr->labels = new_table(c);
+	fr->syms = new_table(c);
+	fr->ret = ret;
+	c->lx.p = f->hdr;
+	c->lx.line = f->line;
+	next(c);
+	/* ( .param ret, ... ) name ( .param arg, ... ) */
+	i = 0;
+	if (accept(c, '(')) {
+		do {
+			char name[256];
+			uint32_t size, al;
+			bool unsized;
+
+			if (!is_id(c, ".param"))
+				fail(c, "expected .param");
+			next(c);
+			parse_var(c, name, sizeof(name), &size, &al, &unsized, NULL);
+			if (i >= nrets)
+				fail(c, "%s returns more values than the call takes", fname);
+			_mesa_hash_table_insert(fr->syms, ralloc_strdup(c->mem, name), bind[i++]);
+		} while (accept(c, ','));
+		expect(c, ')');
+	}
+	if (i != nrets)
+		fail(c, "%s: %d return values, call takes %d", fname, i, nrets);
+	expect_id(c);
+	i = 0;
+	if (accept(c, '(') && !accept(c, ')')) {
+		do {
+			char name[256];
+			uint32_t size, al;
+			bool unsized;
+
+			if (!is_id(c, ".param"))
+				fail(c, "expected .param");
+			next(c);
+			parse_var(c, name, sizeof(name), &size, &al, &unsized, NULL);
+			if (i >= nargs)
+				fail(c, "%s takes more arguments than the call passes", fname);
+			_mesa_hash_table_insert(fr->syms, ralloc_strdup(c->mem, name), bind[nrets + i++]);
+		} while (accept(c, ','));
+		expect(c, ')');
+	}
+	if (i != nargs)
+		fail(c, "%s: %d parameters, call passes %d", fname, i, nargs);
+	while (!is_p(c, '{') && c->lx.t != T_EOF)	/* .noreturn, .maxnreg, ... */
+		next(c);
+	parse_body(c);
+	c->depth--;
+	c->local_top = saved_top;
+	c->lx = saved;
+	switch_to(c, ret);
+}
+
+/*
+ * Static .shared variables of a body (cursor on its '{'), so dynamic (extern) shared memory can
+ * start after all of them. Every function's body is scanned, whether or not it is called.
+ */
+static void prescan_shared(struct ctx *c)
 {
 	int depth = 0;
 
-	c->lx.p = body;
-	c->lx.line = line;
-	next(c);
 	do {
 		if (c->lx.t == T_EOF)
 			fail(c, "unterminated function");
@@ -1589,14 +1843,316 @@ static void prescan_shared(struct ctx *c, const char *body, int line)
 			bool unsized;
 
 			next(c);
-			parse_var(c, name, sizeof(name), &size, &al, &unsized);
-			c->shared_size = align_up(c->shared_size, al);
-			add_sym(c, name, SP_SHARED, c->shared_size, size);
-			c->shared_size += size;
+			parse_var(c, name, sizeof(name), &size, &al, &unsized, NULL);
+			if (!_mesa_hash_table_search(c->modsyms, name)) {
+				c->shared_size = align_up(c->shared_size, al);
+				add_sym_to(c, c->modsyms, name, SP_SHARED, c->shared_size, size);
+				c->shared_size += size;
+			}
 			continue;
 		}
 		next(c);
 	} while (depth);
+}
+
+/* ---- module globals (.global / .const) with initializers ---- */
+
+static void init_write(struct ctx *c, uint8_t *dst, uint32_t size, uint32_t *pos, struct ptype t, uint64_t bits)
+{
+	uint32_t n = t.bits / 8;
+
+	if (*pos + n > size)
+		fail(c, "initializer longer than the variable");
+	memcpy(dst + *pos, &bits, n);	/* little-endian host and GPU */
+	*pos += n;
+}
+
+/* = { ... } or = value; nested braces are flattened; elements take the variable's element type */
+static void parse_init(struct ctx *c, uint8_t *dst, uint32_t size, struct ptype t)
+{
+	uint32_t pos = 0;
+	int depth = 0;
+
+	do {
+		if (accept(c, '{')) {
+			depth++;
+			continue;
+		}
+		if (is_p(c, '}')) {
+			next(c);
+			if (--depth < 0)
+				fail(c, "unbalanced initializer");
+			if (!depth)
+				break;
+			accept(c, ',');
+			continue;
+		}
+		if (accept(c, ',')) {
+			continue;
+		}
+		if (c->lx.t == T_INT) {
+			init_write(c, dst, size, &pos, t, c->lx.u);
+			next(c);
+		} else if (c->lx.t == T_HEXF) {
+			init_write(c, dst, size, &pos, t, c->lx.u);
+			next(c);
+		} else if (c->lx.t == T_FLT) {
+			uint64_t bits;
+
+			if (t.bits == 64) {
+				double d = c->lx.d;
+
+				memcpy(&bits, &d, 8);
+			} else {
+				float f = (float)c->lx.d;
+				uint32_t u;
+
+				memcpy(&u, &f, 4);
+				bits = u;
+			}
+			init_write(c, dst, size, &pos, t, bits);
+			next(c);
+		} else if (accept(c, '-')) {
+			if (c->lx.t == T_INT)
+				init_write(c, dst, size, &pos, t, -c->lx.u);
+			else
+				fail(c, "negative float initializers");
+			next(c);
+		} else {
+			fail(c, "unsupported initializer element (addresses of other variables?)");
+		}
+	} while (depth);
+}
+
+/* a module-scope .global/.const declaration (cursor after the space keyword): layout + initializer */
+static void module_global(struct ctx *c, enum space sp)
+{
+	char name[256];
+	uint32_t size, al, off;
+	bool unsized;
+	struct ptype t;
+
+	parse_var(c, name, sizeof(name), &size, &al, &unsized, &t);
+	if (unsized)
+		fail(c, "%s: unsized module variable", name);
+	if (al < 16)
+		al = 16;
+	off = align_up(c->globals_size, al);
+	if (c->nglobals == c->maxglobals) {
+		c->maxglobals = c->maxglobals ? c->maxglobals * 2 : 64;
+		c->globals = realloc(c->globals, c->maxglobals * sizeof(*c->globals));
+		if (!c->globals)
+			fail(c, "out of memory");
+	}
+	snprintf(c->globals[c->nglobals].name, sizeof(c->globals[0].name), "%s", name);
+	c->globals[c->nglobals].offset = off;
+	c->globals[c->nglobals].size = size;
+	c->nglobals++;
+	c->globals_size = off + size;
+	c->globals_image = realloc(c->globals_image, c->globals_size);
+	if (!c->globals_image)
+		fail(c, "out of memory");
+	memset(c->globals_image + off, 0, size);
+	add_sym_to(c, c->modsyms, name, sp, off, size);
+	if (accept(c, '='))
+		parse_init(c, c->globals_image + off, size, t);
+	while (!is_p(c, ';') && c->lx.t != T_EOF)
+		next(c);
+	expect(c, ';');
+}
+
+/*
+ * The module scope: functions (catalogued), module variables (laid out), the entry (its
+ * parameters, .maxntid and body position). Every body is prescanned for .shared.
+ */
+static void scan_module(struct ctx *c, const char *entry, const char **body, int *body_line, bool *found)
+{
+	*found = false;
+	next(c);
+	while (c->lx.t != T_EOF) {
+		if (c->lx.t != T_ID) {
+			next(c);
+			continue;
+		}
+		if (is_id(c, ".entry")) {
+			bool want;
+
+			next(c);
+			want = entry && !strcmp(c->lx.s, entry);
+			expect_id(c);
+			if (want) {
+				*found = true;
+				parse_params(c);
+				/* performance directives until the body */
+				while (!is_p(c, '{') && c->lx.t != T_EOF) {
+					if (is_id(c, ".maxntid") || is_id(c, ".reqntid")) {
+						uint64_t prod = 1;
+
+						next(c);
+						do {
+							prod *= expect_int(c);
+						} while (accept(c, ','));
+						c->kb->max_threads = prod > 1024 ? 1024 : (uint32_t)prod;
+						continue;
+					}
+					next(c);
+				}
+				*body = c->lx.p - 1;
+				*body_line = c->lx.line;
+				prescan_shared(c);
+			} else {
+				while (!is_p(c, '{') && !is_p(c, ';') && c->lx.t != T_EOF)
+					next(c);
+				if (is_p(c, '{'))
+					prescan_shared(c);
+			}
+			continue;
+		}
+		if (is_id(c, ".func")) {
+			struct pfunc *f;
+			struct hash_entry *e;
+			const char *hdr = c->lx.p;
+			int line = c->lx.line, depth = 0;
+			char name[256];
+
+			next(c);
+			if (accept(c, '(')) {		/* return values */
+				depth = 1;
+				while (depth && c->lx.t != T_EOF) {
+					if (is_p(c, '('))
+						depth++;
+					else if (is_p(c, ')'))
+						depth--;
+					next(c);
+				}
+			}
+			snprintf(name, sizeof(name), "%s", expect_id(c));
+			while (!is_p(c, '{') && !is_p(c, ';') && c->lx.t != T_EOF)
+				next(c);
+			e = _mesa_hash_table_search(c->funcs, name);
+			f = e ? e->data : NULL;
+			if (is_p(c, '{')) {	/* a definition replaces a declaration */
+				if (!f) {
+					f = ralloc(c->mem, struct pfunc);
+					_mesa_hash_table_insert(c->funcs, ralloc_strdup(c->mem, name), f);
+				}
+				f->hdr = hdr;
+				f->line = line;
+				f->has_body = true;
+				prescan_shared(c);
+			} else if (!f) {
+				f = ralloc(c->mem, struct pfunc);
+				f->hdr = hdr;
+				f->line = line;
+				f->has_body = false;
+				_mesa_hash_table_insert(c->funcs, ralloc_strdup(c->mem, name), f);
+			}
+			continue;
+		}
+		if (is_id(c, ".shared")) {
+			char name[256];
+			uint32_t size, al;
+			bool unsized;
+
+			next(c);
+			parse_var(c, name, sizeof(name), &size, &al, &unsized, NULL);
+			if (unsized) {	/* .extern .shared x[]: dynamic shared memory, after the static part */
+				c->dyn_shared = true;
+				add_sym_to(c, c->modsyms, name, SP_SHARED, ~0u, 0);
+			} else {
+				c->shared_size = align_up(c->shared_size, al);
+				add_sym_to(c, c->modsyms, name, SP_SHARED, c->shared_size, size);
+				c->shared_size += size;
+			}
+			while (!is_p(c, ';') && c->lx.t != T_EOF)
+				next(c);
+			continue;
+		}
+		if (is_id(c, ".global") || is_id(c, ".const")) {
+			enum space sp = is_id(c, ".global") ? SP_GLOBAL : SP_CONST;
+
+			next(c);
+			module_global(c, sp);
+			continue;
+		}
+		if (is_id(c, ".file")) {
+			int line = c->lx.line;
+
+			while (c->lx.t != T_EOF && c->lx.line == line)
+				next(c);
+			continue;
+		}
+		if (is_id(c, ".section")) {
+			while (!is_p(c, '{') && c->lx.t != T_EOF)
+				next(c);
+			skip_braces(c);
+			continue;
+		}
+		next(c);
+	}
+	if (c->dyn_shared) {	/* extern shared arrays start after the static ones, 16-byte aligned */
+		c->shared_size = align_up(c->shared_size, 16);
+		hash_table_foreach(c->modsyms, e) {
+			struct psym *s = e->data;
+
+			if (s->space == SP_SHARED && s->offset == ~0u)
+				s->offset = c->shared_size;
+		}
+	}
+}
+
+static struct ctx *ctx_new(const char *src, char *err, size_t errlen)
+{
+	struct ctx *c = calloc(1, sizeof(*c));
+
+	if (!c)
+		return NULL;
+	c->mem = ralloc_context(NULL);
+	c->err = err;
+	c->errlen = errlen;
+	c->lx.src = c->lx.p = src;
+	c->lx.line = 1;
+	c->modsyms = new_table(c);
+	c->funcs = new_table(c);
+	c->frames[0].regs = new_table(c);
+	c->frames[0].labels = new_table(c);
+	c->frames[0].syms = new_table(c);
+	return c;
+}
+
+static void ctx_free(struct ctx *c)
+{
+	free(c->globals);
+	free(c->globals_image);
+	ralloc_free(c->mem);
+	free(c);
+}
+
+int nvc_ptx_globals(const char *ptx, struct nvc_global **globals, uint32_t *count, void **image, uint32_t *size,
+		    char *err, size_t errlen)
+{
+	struct ctx *c = ctx_new(ptx, err, errlen);
+	struct nvc_kernel_bin kb = { 0 };
+	const char *body;
+	int line;
+	bool found;
+
+	if (!c)
+		return -1;
+	c->kb = &kb;
+	if (setjmp(c->fail)) {
+		ctx_free(c);
+		return -1;
+	}
+	scan_module(c, NULL, &body, &line, &found);
+	*globals = c->globals;
+	*count = c->nglobals;
+	*image = c->globals_image;
+	*size = c->globals_size;
+	c->globals = NULL;
+	c->globals_image = NULL;
+	ctx_free(c);
+	return 0;
 }
 
 /* .entry name ( .param ... ) — the parameter list, laid out for cuLaunchKernel */
@@ -1616,7 +2172,7 @@ static void parse_params(struct ctx *c)
 		if (!is_id(c, ".param"))
 			fail(c, "expected .param");
 		next(c);
-		parse_var(c, name, sizeof(name), &size, &al, &unsized);
+		parse_var(c, name, sizeof(name), &size, &al, &unsized, NULL);
 		if (c->kb->nparams == NVC_MAX_PARAMS)
 			fail(c, "too many parameters");
 		off = align_up(off, al);
@@ -1631,152 +2187,48 @@ static void parse_params(struct ctx *c)
 }
 
 nir_shader *nvc_ptx_build(const char *src, const char *entry, const nir_shader_compiler_options *opts,
-			  struct nvc_kernel_bin *kb, char *err, size_t errlen)
+			  struct nvc_kernel_bin *kb, uint64_t globals_va, char *err, size_t errlen)
 {
-	struct ctx *c = calloc(1, sizeof(*c));
+	struct ctx *c = ctx_new(src, err, errlen);
 	nir_shader *nir = NULL;
+	nir_function *f;
 	const char *body = NULL;
 	int body_line = 0;
-	bool found = false;
+	bool found;
 
 	if (!c)
 		return NULL;
-	c->mem = ralloc_context(NULL);
-	c->err = err;
-	c->errlen = errlen;
 	c->kb = kb;
-	c->lx.src = c->lx.p = src;
-	c->lx.line = 1;
-	c->regs = _mesa_hash_table_create(c->mem, _mesa_hash_string, _mesa_key_string_equal);
-	c->labels = _mesa_hash_table_create(c->mem, _mesa_hash_string, _mesa_key_string_equal);
-	c->syms = _mesa_hash_table_create(c->mem, _mesa_hash_string, _mesa_key_string_equal);
+	c->globals_va = globals_va;
 	if (setjmp(c->fail)) {
 		if (nir)
 			ralloc_free(nir);
 		nir = NULL;
 		goto out;
 	}
-
-	/* module scope: find the entry, collect module-level .shared variables */
-	next(c);
-	while (c->lx.t != T_EOF) {
-		if (c->lx.t != T_ID) {
-			next(c);
-			continue;
-		}
-		if (is_id(c, ".entry")) {
-			bool want;
-
-			next(c);
-			want = !strcmp(c->lx.s, entry);
-			expect_id(c);
-			if (want) {
-				found = true;
-				nir = nir_shader_create(NULL, MESA_SHADER_KERNEL, opts);
-				nir->info.name = ralloc_strdup(nir, entry);
-				parse_params(c);
-				/* performance directives (.maxntid, .reqntid, .minnctapersm, ...) until the body */
-				while (!is_p(c, '{') && c->lx.t != T_EOF)
-					next(c);
-				body = c->lx.p - 1;
-				body_line = c->lx.line;
-				skip_braces(c);
-			} else {
-				while (!is_p(c, '{') && !is_p(c, ';') && c->lx.t != T_EOF)
-					next(c);
-				if (is_p(c, '{'))
-					skip_braces(c);
-			}
-			continue;
-		}
-		if (is_id(c, ".func")) {
-			while (!is_p(c, '{') && !is_p(c, ';') && c->lx.t != T_EOF)
-				next(c);
-			if (is_p(c, '{'))
-				skip_braces(c);
-			continue;
-		}
-		if (is_id(c, ".shared")) {
-			char name[256];
-			uint32_t size, al;
-			bool unsized;
-
-			next(c);
-			parse_var(c, name, sizeof(name), &size, &al, &unsized);
-			if (unsized) {	/* .extern .shared x[]: dynamic shared memory, after the static part */
-				c->dyn_shared = true;
-				add_sym(c, name, SP_SHARED, ~0u, 0);
-			} else {
-				c->shared_size = align_up(c->shared_size, al);
-				add_sym(c, name, SP_SHARED, c->shared_size, size);
-				c->shared_size += size;
-			}
-			while (!is_p(c, ';') && c->lx.t != T_EOF)
-				next(c);
-			continue;
-		}
-		if (is_id(c, ".global") || is_id(c, ".const")) {
-			enum space sp = is_id(c, ".global") ? SP_GLOBAL : SP_CONST;
-			char name[256];
-			uint32_t size, al;
-			bool unsized;
-
-			next(c);
-			parse_var(c, name, sizeof(name), &size, &al, &unsized);
-			add_sym(c, name, sp, 0, size);
-			while (!is_p(c, ';') && c->lx.t != T_EOF)
-				next(c);
-			continue;
-		}
-		if (is_id(c, ".file")) {
-			int line = c->lx.line;
-
-			while (c->lx.t != T_EOF && c->lx.line == line)
-				next(c);
-			continue;
-		}
-		if (is_id(c, ".section")) {
-			while (!is_p(c, '{') && c->lx.t != T_EOF)
-				next(c);
-			skip_braces(c);
-			continue;
-		}
-		next(c);
-	}
+	scan_module(c, entry, &body, &body_line, &found);
 	if (!found) {
 		snprintf(err, errlen, "no .entry %s in the PTX", entry);
 		goto out;
 	}
 
-	/* the entry's body */
-	{
-		nir_function *f = nir_function_create(nir, entry);
-
-		f->is_entrypoint = true;
-		c->impl = nir_function_impl_create(f);
-		c->impl->structured = false;
-		c->nir = nir;
-		c->b = nir_builder_at(nir_after_block(nir_start_block(c->impl)));
-		prescan_shared(c, body, body_line);
-		if (c->dyn_shared) {	/* extern shared arrays start after the static ones, 16-byte aligned */
-			c->shared_size = align_up(c->shared_size, 16);
-			hash_table_foreach(c->syms, e) {
-				struct psym *s = e->data;
-
-				if (s->space == SP_SHARED && s->offset == ~0u)
-					s->offset = c->shared_size;
-			}
-		}
-		c->lx.p = body;
-		c->lx.line = body_line;
-		next(c);
-		parse_body(c);
-	}
+	nir = nir_shader_create(NULL, MESA_SHADER_KERNEL, opts);
+	nir->info.name = ralloc_strdup(nir, entry);
+	f = nir_function_create(nir, entry);
+	f->is_entrypoint = true;
+	c->impl = nir_function_impl_create(f);
+	c->impl->structured = false;
+	c->nir = nir;
+	c->b = nir_builder_at(nir_after_block(nir_start_block(c->impl)));
+	c->frames[0].ret = c->impl->end_block;
+	c->lx.p = body;
+	c->lx.line = body_line;
+	next(c);
+	parse_body(c);
 	nir->info.shared_size = c->shared_size;
-	nir->scratch_size = c->local_size;
+	nir->scratch_size = c->local_max;
 	nir->info.workgroup_size_variable = true;
 out:
-	ralloc_free(c->mem);
-	free(c);
+	ctx_free(c);
 	return nir;
 }

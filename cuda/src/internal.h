@@ -130,6 +130,8 @@ uint32_t *nvc_mthd(uint32_t *p, int subc, uint32_t mthd, int n, const uint32_t *
 
 /* memory.c: pageable host -> GPU VA, synchronous (code upload) */
 CUresult nvc_upload(struct CUctx_st *ctx, uint64_t va, const void *data, size_t bytes);
+CUresult nvc_mem_alloc_device(struct CUctx_st *ctx, size_t bytes, uint64_t *va);
+void nvc_mem_free_device(struct CUctx_st *ctx, uint64_t va);
 
 /* module.c */
 void nvc_modules_drop(struct CUctx_st *ctx);

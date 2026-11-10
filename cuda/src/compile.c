@@ -183,7 +183,8 @@ static struct nvc_kernel_bin *finish(nir_shader *nir, struct nvc_kernel_bin *kb,
 	 * NAK derives the register limit from the workgroup size: 1x1x1 leaves it at 255, as CUDA does
 	 * without __launch_bounds__; cuLaunchKernel checks registers x threads against the SM.
 	 */
-	nir->info.workgroup_size[0] = nir->info.workgroup_size[1] = nir->info.workgroup_size[2] = 1;
+	nir->info.workgroup_size[0] = kb->max_threads ? kb->max_threads : 1;	/* .maxntid: nvcc's cap too */
+	nir->info.workgroup_size[1] = nir->info.workgroup_size[2] = 1;
 	nak_preprocess_nir(nir, nak);
 	NIR_PASS(_, nir, nir_lower_int64);
 	optimize(nir);
@@ -356,14 +357,14 @@ const struct nak_constant_offset_info nak_const_offsets_turing_graphics = {
 };
 
 /* PTX text -> NIR (ptx.c) -> the same tail as SPIR-V */
-struct nvc_kernel_bin *nvc_compile_ptx(const char *ptx, const char *entry, char *err, size_t errlen)
+struct nvc_kernel_bin *nvc_compile_ptx(const char *ptx, const char *entry, uint64_t globals_va, char *err, size_t errlen)
 {
 	struct nvc_kernel_bin *kb = calloc(1, sizeof(*kb));
 	nir_shader *nir;
 
 	if (!kb)
 		return NULL;
-	nir = nvc_ptx_build(ptx, entry, nak_nir_options(nak), kb, err, errlen);
+	nir = nvc_ptx_build(ptx, entry, nak_nir_options(nak), kb, globals_va, err, errlen);
 	if (!nir) {
 		free(kb);
 		return NULL;
