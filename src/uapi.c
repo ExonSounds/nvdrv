@@ -34,6 +34,7 @@
 #include <drm/drm_print.h>
 #include <drm/drm_syncobj.h>
 #include <uapi/drm/nouveau_drm.h>
+#include "../uapi/nvdrv_drm.h"
 
 #include "nvdrv.h"
 
@@ -99,6 +100,7 @@ struct nv_cli {
 	struct workqueue_struct *bind_wq;	/* asynchronous VM_BIND, in order */
 	atomic_t binds_queued;
 	char comm[TASK_COMM_LEN];	/* opener, for hang reports */
+	bool compute_boost;		/* NVDRV_SETPARAM_COMPUTE_BOOST */
 	pid_t pid;
 };
 
@@ -1752,7 +1754,7 @@ static void exec_fence_shared(struct nv_cli *cli, struct dma_fence *fence)
 		dma_resv_unlock(obj->resv);
 	}
 }
-static void uapi_boost(struct nvdrv_dev *nv);
+static void uapi_boost(struct nvdrv_dev *nv, bool want);
 #define HOST_NON_STALL_INTERRUPT	0x20
 #define HOST_MEM_OP_A		0x28
 #define HOST_SEM_ADDR_LO	0x5c
@@ -1848,7 +1850,7 @@ static int ioctl_exec(struct drm_device *dev, void *data, struct drm_file *file)
 	dma_fence_put(u->last);
 	u->last = dma_fence_get(fence);
 	exec_fence_shared(cli, fence);
-	uapi_boost(nv);
+	uapi_boost(nv, READ_ONCE(cli->compute_boost));
 unlock:
 	up_read(&nv->uapi.evict_sem);
 	mutex_unlock(&cli->lock);
@@ -1924,11 +1926,12 @@ static bool exec_boost;
 module_param(exec_boost, bool, 0644);
 MODULE_PARM_DESC(exec_boost, "Force P0 for a few seconds whenever GPU work is submitted (default off; RM's governor scales)");
 
-static void uapi_boost(struct nvdrv_dev *nv)
+/* every submission with exec_boost=1, or from a file that asked for it (compute clients) */
+static void uapi_boost(struct nvdrv_dev *nv, bool want)
 {
 	struct nv_uapi *ua = &nv->uapi;
 
-	if (exec_boost && time_after_eq(jiffies, READ_ONCE(ua->boost_next))) {
+	if ((exec_boost || want) && time_after_eq(jiffies, READ_ONCE(ua->boost_next))) {
 		WRITE_ONCE(ua->boost_next, jiffies + HZ);
 		schedule_work(&ua->boost_work);
 	}
@@ -1959,6 +1962,23 @@ static void gr_units(struct nvdrv_dev *nv)
 		}
 	}
 	mutex_unlock(&nv->gsp_lock);
+}
+
+/* nvdrv's own per-file parameters (uapi/nvdrv_drm.h) */
+static int ioctl_setparam(struct drm_device *dev, void *data, struct drm_file *file)
+{
+	struct nvdrv_setparam *req = data;
+	struct nv_cli *cli = file->driver_priv;
+
+	switch (req->param) {
+	case NVDRV_SETPARAM_COMPUTE_BOOST:
+		if (req->value > 1)
+			return -EINVAL;
+		WRITE_ONCE(cli->compute_boost, req->value);
+		return 0;
+	default:
+		return -EINVAL;
+	}
 }
 
 static int ioctl_getparam(struct drm_device *dev, void *data, struct drm_file *file)
@@ -2332,6 +2352,7 @@ void nv_uapi_postclose(struct drm_device *dev, struct drm_file *file)
 #define IOCTL(n, f) DRM_IOCTL_DEF_DRV(NOUVEAU_##n, f, DRM_RENDER_ALLOW)
 static const struct drm_ioctl_desc nv_uapi_ioctls[] = {
 	IOCTL(GETPARAM, ioctl_getparam),
+	IOCTL(SETPARAM, ioctl_setparam),
 	IOCTL(CHANNEL_ALLOC, ioctl_channel_alloc),
 	IOCTL(CHANNEL_FREE, ioctl_channel_free),
 	IOCTL(VM_INIT, ioctl_vm_init),

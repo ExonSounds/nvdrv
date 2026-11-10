@@ -823,8 +823,10 @@ not used.
       - Speed: 20 back-to-back saxpy launches run at **399 GB/s with exec_boost** (89 % of the 448 GB/s peak), but
         19 GB/s at the idle P8 clocks. A single launch timed between copy-engine events is about 10 ms at P8,
         mostly cross-channel fence latency.
-      - [ ] nvcuda should get P0 while compute work is queued: a uAPI hint, or exec_boost for compute
-        channels. GSP-RM's governor only reacts after about 2.5 s of load.
+      - [x] Clocks for compute (2026-11-10): `uapi/nvdrv_drm.h` gives nouveau's unused SETPARAM ioctl a per-file
+        `NVDRV_SETPARAM_COMPUTE_BOOST`. With it, every EXEC re-arms the 3 s P0 / PCIe Gen3 boost (at most one RPC
+        per second); nvcuda sets it per context (`NVCUDA_BOOST=0` opts out). Desktop clients keep GSP-RM's normal
+        governor. From an idle GPU (P8, Gen1): saxpy 23 GB/s without it, **396 GB/s** with it; copies 12.6 GB/s.
       - [ ] Fewer generic branches: turn clang's `inttoptr(ptrtoint(addrspace(1)))` back into addrspacecast so
         LLVM infer-address-spaces sees global pointers; or a NIR pass treating kernel-argument pointers as global.
       - [ ] Module-scope `__device__`/`__constant__` variables (cuModuleGetGlobal), dynamic `extern __shared__`,
@@ -896,5 +898,6 @@ tools/            userspace helpers (VBIOS parser, register decoders)
 scripts/          bind / unbind
 tests/            per-phase smoke tests
 cuda/             nvcuda: open libcuda.so.1 (MIT), its headers and tests
+uapi/             nvdrv's additions to the nouveau uAPI (shared by the module and nvcuda)
 ref/              (gitignored) NVIDIA reference trees
 ```

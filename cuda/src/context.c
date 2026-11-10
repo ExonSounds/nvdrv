@@ -14,6 +14,7 @@
 #include <drm/nouveau_drm.h>
 
 #include "internal.h"
+#include "nvdrv_drm.h"
 
 #define DRM_NOUVEAU_NVIF 0x07
 struct nvif_hdr { uint8_t version, type, pad02[4], owner, route; uint64_t token, object; };
@@ -139,6 +140,16 @@ CUresult nvc_ctx_init(struct CUctx_st *ctx, CUdevice dev, unsigned int flags)
 		goto fail;
 	}
 	ctx->ce_chan = ca.channel;
+	/*
+	 * Compute client: nvdrv keeps the GPU at P0 while this file submits work (GSP-RM's governor
+	 * alone needs ~2.5 s of load). Older nvdrv builds refuse the parameter; that is harmless.
+	 */
+	{
+		const char *e = getenv("NVCUDA_BOOST");
+		struct nvdrv_setparam sp = { NVDRV_SETPARAM_COMPUTE_BOOST, !(e && e[0] == '0') };
+
+		drmIoctl(ctx->fd, DRM_IOCTL_NOUVEAU_SETPARAM, &sp);
+	}
 	on.h.token = ca.channel;
 	if (drmCommandWrite(ctx->fd, DRM_NOUVEAU_NVIF, &on, sizeof(on))) {
 		res = CUDA_ERROR_DEVICE_UNAVAILABLE;

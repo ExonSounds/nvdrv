@@ -3,7 +3,7 @@
 CC ?= cc
 CFLAGS ?= -O2 -g
 CFLAGS += -std=gnu11 -D_GNU_SOURCE -fPIC -fvisibility=hidden -Wall -Wextra -Wno-unused-parameter \
-	  -Iinclude $(shell pkg-config --cflags libdrm)
+	  -Iinclude -I../uapi $(shell pkg-config --cflags libdrm)
 LIBS = $(shell pkg-config --libs libdrm) -lpthread
 
 -include mesa/mesa.mk
